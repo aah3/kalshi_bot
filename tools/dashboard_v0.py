@@ -427,9 +427,6 @@ parser.add_argument("--days",        type=int, default=7,
 
 
 if __name__ == "__main__":
-    import sys
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     args = parser.parse_args()
     print(f"[dashboard] ENV={config.ENV}  interval={args.interval}s")
     asyncio.run(run_dashboard(

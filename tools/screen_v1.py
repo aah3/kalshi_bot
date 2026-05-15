@@ -483,9 +483,6 @@ async def _dispatch(args) -> None:
 
 
 if __name__ == "__main__":
-    import sys
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     args = parser.parse_args()
     print(f"[screen] ENV={config.ENV}  BASE={config.BASE_URL}\n")
     asyncio.run(_dispatch(args))

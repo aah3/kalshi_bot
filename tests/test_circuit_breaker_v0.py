@@ -351,8 +351,5 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
-    import sys
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     ok = run_all_tests()
     sys.exit(0 if ok else 1)

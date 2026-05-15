@@ -453,9 +453,6 @@ p_se.add_argument("--price",      type=int, default=None, help="Override exit pr
 
 
 if __name__ == "__main__":
-    import sys
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     args    = parser.parse_args()
     blotter = Blotter()
     print(f"[blotter] ENV={config.ENV}  DB={config.DB_PATH}")

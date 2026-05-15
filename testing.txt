@@ -19,5 +19,45 @@ python tools/screen.py --categories
 python tools/screen.py --category Politics
 
 # 6. Set tickers and start the bot in demo mode
-export KALSHI_TICKERS="PRES-2024-DEM"
+export KALSHI_TICKERS="PRES-2026-DEM"
+python main.py
+
+
+#####
+
+# Step 1: browse all open markets publicly (no credentials needed)
+curl "https://external-api.kalshi.com/trade-api/v2/markets?status=open&limit=200" \
+  | python3 -c "
+import sys,json
+for m in json.load(sys.stdin)['markets']:
+    print(m['event_ticker'], m['ticker'], m.get('volume_24h','0'))
+" | sort -k3 -rn | head -30   # top 30 by 24h volume
+
+# Step 2: once you find interesting tickers, screen them properly
+python tools/screen.py --ticker KXHIGHNY-23DEC29-B4700
+
+# Step 3: set them in your env and start the bot
+export KALSHI_TICKERS="KXHIGHNY-23DEC29-B4700,PRES-2028-DEM"
+python main.py
+
+
+############
+
+# Categories
+python tools/screen.py --categories
+
+# Browse a category with their economics
+python tools/screen.py browse --category Politics
+python tools/screen.py browse --category Economics
+python tools/screen.py browse --category Sports
+
+# Full detail on a specific market
+python tools/screen.py browse --ticker PRES-2028-DEM
+
+# Score markets for your strategy
+python tools/screen.py screen --category Politics
+
+# Copy the tickers to your environment and start the bot
+# The browse command prints this at the bottom automatically:
+export KALSHI_TICKERS="PRES-2028-DEM,PRES-2028-REP"
 python main.py
