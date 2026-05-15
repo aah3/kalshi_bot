@@ -2,3 +2,6 @@
 .env
 __pycache__/
 *.py[cod]
+
+# Versioned snapshots (*_v0*, *_v1*, *_v10*, ...)
+*_v[0-9]*

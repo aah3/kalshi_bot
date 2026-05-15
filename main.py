@@ -23,6 +23,7 @@ Shutdown sequence (on SIGINT / SIGTERM):
     7. Print session summary from blotter
 """
 
+import argparse
 import asyncio
 import os
 import signal
@@ -41,19 +42,33 @@ from metrics.metrics_store import MetricsStore
 from metrics.settlement import SettlementWatcher
 from risk.alert_manager import AlertManager
 from risk.circuit_breaker import CircuitBreaker
-from strategy.kelly_strategy import KellyStrategy
+from discovery.ticker_selector import (
+    TickerCriteria,
+    criteria_from_env,
+    discover_tickers,
+    discover_with_details,
+    format_discovery_table,
+)
+from strategy.base_strategy import BaseStrategy
+from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_probs, build_strategy
+from monitoring.session_table import SessionMonitor
 from trading.portfolio_monitor import PortfolioMonitor
 
 
 # ── Tickers to trade ──────────────────────────────────────────────────────────
 # Override via env var: KALSHI_TICKERS="TICK1,TICK2,TICK3"
 
-TICKERS: list[str] = os.getenv(
-    "KALSHI_TICKERS", "PRES-2024-DEM,INXD-23DEC29-B4700"
-).split(",")
+def _load_tickers() -> list[str]:
+    raw = os.getenv("KALSHI_TICKERS", "PRES-2024-DEM,INXD-23DEC29-B4700")
+    return [t.strip() for t in raw.split(",") if t.strip()]
 
 # Alert evaluation interval (seconds)
 ALERT_INTERVAL_SECONDS: float = 30.0
+
+# Live terminal table refresh (seconds); 0 = disabled
+MONITOR_INTERVAL_SECONDS: float = float(
+    os.getenv("KALSHI_MONITOR_INTERVAL", "15")
+)
 
 
 # ── Module-level handles ──────────────────────────────────────────────────────
@@ -64,9 +79,10 @@ _execution:          ExecutionManager  | None = None
 _settlement_watcher: SettlementWatcher | None = None
 _portfolio_monitor:  PortfolioMonitor  | None = None
 _alert_manager:      AlertManager      | None = None
+_session_monitor:    SessionMonitor    | None = None
 _blotter:            Blotter           | None = None
 _circuit_breaker:    CircuitBreaker    | None = None
-_strategy:           KellyStrategy     | None = None
+_strategy:           BaseStrategy      | None = None
 _store:              MetricsStore      | None = None
 _shutdown_event = asyncio.Event()
 
@@ -188,24 +204,20 @@ async def on_tick(tick: dict[str, Any]) -> None:
 
 def on_fill_received(fill: dict[str, Any]) -> None:
     """
-    Called when a confirmed fill arrives via the WebSocket trade stream.
+    Called when a confirmed fill arrives via the WebSocket ``fill`` channel.
 
-    This is the authoritative fill record — use it to:
-      - Advance strategy state machines (green-up, arb leg tracking)
-      - Update the circuit breaker's position state
-      - Confirm fill in the alert manager (clears fill-timeout timer)
-      - Mark signal as filled in MetricsStore
-
-    Wire this into market_ingestor.py's _apply_trade() method.
+    Authoritative fill record — advances strategy state machines, updates risk,
+    and clears fill-timeout alerts.
     """
     order_id = fill.get("order_id", "")
     ticker   = fill.get("ticker", "")
 
-    # Advance strategy state (green-up hedge trigger, arb leg 2 readiness)
     if _strategy:
         _strategy.on_fill(fill)
 
-    # Update circuit breaker position inventory
+    if _execution:
+        _execution.record_fill(fill)
+
     if _circuit_breaker:
         _circuit_breaker.record_fill(fill)
 
@@ -246,16 +258,264 @@ def _handle_signal(sig, frame) -> None:
     _shutdown_event.set()
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Kalshi prediction market trading bot")
+    parser.add_argument(
+        "--strategy",
+        default=os.getenv("KALSHI_STRATEGY", "kelly"),
+        choices=list(VALID_STRATEGIES),
+        help="Strategy engine (default: kelly, or KALSHI_STRATEGY env)",
+    )
+    parser.add_argument(
+        "--tickers",
+        default=None,
+        help="Comma-separated tickers (overrides KALSHI_TICKERS)",
+    )
+    parser.add_argument(
+        "--model-prob",
+        nargs="*",
+        metavar="TICKER:PROB",
+        help="Kelly: model P(YES) per ticker, e.g. PRES-2024-DEM:0.62",
+    )
+    parser.add_argument("--entry-max",     type=int,   default=None)
+    parser.add_argument("--hedge-trigger", type=int,   default=None)
+    parser.add_argument(
+        "--hedge-mode",
+        default=None,
+        choices=["full_green", "stake_back", "partial"],
+    )
+    parser.add_argument("--stop-loss", type=float, default=None)
+    parser.add_argument(
+        "--comp-pairs",
+        nargs="*",
+        metavar="T1:T2",
+        help="Arb: complementary pairs, e.g. PRES-DEM:PRES-REP",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=float,
+        default=None,
+        help=(
+            "Live terminal table refresh in seconds "
+            f"(default {MONITOR_INTERVAL_SECONDS}, 0=off; env KALSHI_MONITOR_INTERVAL)"
+        ),
+    )
+    parser.add_argument(
+        "--monitor-no-clear",
+        action="store_true",
+        help="Append monitor tables instead of clearing the screen each refresh",
+    )
+
+    # Auto-discovery: top N tickers in a category matching filters
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help=(
+            "Discover tickers automatically (category + filters) instead of "
+            "KALSHI_TICKERS / --tickers"
+        ),
+    )
+    parser.add_argument(
+        "--discover-category",
+        type=str,
+        default=None,
+        help="Category for discovery, e.g. Sports (or KALSHI_DISCOVER_CATEGORY)",
+    )
+    parser.add_argument("--discover-top", type=int, default=None,
+                        help="Max tickers to trade (default 10; env KALSHI_DISCOVER_TOP)")
+    parser.add_argument(
+        "--discover-min-volume",
+        type=int,
+        default=None,
+        help="Minimum 24h contract volume (env KALSHI_DISCOVER_MIN_VOLUME)",
+    )
+    parser.add_argument(
+        "--discover-max-yes-ask",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Only markets with YES ask <= CENTS, e.g. 25 for underdog entries",
+    )
+    parser.add_argument(
+        "--discover-min-yes-ask",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Only markets with YES ask >= CENTS",
+    )
+    parser.add_argument(
+        "--discover-max-spread",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Maximum bid-ask spread in cents",
+    )
+    parser.add_argument(
+        "--discover-activity-hours",
+        type=float,
+        default=None,
+        metavar="HOURS",
+        help=(
+            "Only markets updated within HOURS (live / recently active; "
+            "env KALSHI_DISCOVER_ACTIVITY_HOURS)"
+        ),
+    )
+    parser.add_argument(
+        "--discover-full-scan",
+        action="store_true",
+        help="Scan all open events in category before ranking (slower, fewer misses)",
+    )
+    parser.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="Run discovery, print selected tickers, and exit (no trading)",
+    )
+    parser.add_argument(
+        "--discover-no-tradeable-filter",
+        action="store_true",
+        help="Include markets that fail is_tradeable() (wide spread, etc.)",
+    )
+
+    return parser.parse_args(argv)
+
+
+def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | None:
+    """Merge CLI discover flags with KALSHI_DISCOVER_* env defaults."""
+    if not args.discover and not criteria_from_env():
+        return None
+
+    env = criteria_from_env()
+    category = (args.discover_category or (env.category if env else "") or "").strip()
+    if not category:
+        return None
+
+    def _pick(cli_val, env_val, default):
+        if cli_val is not None:
+            return cli_val
+        if env_val is not None:
+            return env_val
+        return default
+
+    activity = args.discover_activity_hours
+    if activity is None and env:
+        activity = env.activity_hours
+
+    full_scan = args.discover_full_scan or (env.full_scan if env else False)
+    if activity is not None and not args.discover_full_scan:
+        full_scan = True
+
+    return TickerCriteria(
+        category=category,
+        top_n=_pick(args.discover_top, env.top_n if env else None, 10),
+        min_volume_24h=_pick(
+            args.discover_min_volume, env.min_volume_24h if env else None, 0
+        ),
+        max_yes_ask=args.discover_max_yes_ask if args.discover_max_yes_ask is not None
+        else (env.max_yes_ask if env else None),
+        min_yes_ask=args.discover_min_yes_ask if args.discover_min_yes_ask is not None
+        else (env.min_yes_ask if env else None),
+        max_spread=args.discover_max_spread if args.discover_max_spread is not None
+        else (env.max_spread if env else None),
+        activity_hours=activity,
+        full_scan=full_scan,
+        tradeable_only=not args.discover_no_tradeable_filter
+        and (env.tradeable_only if env else True),
+    )
+
+
+async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
+    """
+    Explicit --tickers wins; else --discover / KALSHI_DISCOVER; else env list.
+    """
+    if args.tickers:
+        return [t.strip() for t in args.tickers.split(",") if t.strip()]
+
+    if not (args.discover or criteria_from_env()):
+        return _load_tickers()
+
+    criteria = _discover_criteria_from_args(args)
+    if criteria is None:
+        logger.error(
+            "Discovery requires --discover-category NAME "
+            "(or KALSHI_DISCOVER_CATEGORY in .env)"
+        )
+        sys.exit(1)
+
+    credentials = CredentialManager()
+    rate_limiter = RateLimiter()
+
+    if args.discover_only:
+        tickers, markets = await discover_with_details(
+            credentials, rate_limiter, criteria
+        )
+        print(format_discovery_table(markets, tickers, criteria))
+        if not tickers:
+            logger.error(
+                "Discovery matched no tickers — relax filters or use --discover-full-scan",
+                category=criteria.category,
+            )
+            sys.exit(1)
+        print(f"\n  KALSHI_TICKERS=\"{','.join(tickers)}\"\n")
+        sys.exit(0)
+
+    tickers = await discover_tickers(credentials, rate_limiter, criteria)
+    if not tickers:
+        logger.error(
+            "Discovery matched no tickers — relax filters, add --discover-full-scan, "
+            "or pass --tickers explicitly",
+            category=criteria.category,
+        )
+        sys.exit(1)
+    return tickers
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main() -> None:
+async def main(args: argparse.Namespace | None = None) -> None:
     global _ingestor, _execution, _strategy, _circuit_breaker
     global _store, _blotter, _settlement_watcher
-    global _portfolio_monitor, _alert_manager
+    global _portfolio_monitor, _alert_manager, _session_monitor
+
+    if args is None:
+        args = parse_args()
+
+    tickers = await _resolve_tickers(args)
+    if not tickers:
+        logger.error(
+            "No tickers configured — set KALSHI_TICKERS, pass --tickers, "
+            "or use --discover --discover-category <NAME>"
+        )
+        sys.exit(1)
+
+    model_probs = _parse_model_probs(
+        ",".join(args.model_prob) if args.model_prob else os.getenv("KALSHI_MODEL_PROB")
+    )
+    comp_pairs = (
+        _parse_comp_pairs(",".join(args.comp_pairs))
+        if args.comp_pairs
+        else _parse_comp_pairs(os.getenv("KALSHI_ARB_PAIRS"))
+    )
 
     # ── Startup validation ────────────────────────────────────────────────────
     if config.ENV == "production" and not config.API_KEY_ID:
         logger.error("KALSHI_API_KEY_ID not set — cannot start in production mode")
+        sys.exit(1)
+
+    try:
+        _strategy = build_strategy(
+            args.strategy,
+            tickers,
+            model_probs=model_probs,
+            entry_max=args.entry_max,
+            hedge_trigger=args.hedge_trigger,
+            hedge_mode=args.hedge_mode,
+            stop_loss=args.stop_loss,
+            comp_pairs=comp_pairs,
+        )
+    except ValueError as exc:
+        logger.error(str(exc))
         sys.exit(1)
 
     # ── Instantiate all modules ───────────────────────────────────────────────
@@ -264,7 +524,6 @@ async def main() -> None:
     _store           = MetricsStore()
     _blotter         = Blotter()
     calculator       = MetricsCalculator(_store)
-    _strategy        = KellyStrategy()
     _circuit_breaker = CircuitBreaker(kill_switch=kill_switch)
     _execution       = ExecutionManager(credentials, rate_limiter)
 
@@ -283,8 +542,9 @@ async def main() -> None:
     _alert_manager = AlertManager(blotter=_blotter)
 
     _ingestor = MarketIngestor(
-        tickers=TICKERS,
+        tickers=tickers,
         on_tick=on_tick,
+        on_fill=on_fill_received,
         credentials=credentials,
     )
 
@@ -318,14 +578,39 @@ async def main() -> None:
         _ingestor.run(), name="market_ingestor"
     )
 
+    monitor_task = None
+    monitor_interval = (
+        args.monitor_interval
+        if args.monitor_interval is not None
+        else MONITOR_INTERVAL_SECONDS
+    )
+    if monitor_interval > 0:
+        _session_monitor = SessionMonitor(
+            tickers=tickers,
+            strategy=_strategy,
+            ingestor=_ingestor,
+            execution=_execution,
+            portfolio_monitor=_portfolio_monitor,
+            alert_manager=_alert_manager,
+            blotter=_blotter,
+            calculator=calculator,
+            interval_seconds=monitor_interval,
+            clear_screen=not args.monitor_no_clear,
+        )
+        monitor_task = asyncio.create_task(
+            _session_monitor.run(), name="session_monitor"
+        )
+
     logger.info(
         "Kalshi trading bot started",
         env=config.ENV,
-        tickers=TICKERS,
+        strategy=_strategy.name,
+        tickers=tickers,
         kelly_divisor=config.KELLY_DIVISOR,
         max_drawdown_pct=config.MAX_DRAWDOWN_PCT,
         fee_per_contract_cents=config.FEE_PER_CONTRACT_CENTS,
         alert_interval_seconds=ALERT_INTERVAL_SECONDS,
+        monitor_interval_seconds=monitor_interval,
     )
 
     # Startup metrics from calculator
@@ -358,6 +643,16 @@ async def main() -> None:
         await ingestor_task
     except asyncio.CancelledError:
         pass
+
+    # Stop session monitor
+    if _session_monitor:
+        _session_monitor.stop()
+    if monitor_task:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
 
     # Stop alert manager
     alert_task.cancel()
@@ -408,7 +703,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import sys
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))

@@ -59,5 +59,17 @@ python tools/screen.py screen --category Politics
 
 # Copy the tickers to your environment and start the bot
 # The browse command prints this at the bottom automatically:
-export KALSHI_TICKERS="PRES-2028-DEM,PRES-2028-REP"
+export KALSHI_TICKERS="KXTIMEDECADE20S-30-TAY" 
+#"PRES-2028-DEM,PRES-2028-REP"
 python main.py
+
+
+# Screen a category and score for all strategies
+python tools/screen.py browse --category Politics --min-volume 500
+
+python tools/screen.py browse --category Politics --activity-hours 2 --min-volume 100 --full-scan
+
+python tools/screen.py browse --category Politics --activity-hours 2 --min-volume 100 --full-scan
+
+python tools/screen.py browse --category Sports --activity-hours 2 --min-volume 50 --full-scan
+

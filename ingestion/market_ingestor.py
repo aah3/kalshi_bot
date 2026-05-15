@@ -100,6 +100,44 @@ class OrderBook:
 # ── Ingestor ─────────────────────────────────────────────────────────────────
 
 TickCallback = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
+FillCallback = Callable[[dict[str, Any]], None]
+
+
+def normalize_fill_message(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Convert a Kalshi WebSocket ``fill`` channel payload to the internal fill dict
+    consumed by strategies, the circuit breaker, and the blotter hooks.
+    """
+    ticker = data.get("market_ticker", "")
+    side   = (data.get("purchased_side") or data.get("side") or "yes").lower()
+
+    if data.get("yes_price_dollars") is not None:
+        yes_price_cents = int(round(float(data["yes_price_dollars"]) * 100))
+    elif data.get("yes_price") is not None:
+        yes_price_cents = int(data["yes_price"])
+    else:
+        yes_price_cents = 0
+
+    price_cents = yes_price_cents if side == "yes" else max(100 - yes_price_cents, 0)
+
+    if data.get("count_fp") is not None:
+        contracts = int(float(data["count_fp"]))
+    else:
+        contracts = int(data.get("count") or 0)
+
+    size_cents = contracts * price_cents
+
+    return {
+        "ticker":     ticker,
+        "side":       side,
+        "price":      price_cents,
+        "contracts":  contracts,
+        "size_cents": size_cents,
+        "order_id":   data.get("order_id", ""),
+        "trade_id":   data.get("trade_id", ""),
+        "is_taker":   data.get("is_taker"),
+        "action":     data.get("action"),
+    }
 
 
 class MarketIngestor:
@@ -110,6 +148,8 @@ class MarketIngestor:
         tickers:      List of Kalshi market tickers to subscribe to.
         on_tick:      Async callback invoked on every normalised tick event.
         credentials:  CredentialManager instance for authenticated WS handshake.
+        on_fill:      Sync callback for authenticated user fill notifications
+                      (subscribes to the ``fill`` channel when provided).
 
     Usage:
         ingestor = MarketIngestor(tickers=["PRES-2024-DEM"], on_tick=my_handler)
@@ -124,9 +164,11 @@ class MarketIngestor:
         tickers: list[str],
         on_tick: TickCallback,
         credentials=None,
+        on_fill: FillCallback | None = None,
     ) -> None:
         self._tickers     = tickers
         self._on_tick     = on_tick
+        self._on_fill     = on_fill
         self._credentials = credentials
         self._books: dict[str, OrderBook] = {t: OrderBook(ticker=t) for t in tickers}
         self._running     = False
@@ -189,11 +231,20 @@ class MarketIngestor:
 
     async def _subscribe(self, ws) -> None:
         """Send subscription commands for all tickers."""
+        channels = ["orderbook_delta", "trade"]
+        if self._on_fill:
+            if self._credentials:
+                channels.append("fill")
+            else:
+                logger.warning(
+                    "on_fill provided but no credentials — fill channel not subscribed"
+                )
+
         sub_msg = {
             "id":     1,
             "cmd":    "subscribe",
             "params": {
-                "channels":      ["orderbook_delta", "trade"],
+                "channels":       channels,
                 "market_tickers": self._tickers,
             },
         }
@@ -215,6 +266,8 @@ class MarketIngestor:
             self._apply_delta(data)
         elif msg_type == "trade":
             self._apply_trade(data)
+        elif msg_type == "fill":
+            self._apply_fill(data)
         # Ignore heartbeats and subscription confirmations
 
     def _apply_snapshot(self, data: dict) -> None:
@@ -257,6 +310,17 @@ class MarketIngestor:
 
         book.last_trade_price = data.get("yes_price")
         self._emit_tick(book, event_type="trade")
+
+    def _apply_fill(self, data: dict) -> None:
+        """User order fill from the authenticated ``fill`` channel."""
+        if not self._on_fill:
+            return
+
+        fill = normalize_fill_message(data)
+        if not fill.get("ticker"):
+            return
+
+        self._on_fill(fill)
 
     def _emit_tick(self, book: OrderBook, event_type: str) -> None:
         snap = book.snapshot()

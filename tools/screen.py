@@ -23,6 +23,9 @@ BROWSE COMMANDS  (find tickers and understand market economics)
   # Browse with minimum 24h volume filter
   python tools/screen.py browse --category Economics --min-volume 500
 
+  # Recently active markets (updated in last 2h) + full scan so nothing hot is missed
+  python tools/screen.py browse --category Politics --activity-hours 2 --full-scan
+
   # Browse ALL open markets across all categories
   python tools/screen.py browse --all
 
@@ -284,6 +287,8 @@ async def cmd_browse(args) -> None:
     """Browse markets — shows full payout economics for each market."""
     creds, limiter = CredentialManager(), RateLimiter()
     min_vol = getattr(args, "min_volume", 0) or 0
+    activity_hours = getattr(args, "activity_hours", None)
+    full_scan = getattr(args, "full_scan", False) or activity_hours is not None
 
     async with MarketClient(creds, limiter) as client:
 
@@ -310,8 +315,14 @@ async def cmd_browse(args) -> None:
                 status="open",
                 limit=200,
                 min_volume_24h=min_vol,
+                activity_hours=activity_hours,
+                full_scan=full_scan,
             )
             title = f"Category: {args.category}"
+            if activity_hours:
+                title += f"  (active ≤{activity_hours}h)"
+            if full_scan:
+                title += "  [full scan]"
 
         # ── All open markets ──────────────────────────────────────────────────
         elif args.all:
@@ -434,6 +445,10 @@ p_browse.add_argument("--ticker",     type=str, help="Single market full detail"
 p_browse.add_argument("--all",        action="store_true", help="Browse all open markets")
 p_browse.add_argument("--min-volume", type=int, default=0,
                       help="Minimum 24h volume filter (default: 0)")
+p_browse.add_argument("--activity-hours", type=float, default=None, metavar="HOURS",
+                      help="Only markets updated within HOURS (recent-activity proxy)")
+p_browse.add_argument("--full-scan", action="store_true",
+                      help="Scan all open events before ranking (slower, fewer misses)")
 p_browse.add_argument("--json",       action="store_true", help="Output as JSON")
 p_browse.add_argument("--csv",        type=str, default=None, metavar="FILE.csv",
                       help="Export to CSV file")

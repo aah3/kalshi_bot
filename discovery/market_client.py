@@ -69,6 +69,7 @@ class MarketSummary:
     # Market lifecycle
     status:          str          # "open", "closed", "settled"
     close_time:      datetime | None
+    updated_at:      datetime | None   # last metadata/trade update (API: updated_time)
     result:          str | None   # "yes" / "no" / None if unresolved
 
     # Derived screening fields (computed on construction)
@@ -78,6 +79,7 @@ class MarketSummary:
     yes_decimal_odds: float       = field(init=False)   # 100 / yes_ask
     no_decimal_odds:  float       = field(init=False)   # 100 / no_ask
     minutes_to_close: float | None = field(init=False)
+    minutes_since_update: float | None = field(init=False)
 
     def __post_init__(self) -> None:
         bid = self.yes_bid or 0
@@ -91,11 +93,15 @@ class MarketSummary:
         no_ask_val            = self.no_ask or (100 - bid)
         self.no_decimal_odds  = round(100.0 / no_ask_val, 3) if no_ask_val > 0 else 0.0
 
+        now = datetime.now(timezone.utc)
         if self.close_time:
-            delta = self.close_time - datetime.now(timezone.utc)
-            self.minutes_to_close = delta.total_seconds() / 60.0
+            self.minutes_to_close = (self.close_time - now).total_seconds() / 60.0
         else:
             self.minutes_to_close = None
+        if self.updated_at:
+            self.minutes_since_update = (now - self.updated_at).total_seconds() / 60.0
+        else:
+            self.minutes_since_update = None
 
     def is_tradeable(self) -> bool:
         """Basic sanity check before handing to the strategy engine."""
@@ -150,6 +156,8 @@ class MarketSummary:
             "status":              self.status,
             "close_time":          self.close_time.isoformat() if self.close_time else None,
             "minutes_to_close":    round(self.minutes_to_close, 1) if self.minutes_to_close else None,
+            "updated_at":          self.updated_at.isoformat() if self.updated_at else None,
+            "minutes_since_update": round(self.minutes_since_update, 1) if self.minutes_since_update is not None else None,
             "is_tradeable":        self.is_tradeable(),
         }
 
@@ -250,6 +258,8 @@ class MarketClient:
         status: str = "open",
         limit: int = 100,
         min_volume_24h: int = 0,
+        activity_hours: float | None = None,
+        full_scan: bool = False,
     ) -> list[MarketSummary]:
         """
         Fetch open markets in a given category.
@@ -258,15 +268,22 @@ class MarketClient:
         category label and its child markets in one response. This avoids
         thousands of per-series /markets calls (which trip demo rate limits)
         and full-catalog /markets scans.
+
+        Args:
+            min_volume_24h: Minimum contracts traded in the last 24 hours.
+            activity_hours: If set, only markets whose updated_time is within
+                this many hours (proxy for recent activity; Kalshi does not
+                expose a native 2h volume field on list endpoints).
+            full_scan: Paginate through all open events before ranking, so
+                high-volume markets are not missed due to early stopping.
         """
         category_lc = category.lower()
         collected: list[MarketSummary] = []
         cursor: str | None = None
         pages = 0
         events_matched = 0
-        # Enough candidates to rank by 24h volume; cap pages for rate limits.
-        target_pool = max(limit * 5, 400) if limit else 0
-        max_pages = 50
+        target_pool = 0 if full_scan else (max(limit * 5, 400) if limit else 0)
+        max_pages = 500 if full_scan else 50
 
         while pages < max_pages:
             params: dict[str, Any] = {
@@ -294,10 +311,13 @@ class MarketClient:
                         raw["series_ticker"] = series_tk
                     raw["_category_override"] = category
                     m = self._parse_market(raw)
-                    if m.volume_24h >= min_volume_24h:
-                        collected.append(m)
+                    if m.volume_24h < min_volume_24h:
+                        continue
+                    if activity_hours is not None and not self._matches_activity_hours(m, activity_hours):
+                        continue
+                    collected.append(m)
 
-            if limit and len(collected) >= target_pool:
+            if target_pool and limit and len(collected) >= target_pool:
                 break
             if not cursor or not batch:
                 break
@@ -541,6 +561,14 @@ class MarketClient:
     # ── Parsing ───────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _matches_activity_hours(market: MarketSummary, activity_hours: float) -> bool:
+        """True if the market was updated within the last activity_hours."""
+        if market.updated_at is None:
+            return False
+        age_hours = (datetime.now(timezone.utc) - market.updated_at).total_seconds() / 3600.0
+        return age_hours <= activity_hours
+
+    @staticmethod
     def _market_matches_status(market_status: str | None, requested: str) -> bool:
         """Kalshi uses 'active' for tradeable markets; callers pass status='open'."""
         m = (market_status or "").lower()
@@ -623,5 +651,6 @@ class MarketClient:
             liquidity=_metric_int("liquidity", "liquidity_dollars"),
             status=market_status,
             close_time=_dt(raw.get("close_time") or raw.get("expiration_time")),
+            updated_at=_dt(raw.get("updated_time")),
             result=raw.get("result"),
         )

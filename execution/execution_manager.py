@@ -190,18 +190,18 @@ class ExecutionManager:
 
     def record_fill(self, fill_event: dict[str, Any]) -> None:
         """
-        Call when a fill is received from the WebSocket trade stream.
-        Removes the order from open_orders tracking and logs the fill.
+        Call when a fill is received from the WebSocket ``fill`` channel.
+        Removes the order from open_orders tracking.
         """
         order_id   = fill_event.get("order_id", "")
-        filled_qty = fill_event.get("count", 0)
-        price      = fill_event.get("yes_price", 0)
+        contracts  = fill_event.get("contracts", fill_event.get("count", 0))
+        price      = fill_event.get("price", fill_event.get("yes_price", 0))
 
         self._open_orders.pop(order_id, None)
 
         logger.fill_received(
             order_id=order_id,
-            filled_cents=filled_qty,
+            contracts=contracts,
             price=price,
             ticker=fill_event.get("ticker", ""),
             side=fill_event.get("side", ""),
