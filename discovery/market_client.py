@@ -109,25 +109,48 @@ class MarketSummary:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        # Payout is always $1.00 per contract on Kalshi binary markets.
+        # Cost to enter = ask price (cents / 100 dollars per contract).
+        yes_cost_usd = round(self.yes_ask / 100, 2) if self.yes_ask else None
+        no_cost_usd  = round(self.no_ask  / 100, 2) if self.no_ask  else None
+        yes_roi_pct  = round((1.0 - self.yes_ask / 100) / (self.yes_ask / 100) * 100, 1) if self.yes_ask else None
+        no_roi_pct   = round((1.0 - self.no_ask  / 100) / (self.no_ask  / 100) * 100, 1) if self.no_ask  else None
+
         return {
-            "ticker":           self.ticker,
-            "event_ticker":     self.event_ticker,
-            "title":            self.title,
-            "category":         self.category,
-            "yes_bid":          self.yes_bid,
-            "yes_ask":          self.yes_ask,
-            "spread":           self.spread,
-            "mid_price":        self.mid_price,
-            "implied_prob":     round(self.implied_prob, 4),
-            "yes_decimal_odds": self.yes_decimal_odds,
-            "no_decimal_odds":  self.no_decimal_odds,
-            "volume_24h":       self.volume_24h,
-            "open_interest":    self.open_interest,
-            "liquidity":        self.liquidity,
-            "status":           self.status,
-            "close_time":       self.close_time.isoformat() if self.close_time else None,
-            "minutes_to_close": round(self.minutes_to_close, 1) if self.minutes_to_close else None,
-            "is_tradeable":     self.is_tradeable(),
+            # ── Identity ─────────────────────────────────────────────────────
+            "ticker":              self.ticker,
+            "event_ticker":        self.event_ticker,
+            "title":               self.title,
+            "category":            self.category,
+            # ── Pricing ──────────────────────────────────────────────────────
+            "yes_bid":             self.yes_bid,
+            "yes_ask":             self.yes_ask,
+            "no_bid":              self.no_bid,
+            "no_ask":              self.no_ask,
+            "spread":              self.spread,
+            "last_price":          self.last_price,
+            # ── Probability ───────────────────────────────────────────────────
+            "mid_price":           self.mid_price,
+            "implied_prob_pct":    round(self.implied_prob * 100, 1),  # e.g. 62.5
+            "yes_decimal_odds":    self.yes_decimal_odds,              # e.g. 1.61
+            "no_decimal_odds":     self.no_decimal_odds,               # e.g. 2.50
+            # ── Payout (per 1 contract = $1.00 at resolution) ────────────────
+            "payout_per_contract_usd": 1.00,                           # always $1
+            "yes_cost_usd":        yes_cost_usd,   # what you pay to buy 1 YES
+            "no_cost_usd":         no_cost_usd,    # what you pay to buy 1 NO
+            "yes_profit_if_win_usd": round(1.0 - yes_cost_usd, 2) if yes_cost_usd else None,
+            "no_profit_if_win_usd":  round(1.0 - no_cost_usd,  2) if no_cost_usd  else None,
+            "yes_roi_pct":         yes_roi_pct,    # return on investment if YES wins
+            "no_roi_pct":          no_roi_pct,     # return on investment if NO  wins
+            # ── Liquidity ─────────────────────────────────────────────────────
+            "volume_24h":          self.volume_24h,
+            "open_interest":       self.open_interest,
+            "liquidity":           self.liquidity,
+            # ── Lifecycle ─────────────────────────────────────────────────────
+            "status":              self.status,
+            "close_time":          self.close_time.isoformat() if self.close_time else None,
+            "minutes_to_close":    round(self.minutes_to_close, 1) if self.minutes_to_close else None,
+            "is_tradeable":        self.is_tradeable(),
         }
 
 
@@ -179,8 +202,13 @@ class MarketClient:
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> "MarketClient":
+        # Discovery responses (events with nested markets) can be large and slow.
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=config.ORDER_TIMEOUT_SECONDS)
+            timeout=aiohttp.ClientTimeout(
+                total=60.0,
+                connect=10.0,
+                sock_read=60.0,
+            )
         )
         return self
 
@@ -224,36 +252,73 @@ class MarketClient:
         min_volume_24h: int = 0,
     ) -> list[MarketSummary]:
         """
-        Fetch all open markets in a given category.
+        Fetch open markets in a given category.
 
-        Args:
-            category:       Category string as returned by get_categories().
-            status:         "open" | "closed" | "settled" (default "open").
-            limit:          Max markets to return (Kalshi max per page = 200).
-            min_volume_24h: Pre-filter — skip markets with less 24h volume.
-
-        Returns:
-            List of MarketSummary, sorted by 24h volume descending.
+        Uses GET /events with nested markets: each event carries a
+        category label and its child markets in one response. This avoids
+        thousands of per-series /markets calls (which trip demo rate limits)
+        and full-catalog /markets scans.
         """
-        params = {
-            "status":   status,
-            "category": category,
-            "limit":    min(limit, 200),
-        }
-        data    = await self._get("/markets", params=params)
-        raw     = data.get("markets", [])
-        markets = [self._parse_market(m) for m in raw]
-        markets = [m for m in markets if m.volume_24h >= min_volume_24h]
-        markets.sort(key=lambda m: m.volume_24h, reverse=True)
+        category_lc = category.lower()
+        collected: list[MarketSummary] = []
+        cursor: str | None = None
+        pages = 0
+        events_matched = 0
+        # Enough candidates to rank by 24h volume; cap pages for rate limits.
+        target_pool = max(limit * 5, 400) if limit else 0
+        max_pages = 50
+
+        while pages < max_pages:
+            params: dict[str, Any] = {
+                "status":              status,
+                "limit":               200,
+                "with_nested_markets": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            data   = await self._get("/events", params=params)
+            batch  = data.get("events", [])
+            cursor = data.get("cursor")
+            pages += 1
+
+            for event in batch:
+                if (event.get("category") or "").lower() != category_lc:
+                    continue
+                events_matched += 1
+                series_tk = event.get("series_ticker", "")
+                for raw in event.get("markets", []):
+                    if status and not self._market_matches_status(raw.get("status"), status):
+                        continue
+                    if not raw.get("series_ticker"):
+                        raw["series_ticker"] = series_tk
+                    raw["_category_override"] = category
+                    m = self._parse_market(raw)
+                    if m.volume_24h >= min_volume_24h:
+                        collected.append(m)
+
+            if limit and len(collected) >= target_pool:
+                break
+            if not cursor or not batch:
+                break
+
+        if not collected and events_matched == 0:
+            logger.warning("No events found for category", category=category)
+            return []
+
+        collected.sort(key=lambda m: m.volume_24h, reverse=True)
+        result = collected[:limit] if limit else collected
 
         logger.info(
             "Fetched markets by category",
             category=category,
-            total=len(markets),
-            tradeable=sum(1 for m in markets if m.is_tradeable()),
+            pages_scanned=pages,
+            events_matched=events_matched,
+            matched=len(collected),
+            total=len(result),
+            tradeable=sum(1 for m in result if m.is_tradeable()),
         )
-        return markets
-
+        return result
     async def get_all_open_markets(
         self,
         limit: int = 200,
@@ -265,6 +330,14 @@ class MarketClient:
         Paginates automatically until `limit` is reached or no more pages.
         Pre-filters by min_volume_24h to avoid illiquid noise.
         """
+        # Build series_ticker -> category lookup first (category removed from /markets)
+        series_data    = await self._get("/series")
+        series_cat_map = {
+            s["ticker"]: s.get("category", "Unknown")
+            for s in series_data.get("series", [])
+            if s.get("ticker")
+        }
+
         markets: list[MarketSummary] = []
         cursor: str | None = None
 
@@ -281,6 +354,9 @@ class MarketClient:
             cursor = data.get("cursor")
 
             for raw in batch:
+                # Inject category from series lookup
+                series_tk = raw.get("series_ticker", "")
+                raw["_category_override"] = series_cat_map.get(series_tk, "Unknown")
                 m = self._parse_market(raw)
                 if m.volume_24h >= min_volume_24h:
                     markets.append(m)
@@ -429,8 +505,10 @@ class MarketClient:
         self,
         path: str,
         params: dict[str, Any] | None = None,
+        *,
+        max_429_retries: int = 8,
     ) -> dict[str, Any]:
-        """Signed GET request with rate limiting."""
+        """Signed GET request with rate limiting and 429 retries."""
         full_path = f"/trade-api/v2{path}"
         if params:
             qs = "&".join(f"{k}={v}" for k, v in params.items())
@@ -438,37 +516,72 @@ class MarketClient:
         else:
             signing_path = full_path
 
-        headers = self._creds.sign_request("GET", signing_path)
+        assert self._session is not None, "MarketClient must be used as async context manager"
 
-        async with self._limiter.throttle(BucketType.READ):
-            assert self._session is not None, "MarketClient must be used as async context manager"
-            resp = await self._session.get(
-                f"{config.BASE_URL}{path}",
-                params=params,
-                headers=headers,
-            )
-
-            if resp.status == 429:
-                await self._limiter.on_429(BucketType.READ)
-                # Retry once after backoff
+        for attempt in range(max_429_retries + 1):
+            async with self._limiter.throttle(BucketType.READ):
                 resp = await self._session.get(
                     f"{config.BASE_URL}{path}",
                     params=params,
                     headers=self._creds.sign_request("GET", signing_path),
                 )
 
+            if resp.status == 429:
+                if attempt >= max_429_retries:
+                    resp.raise_for_status()
+                await self._limiter.on_429(BucketType.READ)
+                continue
+
             resp.raise_for_status()
             self._limiter.reset_backoff(BucketType.READ)
             return await resp.json()
 
+        raise RuntimeError("unreachable")  # pragma: no cover
+
     # ── Parsing ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _market_matches_status(market_status: str | None, requested: str) -> bool:
+        """Kalshi uses 'active' for tradeable markets; callers pass status='open'."""
+        m = (market_status or "").lower()
+        r = requested.lower()
+        if r == "open":
+            return m in ("open", "active")
+        return m == r
 
     @staticmethod
     def _parse_market(raw: dict[str, Any]) -> MarketSummary:
         """Normalise a raw Kalshi market dict into a MarketSummary."""
 
         def _cents(val: Any) -> int | None:
-            return int(val) if val is not None else None
+            if val is None:
+                return None
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return None
+
+        def _dollars_to_cents(val: Any) -> int | None:
+            if val is None or val == "":
+                return None
+            try:
+                return int(round(float(val) * 100))
+            except (TypeError, ValueError):
+                return None
+
+        def _price_cents(cent_key: str, dollar_key: str) -> int | None:
+            return _cents(raw.get(cent_key)) or _dollars_to_cents(raw.get(dollar_key))
+
+        def _metric_int(*keys: str) -> int:
+            for key in keys:
+                val = raw.get(key)
+                if val is None or val == "":
+                    continue
+                try:
+                    return int(float(val))
+                except (TypeError, ValueError):
+                    continue
+            return 0
 
         def _dt(val: str | None) -> datetime | None:
             if not val:
@@ -478,10 +591,10 @@ class MarketClient:
             except (ValueError, AttributeError):
                 return None
 
-        yes_bid = _cents(raw.get("yes_bid"))
-        yes_ask = _cents(raw.get("yes_ask"))
-        no_bid  = _cents(raw.get("no_bid"))
-        no_ask  = _cents(raw.get("no_ask"))
+        yes_bid = _price_cents("yes_bid", "yes_bid_dollars")
+        yes_ask = _price_cents("yes_ask", "yes_ask_dollars")
+        no_bid  = _price_cents("no_bid", "no_bid_dollars")
+        no_ask  = _price_cents("no_ask", "no_ask_dollars")
 
         # Kalshi sometimes omits no_bid/no_ask — derive from YES complement
         if yes_ask is not None and no_bid is None:
@@ -489,22 +602,26 @@ class MarketClient:
         if yes_bid is not None and no_ask is None:
             no_ask = 100 - yes_bid
 
+        market_status = raw.get("status", "unknown")
+        if market_status == "active":
+            market_status = "open"
+
         return MarketSummary(
             ticker=raw.get("ticker", ""),
             event_ticker=raw.get("event_ticker", ""),
             title=raw.get("title", raw.get("subtitle", "")),
-            category=raw.get("category", "Unknown"),
+            category=raw.get("_category_override") or raw.get("category", "Unknown"),
             series_ticker=raw.get("series_ticker", ""),
             yes_bid=yes_bid,
             yes_ask=yes_ask,
             no_bid=no_bid,
             no_ask=no_ask,
-            last_price=_cents(raw.get("last_price")),
-            volume=int(raw.get("volume", 0)),
-            volume_24h=int(raw.get("volume_24h", 0)),
-            open_interest=int(raw.get("open_interest", 0)),
-            liquidity=int(raw.get("liquidity", 0)),
-            status=raw.get("status", "unknown"),
+            last_price=_price_cents("last_price", "last_price_dollars"),
+            volume=_metric_int("volume", "volume_fp"),
+            volume_24h=_metric_int("volume_24h", "volume_24h_fp"),
+            open_interest=_metric_int("open_interest", "open_interest_fp"),
+            liquidity=_metric_int("liquidity", "liquidity_dollars"),
+            status=market_status,
             close_time=_dt(raw.get("close_time") or raw.get("expiration_time")),
             result=raw.get("result"),
         )
