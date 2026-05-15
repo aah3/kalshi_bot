@@ -1,0 +1,26 @@
+# Kalshi Trading Bot — Python dependencies
+# Requires Python 3.11+
+# Install: pip install -r requirements.txt
+
+# ── Core runtime ──────────────────────────────────────────────────────────────
+
+# Load `.env` into os.environ (used at startup from config.py)
+python-dotenv>=1.0.0,<2.0.0
+
+# Async HTTP client — order placement, token refresh, REST discovery
+aiohttp>=3.9.0,<4.0.0
+
+# WebSocket client — live market data stream
+websockets>=12.0,<14.0
+
+# RSA-PSS signing — Kalshi request authentication
+cryptography>=42.0.0,<44.0.0
+
+# ── Optional: PostgreSQL backend ──────────────────────────────────────────────
+# Uncomment to switch the blotter from SQLite to Postgres.
+# Also set env var: KALSHI_POSTGRES_URL=postgresql://user:pass@host:5432/kalshi
+# psycopg2-binary>=2.9.9
+
+# ── Development / testing ─────────────────────────────────────────────────────
+# pytest is optional — tests also run with plain `python tests/test_*.py`
+# pytest>=8.0.0

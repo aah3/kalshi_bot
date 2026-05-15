@@ -1,0 +1,3 @@
+{"ts_us": 1778807264188828, "level": "INFO", "event": "SYSTEM", "msg": "Fetched categories", "count": 20, "categories": ["Climate and Weather", "Commodities", "Companies", "Crypto", "Economics", "Education", "Elections", "Entertainment", "Exotics", "Finance", "Financials", "Health", "Mentions", "Politics", "Science and Technology", "Social", "Sports", "Transportation", "World", "other"]}
+{"ts_us": 1778807297694132, "level": "INFO", "event": "SYSTEM", "msg": "Fetched markets by category", "category": "Politics", "total": 0, "tradeable": 0}
+{"ts_us": 1778807297695182, "level": "INFO", "event": "SYSTEM", "msg": "Screening markets", "total": 0, "tradeable": 0}
