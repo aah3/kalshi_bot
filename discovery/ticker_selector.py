@@ -12,10 +12,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
+
 from credentials.credential_manager import CredentialManager
 from discovery.market_client import MarketClient, MarketSummary
+from discovery.market_math import fee_adjusted_roi_if_yes_wins_pct
 from execution.rate_limiter import RateLimiter
 from logging_.structured_logger import logger
+
+RankBy = Literal["volume", "fee_adjusted_roi"]
 
 
 @dataclass(frozen=True)
@@ -28,10 +33,13 @@ class TickerCriteria:
     max_yes_ask: int | None = None
     min_yes_ask: int | None = None
     max_spread: int | None = None
+    min_fee_adjusted_roi_pct: float | None = None
+    rank_by: RankBy = "volume"
     activity_hours: float | None = None
     full_scan: bool = False
     tradeable_only: bool = True
     status: str = "open"
+    preset_name: str | None = None
 
 
 def filter_markets(
@@ -53,13 +61,36 @@ def filter_markets(
                 continue
         if criteria.max_spread is not None and m.spread > criteria.max_spread:
             continue
+        if criteria.min_fee_adjusted_roi_pct is not None:
+            if m.yes_ask is None:
+                continue
+            roi = fee_adjusted_roi_if_yes_wins_pct(
+                m.yes_ask,
+                round_trip_fees=False,
+            )
+            if roi < criteria.min_fee_adjusted_roi_pct:
+                continue
         out.append(m)
     return out
 
 
-def rank_markets(markets: list[MarketSummary]) -> list[MarketSummary]:
-    """Sort by 24h volume descending (primary discovery ranking)."""
-    return sorted(markets, key=lambda m: m.volume_24h, reverse=True)
+def _market_sort_key(market: MarketSummary, rank_by: RankBy) -> float:
+    if rank_by == "fee_adjusted_roi" and market.yes_ask is not None:
+        return fee_adjusted_roi_if_yes_wins_pct(market.yes_ask, round_trip_fees=False)
+    return float(market.volume_24h)
+
+
+def rank_markets(
+    markets: list[MarketSummary],
+    *,
+    rank_by: RankBy = "volume",
+) -> list[MarketSummary]:
+    """Sort markets for discovery (volume or fee-adjusted ROI)."""
+    return sorted(
+        markets,
+        key=lambda m: _market_sort_key(m, rank_by),
+        reverse=True,
+    )
 
 
 def select_tickers(
@@ -67,7 +98,10 @@ def select_tickers(
     criteria: TickerCriteria,
 ) -> list[str]:
     """Filter, rank by volume, return top N tickers."""
-    filtered = rank_markets(filter_markets(markets, criteria))
+    filtered = rank_markets(
+        filter_markets(markets, criteria),
+        rank_by=criteria.rank_by,
+    )
     return [m.ticker for m in filtered[: criteria.top_n]]
 
 
@@ -152,6 +186,9 @@ async def discover_tickers(
         tickers=tickers,
         top_n=criteria.top_n,
         max_yes_ask=criteria.max_yes_ask,
+        min_yes_ask=criteria.min_yes_ask,
+        rank_by=criteria.rank_by,
+        preset=criteria.preset_name,
         activity_hours=criteria.activity_hours,
     )
     return tickers
@@ -164,22 +201,36 @@ def format_discovery_table(
 ) -> str:
     """Human-readable summary for --discover-only."""
     by_ticker = {m.ticker: m for m in markets}
+    preset_line = f"  preset={criteria.preset_name}  " if criteria.preset_name else ""
     lines = [
         f"Discovery: {criteria.category}  →  {len(tickers)} ticker(s)",
         f"  filters: top={criteria.top_n}  min_vol_24h={criteria.min_volume_24h}"
+        + (f"  min_yes_ask={criteria.min_yes_ask}c" if criteria.min_yes_ask else "")
         + (f"  max_yes_ask={criteria.max_yes_ask}c" if criteria.max_yes_ask else "")
+        + (
+            f"  min_fee_roi={criteria.min_fee_adjusted_roi_pct}%"
+            if criteria.min_fee_adjusted_roi_pct is not None
+            else ""
+        )
+        + f"  rank_by={criteria.rank_by}"
+        + preset_line
         + (f"  activity_hours={criteria.activity_hours}" if criteria.activity_hours else ""),
         "",
-        f"  {'VOL24H':>8}  {'ASK':>4}  {'BID':>4}  {'TICKER':<40}  TITLE",
-        f"  {'─' * 90}",
+        f"  {'VOL24H':>8}  {'ASK':>4}  {'ROI%':>6}  {'TICKER':<40}  TITLE",
+        f"  {'─' * 95}",
     ]
     for tk in tickers:
         m = by_ticker.get(tk)
         if not m:
-            lines.append(f"  {'?':>8}  {'?':>4}  {'?':>4}  {tk}")
+            lines.append(f"  {'?':>8}  {'?':>4}  {'?':>6}  {tk}")
             continue
+        roi = (
+            f"{fee_adjusted_roi_if_yes_wins_pct(m.yes_ask):.1f}"
+            if m.yes_ask is not None
+            else "?"
+        )
         lines.append(
-            f"  {m.volume_24h:>8,}  {m.yes_ask or '?':>4}  {m.yes_bid or '?':>4}  "
+            f"  {m.volume_24h:>8,}  {m.yes_ask or '?':>4}  {roi:>6}  "
             f"{m.ticker:<40}  {m.title[:42]}"
         )
     return "\n".join(lines)

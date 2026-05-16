@@ -1,12 +1,12 @@
 # Kalshi Prediction Market Trading Bot
 
-Production-grade automated trading system for Kalshi binary prediction markets.
+Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports multiple pluggable strategies, automatic market discovery, manual order tools, offline replay, and a full trade blotter with settlement reconciliation.
 
 ## Requirements
 
 - Python 3.11+
 - A Kalshi account with API access enabled
-- API key + RSA private key (from kalshi.com/account/api-keys)
+- API key + RSA private key ([kalshi.com/account/api-keys](https://kalshi.com/account/api-keys))
 
 ---
 
@@ -18,138 +18,197 @@ Production-grade automated trading system for Kalshi binary prediction markets.
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment variables
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env with your API key and private key
+# Edit .env with KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_B64
 ```
 
-To encode your private key:
+Encode your private key:
+
 ```bash
+# Linux / macOS
 base64 -w 0 your_private_key.pem
-# Paste the output into KALSHI_PRIVATE_KEY_B64 in .env
+
+# Windows PowerShell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("your_private_key.pem"))
 ```
 
-Then load the variables:
-```bash
-export $(grep -v '^#' .env | xargs)
-```
+The bot loads `.env` on startup. Shell exports override `.env` values.
 
-### 3. Run the tests
+### 3. Run tests
 
 ```bash
-python tests/test_green_up_formulas.py   # 22/22
-python tests/test_circuit_breaker.py     # 16/16
+python -m pytest tests/ -v
 ```
 
 ---
 
-## Before your first paper trading session
+## Strategies
 
-### Step 1 — Find markets to trade
+| Strategy | CLI / env | Profile |
+|----------|-----------|---------|
+| **Kelly** | `--strategy kelly` | Fractional Kelly when model P(YES) beats the market by `MIN_EDGE_TO_VIG` |
+| **Green Up** | `--strategy green_up` | Back cheap YES, hedge when price runs (full green / stake back / partial) |
+| **Arbitrage** | `--strategy arb` | Complementary, exhaustive-set, and dominance arbs |
+| **High probability** | `--strategy high_prob` | Buy high-implied-P(YES) contracts; optional resting take-profit / stop |
+
+### High-probability strategy
+
+Buys **YES** when the market already prices a high chance of winning (default YES ask **85–97¢**), with **fee-adjusted ROI** gating so entries still clear costs after `FEE_PER_CONTRACT_CENTS`.
+
+**Entry modes** (`--hp-entry-mode` / `KALSHI_HP_ENTRY_MODE`):
+
+| Mode | Behaviour |
+|------|-----------|
+| `market` | Market order (IOC) |
+| `limit_at_ask` | Aggressive limit at best ask (default) |
+| `limit_at_bid` | Passive limit at best bid (resting) |
+| `limit_at_mid` | Limit at mid-price |
+| `limit_offset` | Limit at `bid + KALSHI_HP_LIMIT_OFFSET` |
+
+**Post-fill** (`--hp-post-fill` / `KALSHI_HP_POST_FILL`):
+
+| Mode | Behaviour |
+|------|-----------|
+| `hold` | Hold to settlement |
+| `resting_take_profit` | Resting sell YES at entry + offset |
+| `resting_stop` | IOC sell if bid breaches stop |
+| `tp_and_stop` | Resting TP plus stop on breach |
+
+---
+
+## Market discovery
+
+Automatically select tickers at startup instead of hard-coding `KALSHI_TICKERS`.
+
+### Strategy presets
+
+When you use `--discover` (or `KALSHI_DISCOVER=true`), the bot applies a **discovery preset** matching `--strategy` unless you override filters on the CLI:
+
+| Preset | Used for | Default filters |
+|--------|----------|-----------------|
+| `high_prob` | `high_prob` | YES ask 85–97¢, spread ≤8¢, min vol 200, rank by **fee-adjusted ROI** |
+| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, activity 48h |
+| `kelly` | `kelly` | Spread ≤10¢, min vol 100 |
+| `arb` | `arb` | Top 25 by volume, full scan |
+
+Force a preset: `--discover-preset high_prob`  
+Disable presets: `--discover-preset none`
+
+### Examples
 
 ```bash
-# List all categories
-python tools/screen.py --categories
+# Preview tickers only (prints KALSHI_TICKERS=... line)
+python main.py --discover --discover-category Politics --strategy high_prob --discover-only
 
-# Screen a category for the best strategy fits
-python tools/screen.py --category Politics
+# Discover and trade with high-prob defaults
+python main.py --discover --discover-category Sports --strategy high_prob
 
-# Full detail on a specific market
-python tools/screen.py --ticker PRES-2024-DEM
+# Override preset floor but keep ranking
+python main.py --discover --discover-category Politics --strategy high_prob \
+  --discover-min-yes-ask 88 --discover-rank-by fee_adjusted_roi
 
-# Screen an entire event (also runs arb detection)
-python tools/screen.py --event PRES-2024
+# Green-up discovery (underdog window)
+python main.py --discover --discover-category Sports --strategy green_up --discover-only
 ```
 
-### Step 2 — Set tickers and start the bot
+### Discovery environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `KALSHI_DISCOVER` | `true` to enable discovery via env |
+| `KALSHI_DISCOVER_CATEGORY` | e.g. `Politics`, `Sports` |
+| `KALSHI_DISCOVER_TOP` | Max tickers (default 10) |
+| `KALSHI_DISCOVER_MIN_YES_ASK` | Minimum YES ask (cents) |
+| `KALSHI_DISCOVER_MAX_YES_ASK` | Maximum YES ask (cents) |
+| `KALSHI_DISCOVER_MAX_SPREAD` | Max spread (cents) |
+| `KALSHI_DISCOVER_MIN_VOLUME` | Min 24h volume |
+| `KALSHI_DISCOVER_ACTIVITY_HOURS` | Only recently updated markets |
+
+---
+
+## Quick start (paper trading)
+
+### 1. Screen markets
 
 ```bash
-export KALSHI_TICKERS="PRES-2024-DEM,INXD-23DEC29-B4700"
-python main.py
+python tools/screen.py categories
+python tools/screen.py browse --category Politics
+python tools/screen.py screen --category Politics
+python tools/screen.py browse --ticker SOME-TICKER
 ```
 
-The bot defaults to `KALSHI_ENV=demo` (paper money). It will not touch
-real money unless you explicitly set `KALSHI_ENV=production`.
+The screener scores each market for Kelly, Green Up, **high_prob**, and arbitrage fit.
 
-### Step 3 — Place manual orders
+### 2. Run the bot (demo)
 
 ```bash
-# Preview an order (no submission)
-python tools/trade.py preview --ticker PRES-2024-DEM --side yes --count 10 --price 32
+# Manual tickers
+export KALSHI_TICKERS="TICKER-A,TICKER-B"
+python main.py --strategy kelly --model-prob TICKER-A:0.62
 
-# Place a limit order
-python tools/trade.py buy --ticker PRES-2024-DEM --side yes --count 10 --price 32
+# Auto-discovery + high-probability strategy
+python main.py --discover --discover-category Politics --strategy high_prob \
+  --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
+```
 
-# Watch live P&L
+Defaults to **demo** (`KALSHI_ENV=demo`). Real money only when `KALSHI_ENV=production`.
+
+### 3. Manual orders
+
+```bash
+python tools/trade.py preview --ticker TICKER-A --side yes --count 10 --price 32
+python tools/trade.py buy --ticker TICKER-A --side yes --count 10 --price 32
 python tools/trade.py monitor --interval 15
 ```
 
-### Step 4 — Monitor the dashboard
+### 4. Dashboard and reports
 
 ```bash
 python tools/dashboard.py --interval 15 --calibration
-```
-
-### Step 5 — Review session results
-
-```bash
-# End-of-session report
 python tools/session_report.py
-
-# Full blotter history
 python tools/blotter.py trades --days 7
-
-# P&L by strategy and category
 python tools/blotter_report.py performance --days 7
-
-# Kelly calibration check
 python tools/blotter_report.py calibration --days 30
 ```
 
----
-
-## Replay recorded data offline
+### 5. Live monitor table
 
 ```bash
-# Record 30 minutes of live book data
-python tools/replay.py record \
-    --tickers PRES-2024-DEM \
-    --output data/session.jsonl \
-    --duration 1800
-
-# Replay at 100x speed through Kelly strategy
-python tools/replay.py replay \
-    --input data/session.jsonl \
-    --strategy kelly \
-    --model-prob PRES-2024-DEM:0.62 \
-    --speed 100
-
-# Replay green-up strategy
-python tools/replay.py replay \
-    --input data/session.jsonl \
-    --strategy green_up \
-    --entry-max 30 \
-    --hedge-trigger 70
-
-# Inspect a recording file
-python tools/replay.py info --input data/session.jsonl
+python main.py --strategy high_prob --tickers TICKER-A --monitor-interval 15
 ```
 
 ---
 
-## Production checklist (before setting KALSHI_ENV=production)
+## Offline replay
 
-- [ ] Two consecutive weeks of paper trading with no unhandled exceptions
-- [ ] All 38 tests passing: `python tests/test_*.py`
-- [ ] Kelly calibration ratio between 0.85–1.10 for all strategies (30+ settled trades)
-- [ ] At least one clean SIGINT shutdown observed (Ctrl-C → all orders cancelled)
-- [ ] Circuit breaker tested: temporarily set `MAX_DRAWDOWN_PCT=0.01` in config.py,
-      confirm the kill switch fires and halts the engine in demo
-- [ ] `config.py` reviewed: `KELLY_DIVISOR`, `MAX_POSITION_CENTS`,
-      `DAILY_LOSS_LIMIT_CENTS` set to values you are comfortable losing in week 1
-- [ ] `KALSHI_ENV=production` is not set in any shell profile or CI variable
+```bash
+# Record live book data
+python tools/replay.py record --tickers TICKER-A --output data/session.jsonl --duration 1800
+
+# Replay strategies
+python tools/replay.py replay --input data/session.jsonl --strategy kelly \
+  --model-prob TICKER-A:0.62 --speed 100
+
+python tools/replay.py replay --input data/session.jsonl --strategy green_up \
+  --entry-max 30 --hedge-trigger 70
+
+python tools/replay.py replay --input data/session.jsonl --strategy high_prob
+```
+
+---
+
+## Production checklist
+
+- [ ] Two+ weeks demo trading without unhandled exceptions
+- [ ] `python -m pytest tests/ -v` all green
+- [ ] Kelly calibration ratio 0.85–1.10 (30+ settled trades per strategy)
+- [ ] Clean SIGINT shutdown (orders cancelled)
+- [ ] Circuit breaker tested in demo (`MAX_DRAWDOWN_PCT=0.01`)
+- [ ] `config.py` reviewed: `MAX_POSITION_CENTS`, `DAILY_LOSS_LIMIT_CENTS`, fees
+- [ ] `KALSHI_ENV=production` not set in shell profiles by accident
 
 ---
 
@@ -157,77 +216,78 @@ python tools/replay.py info --input data/session.jsonl
 
 ```
 kalshi_bot/
-├── config.py                        All tunable parameters
-├── main.py                          Entry point, full bot lifecycle
-├── .env.example                     Environment variable template
-├── requirements.txt
-│
-├── credentials/
-│   └── credential_manager.py        RSA-PSS signing, env-var credential loading
-│
-├── ingestion/
-│   └── market_ingestor.py           WebSocket stream, local order book state
-│
+├── config.py                     Tunable parameters (fees, Kelly, HP, risk)
+├── main.py                       Bot entry point + discovery CLI
 ├── strategy/
-│   ├── base_strategy.py             Pluggable strategy interface
-│   ├── kelly_strategy.py            Fractional Kelly + edge-to-vig gating
-│   ├── arbitrage_strategy.py        Complementary, exhaustive-set, dominance arb
-│   └── green_up_strategy.py         Back High Lay Low in-play hedging
-│
-├── risk/
-│   ├── circuit_breaker.py           Kill switch, drawdown, concentration limits
-│   ├── alert_manager.py             Profit target, stop, expiry, fill timeout alerts
-│   └── kelly_calibrator.py          Brier score, reliability diagram, divisor recs
-│
-├── execution/
-│   ├── execution_manager.py         Order placement, 25-min token refresh
-│   └── rate_limiter.py              Token-bucket + exponential backoff on 429
-│
-├── logging_/
-│   └── structured_logger.py         JSON logs, microsecond timestamps
-│
-├── metrics/
-│   ├── blotter.py                   Trade blotter (legs + parent trades, SQLite/PG)
-│   ├── settlement.py                Auto-detect market resolutions, reconcile P&L
-│   ├── performance.py               Win rate, profit factor, Sortino, streaks, etc.
-│   ├── calculator.py                Sharpe, max drawdown, fill rate, edge-to-vig
-│   └── metrics_store.py             Legacy signal/equity store (for Sharpe calc)
-│
+│   ├── base_strategy.py          Signal interface
+│   ├── factory.py                build_strategy() by name
+│   ├── kelly_strategy.py         Fractional Kelly + edge-to-vig
+│   ├── green_up_strategy.py      Back high / lay low hedging
+│   ├── high_prob_strategy.py     High P(YES), fee-aware ROI, exit modes
+│   └── arbitrage_strategy.py     Multi-leg arb
 ├── discovery/
-│   ├── market_client.py             REST client: categories, markets, order books
-│   └── screener.py                  Score and rank markets by strategy fit
-│
-├── trading/
-│   ├── order_entry.py               Manual market/limit order placement + validation
-│   └── portfolio_monitor.py         Live mark-to-market P&L, position tracking
-│
-├── tools/
-│   ├── screen.py                    CLI: browse and score available markets
-│   ├── trade.py                     CLI: place orders, monitor positions
-│   ├── blotter.py                   CLI: query trade history, export CSV
-│   ├── blotter_report.py            CLI: performance analytics, calibration
-│   ├── session_report.py            CLI: end-of-day session summary
-│   ├── replay.py                    Record live WS data; replay offline
-│   └── dashboard.py                 Live terminal dashboard (all panels)
-│
-└── tests/
-    ├── test_green_up_formulas.py    22 tests — hedge math vs spec examples
-    └── test_circuit_breaker.py      16 tests — all 5 risk conditions
+│   ├── market_client.py          REST: markets, books, categories
+│   ├── screener.py               Score markets per strategy
+│   ├── ticker_selector.py        Filter, rank, select tickers
+│   ├── discovery_presets.py      Strategy-aligned discovery defaults
+│   └── market_math.py            Gross / fee-adjusted ROI helpers
+├── execution/
+│   ├── execution_manager.py      Orders (limit/market, buy/sell, TIF)
+│   └── rate_limiter.py           Token bucket + 429 backoff
+├── ingestion/
+│   └── market_ingestor.py        WebSocket order books + fills
+├── risk/
+│   ├── circuit_breaker.py        Kill switch, limits
+│   ├── alert_manager.py          P&L / expiry / fill-timeout alerts
+│   └── kelly_calibrator.py       Brier score, divisor recommendations
+├── metrics/                      Blotter, settlement, performance, Sharpe
+├── trading/                      Manual order entry, portfolio monitor
+├── monitoring/                   Live session terminal table
+└── tools/                        screen, trade, replay, blotter, dashboard
 ```
 
 ---
 
-## Key configuration parameters (config.py)
+## Key configuration (`config.py`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `KELLY_DIVISOR` | 4 | Quarter-Kelly position sizing |
-| `MAX_POSITION_CENTS` | 10,000 | $100 max per market |
-| `MIN_EDGE_TO_VIG` | 0.02 | 2% minimum edge before trading |
-| `MAX_DRAWDOWN_PCT` | 0.10 | 10% drawdown triggers kill switch |
-| `DAILY_LOSS_LIMIT_CENTS` | 50,000 | $500 daily loss limit |
-| `MAX_OPEN_POSITIONS` | 20 | Maximum simultaneous positions |
-| `FEE_PER_CONTRACT_CENTS` | 7.0 | Kalshi fee per contract |
-| `SETTLEMENT_POLL_INTERVAL_SECONDS` | 300 | Check resolutions every 5 min |
-| `PROFIT_TARGET_PCT` | 0.60 | Alert at +60% unrealised P&L |
-| `POSITION_STOP_LOSS_PCT` | 0.40 | Alert at -40% unrealised P&L |
+| `KELLY_DIVISOR` | 4 | Quarter-Kelly sizing |
+| `MAX_POSITION_CENTS` | 10,000 | $100 cap per market |
+| `MIN_EDGE_TO_VIG` | 0.02 | Minimum edge vs half-spread |
+| `FEE_PER_CONTRACT_CENTS` | 7.0 | Per-contract fee (set from your tier) |
+| `HP_MIN_YES_ASK` / `HP_MAX_YES_ASK` | 85 / 97 | High-prob entry window |
+| `HP_MIN_ROI_PCT` | 2.0 | Min ROI % (fee-adjusted when enabled) |
+| `HP_USE_FEE_ADJUSTED_ROI` | true | Gate entries on net ROI after fees |
+| `HP_ASSUME_ROUND_TRIP_FEES` | false | Also count exit fee in ROI gate (or infer from post-fill) |
+| `MAX_DRAWDOWN_PCT` | 0.10 | Kill switch drawdown |
+| `DAILY_LOSS_LIMIT_CENTS` | 50,000 | Daily stop ($500) |
+
+### High-probability environment variables
+
+```env
+KALSHI_STRATEGY=high_prob
+KALSHI_HP_MIN_YES_ASK=85
+KALSHI_HP_MAX_YES_ASK=97
+KALSHI_HP_MIN_ROI_PCT=2.0
+KALSHI_HP_USE_FEE_ADJUSTED_ROI=true
+KALSHI_HP_ENTRY_MODE=limit_at_ask
+KALSHI_HP_POST_FILL=resting_take_profit
+KALSHI_HP_STAKE_CENTS=5000
+
+KALSHI_DISCOVER=true
+KALSHI_DISCOVER_CATEGORY=Politics
+```
+
+---
+
+## Fee-adjusted ROI
+
+For a YES buy at ask `A` cents with entry fee `F`:
+
+- **Gross ROI** if YES wins: `(100 - A) / A × 100`
+- **Fee-adjusted ROI** (hold to settlement): `(100 - A - F) / (A + F) × 100`
+
+Example at 90¢ ask, $0.07 fee: gross ≈ 11.1%, net ≈ **3.1%**.
+
+Discovery and `high_prob` use this net figure when `HP_USE_FEE_ADJUSTED_ROI=true`. Set `KALSHI_HP_ASSUME_ROUND_TRIP_FEES=true` (or use a non-`hold` post-fill mode) to require entries to clear two fees.

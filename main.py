@@ -42,6 +42,11 @@ from metrics.metrics_store import MetricsStore
 from metrics.settlement import SettlementWatcher
 from risk.alert_manager import AlertManager
 from risk.circuit_breaker import CircuitBreaker
+from discovery.discovery_presets import (
+    STRATEGY_DISCOVERY_PRESETS,
+    apply_preset,
+    preset_for_strategy,
+)
 from discovery.ticker_selector import (
     TickerCriteria,
     criteria_from_env,
@@ -294,6 +299,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Arb: complementary pairs, e.g. PRES-DEM:PRES-REP",
     )
     parser.add_argument(
+        "--hp-min-yes-ask",
+        type=int,
+        default=None,
+        help="High-prob: minimum YES ask in cents (default 85)",
+    )
+    parser.add_argument(
+        "--hp-max-yes-ask",
+        type=int,
+        default=None,
+        help="High-prob: maximum YES ask in cents (default 97)",
+    )
+    parser.add_argument(
+        "--hp-entry-mode",
+        default=None,
+        choices=[
+            "market", "limit_at_ask", "limit_at_bid",
+            "limit_at_mid", "limit_offset",
+        ],
+        help="High-prob: how to price entries",
+    )
+    parser.add_argument(
+        "--hp-post-fill",
+        default=None,
+        choices=["hold", "resting_take_profit", "resting_stop", "tp_and_stop"],
+        help="High-prob: behaviour after entry fill",
+    )
+    parser.add_argument(
+        "--hp-stake-cents",
+        type=int,
+        default=None,
+        help="High-prob: stake per entry in cents (default 5000)",
+    )
+    parser.add_argument(
         "--monitor-interval",
         type=float,
         default=None,
@@ -377,8 +415,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Include markets that fail is_tradeable() (wide spread, etc.)",
     )
+    parser.add_argument(
+        "--discover-preset",
+        default=None,
+        choices=["none"] + list(STRATEGY_DISCOVERY_PRESETS.keys()),
+        help=(
+            "Discovery filter preset (high_prob, green_up, kelly, arb). "
+            "Default: match --strategy when using --discover. Use 'none' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--discover-rank-by",
+        default=None,
+        choices=["volume", "fee_adjusted_roi"],
+        help="Rank discovered markets by volume or fee-adjusted ROI",
+    )
+    parser.add_argument(
+        "--discover-min-fee-roi",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Minimum fee-adjusted ROI if YES wins (high-prob discovery)",
+    )
 
     return parser.parse_args(argv)
+
+
+def _explicit_discover_fields(args: argparse.Namespace) -> frozenset[str]:
+    """CLI flags the user set explicitly — do not overwrite with presets."""
+    explicit: set[str] = set()
+    if args.discover_top is not None:
+        explicit.add("top_n")
+    if args.discover_min_volume is not None:
+        explicit.add("min_volume_24h")
+    if args.discover_max_yes_ask is not None:
+        explicit.add("max_yes_ask")
+    if args.discover_min_yes_ask is not None:
+        explicit.add("min_yes_ask")
+    if args.discover_max_spread is not None:
+        explicit.add("max_spread")
+    if args.discover_activity_hours is not None:
+        explicit.add("activity_hours")
+    if args.discover_full_scan:
+        explicit.add("full_scan")
+    if args.discover_rank_by is not None:
+        explicit.add("rank_by")
+    if args.discover_min_fee_roi is not None:
+        explicit.add("min_fee_adjusted_roi_pct")
+    return frozenset(explicit)
+
+
+def _resolve_discover_preset(args: argparse.Namespace) -> str | None:
+    if args.discover_preset == "none":
+        return None
+    if args.discover_preset:
+        return args.discover_preset
+    if args.discover or criteria_from_env():
+        return preset_for_strategy(args.strategy)
+    return None
 
 
 def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | None:
@@ -406,7 +500,7 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
     if activity is not None and not args.discover_full_scan:
         full_scan = True
 
-    return TickerCriteria(
+    criteria = TickerCriteria(
         category=category,
         top_n=_pick(args.discover_top, env.top_n if env else None, 10),
         min_volume_24h=_pick(
@@ -418,11 +512,30 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
         else (env.min_yes_ask if env else None),
         max_spread=args.discover_max_spread if args.discover_max_spread is not None
         else (env.max_spread if env else None),
+        min_fee_adjusted_roi_pct=args.discover_min_fee_roi,
+        rank_by=args.discover_rank_by or "volume",
         activity_hours=activity,
         full_scan=full_scan,
         tradeable_only=not args.discover_no_tradeable_filter
         and (env.tradeable_only if env else True),
     )
+
+    preset_name = _resolve_discover_preset(args)
+    if preset_name:
+        criteria = apply_preset(
+            criteria,
+            preset_name,
+            skip_fields=_explicit_discover_fields(args),
+        )
+        logger.info(
+            "Discovery preset applied",
+            preset=preset_name,
+            rank_by=criteria.rank_by,
+            min_yes_ask=criteria.min_yes_ask,
+            max_yes_ask=criteria.max_yes_ask,
+        )
+
+    return criteria
 
 
 async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
@@ -513,6 +626,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
             hedge_mode=args.hedge_mode,
             stop_loss=args.stop_loss,
             comp_pairs=comp_pairs,
+            hp_min_yes_ask=args.hp_min_yes_ask,
+            hp_max_yes_ask=args.hp_max_yes_ask,
+            hp_entry_mode=args.hp_entry_mode,
+            hp_post_fill=args.hp_post_fill,
+            hp_stake_cents=args.hp_stake_cents,
         )
     except ValueError as exc:
         logger.error(str(exc))

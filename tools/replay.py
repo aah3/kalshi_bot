@@ -239,8 +239,23 @@ class ReplayEngine:
                     strat.register_complementary(parts[0], parts[1])
             return strat
 
+        elif name == "high_prob":
+            from strategy.factory import build_strategy
+            tickers = self._strat_kwargs.get("tickers", [])
+            model_probs = self._strat_kwargs.get("model_probs", {})
+            return build_strategy(
+                "high_prob",
+                tickers,
+                model_probs=model_probs,
+                hp_min_yes_ask=self._strat_kwargs.get("hp_min_yes_ask"),
+                hp_max_yes_ask=self._strat_kwargs.get("hp_max_yes_ask"),
+                hp_entry_mode=self._strat_kwargs.get("hp_entry_mode"),
+                hp_post_fill=self._strat_kwargs.get("hp_post_fill"),
+                hp_stake_cents=self._strat_kwargs.get("hp_stake_cents"),
+            )
+
         else:
-            raise ValueError(f"Unknown strategy: {name}. Choose: kelly, green_up, arb")
+            raise ValueError(f"Unknown strategy: {name}. Choose: kelly, green_up, arb, high_prob")
 
     def _build_circuit_breaker(self):
         """Dummy async kill switch for replay (never actually kills anything)."""
@@ -659,7 +674,8 @@ p_rec.add_argument("--duration", type=int, default=0,
 # replay
 p_rep = sub.add_parser("replay", help="Replay recorded file through strategy stack")
 p_rep.add_argument("--input",    required=True, help="Input .jsonl file path")
-p_rep.add_argument("--strategy", required=True, choices=["kelly","green_up","arb"])
+p_rep.add_argument("--strategy", required=True,
+                   choices=["kelly", "green_up", "arb", "high_prob"])
 p_rep.add_argument("--speed",    type=float, default=50.0,
                    help="Playback speed multiplier (0=max, default 50×)")
 p_rep.add_argument("--model-prob", nargs="*", metavar="TICKER:PROB",

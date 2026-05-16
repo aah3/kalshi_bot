@@ -13,9 +13,14 @@ import config
 from strategy.arbitrage_strategy import ArbitrageStrategy
 from strategy.base_strategy import BaseStrategy
 from strategy.green_up_strategy import GreenUpStrategy, HedgeMode
+from strategy.high_prob_strategy import (
+    EntryPriceMode,
+    HighProbStrategy,
+    PostFillMode,
+)
 from strategy.kelly_strategy import KellyStrategy
 
-VALID_STRATEGIES = ("kelly", "green_up", "arb")
+VALID_STRATEGIES = ("kelly", "green_up", "arb", "high_prob")
 
 
 def _parse_model_probs(raw: str | None) -> dict[str, float]:
@@ -53,6 +58,16 @@ def _parse_comp_pairs(raw: str | None) -> list[tuple[str, str]]:
     return pairs
 
 
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    return int(raw) if raw is not None else default
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    return float(raw) if raw is not None else default
+
+
 def build_strategy(
     name: str,
     tickers: list[str],
@@ -63,12 +78,17 @@ def build_strategy(
     hedge_mode: str | None = None,
     stop_loss: float | None = None,
     comp_pairs: list[tuple[str, str]] | None = None,
+    hp_min_yes_ask: int | None = None,
+    hp_max_yes_ask: int | None = None,
+    hp_entry_mode: str | None = None,
+    hp_post_fill: str | None = None,
+    hp_stake_cents: int | None = None,
 ) -> BaseStrategy:
     """
     Build a strategy instance by name.
 
     Args:
-        name:           One of kelly, green_up, arb.
+        name:           One of kelly, green_up, arb, high_prob.
         tickers:        Markets to watch (green_up registers each via add_watch_ticker).
         model_probs:    Kelly only — ticker -> P(YES wins).
         entry_max:      Green-up max YES ask for entry (cents).
@@ -76,6 +96,7 @@ def build_strategy(
         hedge_mode:     full_green | stake_back | partial.
         stop_loss:      Green-up stop fraction below entry.
         comp_pairs:     Arb only — complementary ticker pairs.
+        hp_*:           High-probability strategy tunables.
     """
     key = name.strip().lower()
     if key not in VALID_STRATEGIES:
@@ -84,7 +105,55 @@ def build_strategy(
         )
 
     if key == "kelly":
-        strat = KellyStrategy(model_probabilities=model_probs or {})
+        return KellyStrategy(model_probabilities=model_probs or {})
+
+    if key == "high_prob":
+        entry_map = {
+            "market":       EntryPriceMode.MARKET,
+            "limit_at_ask": EntryPriceMode.LIMIT_AT_ASK,
+            "limit_at_bid": EntryPriceMode.LIMIT_AT_BID,
+            "limit_at_mid": EntryPriceMode.LIMIT_AT_MID,
+            "limit_offset": EntryPriceMode.LIMIT_OFFSET,
+        }
+        post_map = {
+            "hold":                PostFillMode.HOLD_TO_SETTLEMENT,
+            "resting_take_profit": PostFillMode.RESTING_TAKE_PROFIT,
+            "resting_stop":        PostFillMode.RESTING_STOP_LOSS,
+            "tp_and_stop":         PostFillMode.TAKE_PROFIT_AND_STOP,
+        }
+        entry_key = (
+            hp_entry_mode or os.getenv("KALSHI_HP_ENTRY_MODE", "limit_at_ask")
+        ).lower()
+        post_key = (
+            hp_post_fill or os.getenv("KALSHI_HP_POST_FILL", "hold")
+        ).lower()
+        strat = HighProbStrategy(
+            min_yes_ask=hp_min_yes_ask if hp_min_yes_ask is not None else _env_int(
+                "KALSHI_HP_MIN_YES_ASK", config.HP_MIN_YES_ASK
+            ),
+            max_yes_ask=hp_max_yes_ask if hp_max_yes_ask is not None else _env_int(
+                "KALSHI_HP_MAX_YES_ASK", config.HP_MAX_YES_ASK
+            ),
+            min_roi_pct=_env_float("KALSHI_HP_MIN_ROI_PCT", config.HP_MIN_ROI_PCT),
+            max_spread_cents=_env_int("KALSHI_HP_MAX_SPREAD", config.HP_MAX_SPREAD_CENTS),
+            stake_cents=hp_stake_cents if hp_stake_cents is not None else _env_int(
+                "KALSHI_HP_STAKE_CENTS", config.HP_STAKE_CENTS
+            ),
+            entry_price_mode=entry_map.get(entry_key, EntryPriceMode.LIMIT_AT_ASK),
+            limit_offset_cents=_env_int("KALSHI_HP_LIMIT_OFFSET", config.HP_LIMIT_OFFSET),
+            post_fill_mode=post_map.get(post_key, PostFillMode.HOLD_TO_SETTLEMENT),
+            take_profit_offset_cents=_env_int(
+                "KALSHI_HP_TAKE_PROFIT_OFFSET", config.HP_TAKE_PROFIT_OFFSET
+            ),
+            stop_loss_pct=_env_float("KALSHI_HP_STOP_LOSS", config.HP_STOP_LOSS_PCT),
+            require_model_edge=os.getenv("KALSHI_HP_REQUIRE_MODEL_EDGE", "").lower()
+            in ("1", "true", "yes"),
+        )
+        if model_probs:
+            for ticker, prob in model_probs.items():
+                strat.set_model_probability(ticker, prob)
+        for ticker in tickers:
+            strat.add_watch_ticker(ticker)
         return strat
 
     if key == "green_up":
@@ -110,11 +179,13 @@ def build_strategy(
             strat.add_watch_ticker(ticker)
         return strat
 
-    # arb
-    strat = ArbitrageStrategy()
-    for a, b in comp_pairs or []:
-        strat.register_complementary(a, b)
-    return strat
+    if key == "arb":
+        strat = ArbitrageStrategy()
+        for a, b in comp_pairs or []:
+            strat.register_complementary(a, b)
+        return strat
+
+    raise ValueError(f"Unhandled strategy {name!r}")
 
 
 def build_strategy_from_env(tickers: list[str]) -> BaseStrategy:

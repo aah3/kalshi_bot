@@ -71,6 +71,23 @@ KELLY_DIVISOR: int     = 4          # 4 = quarter-Kelly
 MAX_POSITION_CENTS: int = 10_000    # hard cap per market ($100)
 MIN_EDGE_TO_VIG: float  = 0.02      # minimum edge over vig before trading (2%)
 
+# ─── High-probability strategy ─────────────────────────────────────────────────
+
+HP_MIN_YES_ASK: int       = int(os.getenv("KALSHI_HP_MIN_YES_ASK", "85"))
+HP_MAX_YES_ASK: int       = int(os.getenv("KALSHI_HP_MAX_YES_ASK", "97"))
+HP_MIN_ROI_PCT: float     = float(os.getenv("KALSHI_HP_MIN_ROI_PCT", "2.0"))
+HP_USE_FEE_ADJUSTED_ROI: bool = os.getenv(
+    "KALSHI_HP_USE_FEE_ADJUSTED_ROI", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+HP_ASSUME_ROUND_TRIP_FEES: bool = os.getenv(
+    "KALSHI_HP_ASSUME_ROUND_TRIP_FEES", ""
+).strip().lower() in ("1", "true", "yes", "on")
+HP_MAX_SPREAD_CENTS: int  = int(os.getenv("KALSHI_HP_MAX_SPREAD", "8"))
+HP_STAKE_CENTS: int       = int(os.getenv("KALSHI_HP_STAKE_CENTS", "5000"))
+HP_LIMIT_OFFSET: int      = int(os.getenv("KALSHI_HP_LIMIT_OFFSET", "0"))
+HP_TAKE_PROFIT_OFFSET: int = int(os.getenv("KALSHI_HP_TAKE_PROFIT_OFFSET", "3"))
+HP_STOP_LOSS_PCT: float   = float(os.getenv("KALSHI_HP_STOP_LOSS", "0.12"))
+
 # Pre-trade checks
 MIN_ACCOUNT_BALANCE_CENTS: int = 5_000   # refuse new trades if balance drops below $50
 MIN_MINUTES_TO_EXPIRY: float   = 10.0    # refuse entries on markets closing in < 10 min

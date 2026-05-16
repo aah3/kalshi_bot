@@ -53,6 +53,11 @@ from typing import Any
 
 import config
 from discovery.market_client import MarketClient, MarketSummary, OrderBookSnapshot
+from discovery.market_math import (
+    fee_adjusted_roi_if_yes_wins_pct,
+    gross_roi_if_yes_wins_pct,
+    passes_roi_gate,
+)
 from logging_.structured_logger import logger
 
 
@@ -67,6 +72,11 @@ MIN_MINUTES_TO_CLOSE: float   = 30.0  # skip markets closing very soon
 GREEN_UP_MAX_ENTRY_PRICE: int   = 35   # back YES below this (high decimal odds)
 GREEN_UP_MIN_ENTRY_PRICE: int   = 10   # skip if too cheap (near-zero liquidity)
 
+# High-probability entry window (cents)
+HP_MIN_YES_ASK: int = 85
+HP_MAX_YES_ASK: int = 97
+HP_MIN_ROI_PCT: float = config.HP_MIN_ROI_PCT
+
 # Arbitrage detection
 ARB_SUM_THRESHOLD: int = 98    # flag if sum of YES asks in event < this
 
@@ -74,11 +84,12 @@ ARB_SUM_THRESHOLD: int = 98    # flag if sum of YES asks in event < this
 # ── Result types ──────────────────────────────────────────────────────────────
 
 class StrategyFit(str, Enum):
-    KELLY     = "kelly"
-    GREEN_UP  = "green_up"
-    ARB_COMP  = "arb_complementary"
-    ARB_SET   = "arb_exhaustive_set"
-    ARB_DOM   = "arb_dominance"
+    KELLY      = "kelly"
+    GREEN_UP   = "green_up"
+    HIGH_PROB  = "high_prob"
+    ARB_COMP   = "arb_complementary"
+    ARB_SET    = "arb_exhaustive_set"
+    ARB_DOM    = "arb_dominance"
 
 
 @dataclass
@@ -274,11 +285,12 @@ class MarketScreener:
         for market in tradeable:
             book = books.get(market.ticker)
 
-            # Run all three scorers
+            # Run all strategy scorers
             for scorer_fn, strategy_fit in [
-                (self._score_kelly,   StrategyFit.KELLY),
-                (self._score_green_up, StrategyFit.GREEN_UP),
-                (self._score_arb_comp, StrategyFit.ARB_COMP),
+                (self._score_kelly,     StrategyFit.KELLY),
+                (self._score_green_up,  StrategyFit.GREEN_UP),
+                (self._score_high_prob, StrategyFit.HIGH_PROB),
+                (self._score_arb_comp,  StrategyFit.ARB_COMP),
             ]:
                 score, reasons = scorer_fn(market, book)
                 if score >= MIN_SCORE_THRESHOLD:
@@ -445,6 +457,79 @@ class MarketScreener:
 
         return round(min(score, 1.0), 3), reasons
 
+    def _score_high_prob(
+        self, market: MarketSummary, book: OrderBookSnapshot | None
+    ) -> tuple[float, list[str]]:
+        """
+        Score a market for the high-probability strategy.
+
+        Rewards:
+          - YES ask in the 85–97c window (high implied P(YES), modest payout)
+          - Tight spread and healthy volume
+          - ROI if YES wins above HP_MIN_ROI_PCT
+        """
+        reasons: list[str] = []
+        score = 0.0
+
+        yes_ask = market.yes_ask
+        if yes_ask is None:
+            return 0.0, ["No ask price"]
+
+        if yes_ask < HP_MIN_YES_ASK:
+            return 0.0, [f"YES ask {yes_ask}c below high-prob floor ({HP_MIN_YES_ASK}c)"]
+        if yes_ask > HP_MAX_YES_ASK:
+            return 0.0, [f"YES ask {yes_ask}c above high-prob cap ({HP_MAX_YES_ASK}c)"]
+
+        gross = gross_roi_if_yes_wins_pct(yes_ask)
+        net = fee_adjusted_roi_if_yes_wins_pct(yes_ask, round_trip_fees=False)
+        passed, _, applied = passes_roi_gate(yes_ask, HP_MIN_ROI_PCT)
+        if not passed:
+            return 0.0, [
+                f"Fee-adj ROI {applied:.1f}% below minimum {HP_MIN_ROI_PCT}% "
+                f"(gross {gross:.1f}%)"
+            ]
+        roi = applied
+
+        # Price band: prefer mid-high prob (88–94c) — balance of edge vs payout
+        if 88 <= yes_ask <= 94:
+            score += 0.35
+            reasons.append(f"YES ask {yes_ask}c — sweet spot for high-prob entries")
+        else:
+            score += 0.20
+            reasons.append(f"YES ask {yes_ask}c — in high-prob window")
+
+        reasons.append(
+            f"Implied P(YES) {yes_ask}%  |  net ROI if win {roi:.1f}% "
+            f"(gross {gross:.1f}%)"
+        )
+
+        if market.spread <= 4:
+            score += 0.25
+            reasons.append(f"Spread {market.spread}c — tight")
+        elif market.spread <= MAX_SPREAD_CENTS:
+            score += 0.12
+            reasons.append(f"Spread {market.spread}c — acceptable")
+        else:
+            return 0.0, [f"Spread {market.spread}c too wide"]
+
+        if market.volume_24h >= 1_000:
+            score += 0.25
+            reasons.append(f"Volume 24h: {market.volume_24h:,}")
+        elif market.volume_24h >= 200:
+            score += 0.10
+        else:
+            return 0.0, [f"Volume 24h {market.volume_24h} too low"]
+
+        mins = market.minutes_to_close
+        if mins is not None and mins < MIN_MINUTES_TO_CLOSE:
+            return 0.0, [f"Closing in {mins:.0f}m — too soon"]
+
+        if mins is not None and mins >= 60:
+            score += 0.15
+            reasons.append(f"Closes in {mins/60:.0f}h")
+
+        return round(min(score, 1.0), 3), reasons
+
     def _score_arb_comp(
         self, market: MarketSummary, book: OrderBookSnapshot | None
     ) -> tuple[float, list[str]]:
@@ -608,6 +693,28 @@ class MarketScreener:
                     "hedge_stake_usd":       round(hedge_stake / 100, 2),
                     "locked_profit_usd":     round(locked_profit / 100, 2),
                 },
+            }
+
+        # High-probability hints
+        if yes_ask and HP_MIN_YES_ASK <= yes_ask <= HP_MAX_YES_ASK:
+            gross = gross_roi_if_yes_wins_pct(yes_ask)
+            net = fee_adjusted_roi_if_yes_wins_pct(yes_ask, round_trip_fees=False)
+            hints["high_prob"] = {
+                "yes_ask_cents":           yes_ask,
+                "implied_prob_pct":        yes_ask,
+                "payout_per_contract_usd": round((100 - yes_ask) / 100, 2),
+                "gross_roi_if_yes_wins_pct": round(gross, 2),
+                "fee_adjusted_roi_if_yes_wins_pct": round(net, 2),
+                "roi_if_yes_wins_pct":     round(net, 2),
+                "fee_per_contract_cents":  config.FEE_PER_CONTRACT_CENTS,
+                "example_stake_usd":       config.HP_STAKE_CENTS / 100,
+                "entry_modes": [
+                    "market", "limit_at_ask", "limit_at_bid",
+                    "limit_at_mid", "limit_offset",
+                ],
+                "post_fill_modes": [
+                    "hold", "resting_take_profit", "resting_stop", "tp_and_stop",
+                ],
             }
 
         # Arb hints

@@ -78,21 +78,41 @@ class ExecutionManager:
 
     async def submit_order(self, signal: Signal) -> dict[str, Any] | None:
         """
-        Place a limit order derived from a Signal.
+        Place an order derived from a Signal.
+
+        Reads optional execution hints from ``signal.meta``:
+          - order_type:    "limit" | "market"  (default "limit")
+          - action:        "buy" | "sell"      (default "buy")
+          - time_in_force: "gtc" | "ioc" | "fok" (default "gtc")
 
         Returns the exchange order dict on success, or None on failure.
         """
+        meta          = signal.meta or {}
+        order_type    = meta.get("order_type", "limit")
+        action        = meta.get("action", "buy")
+        time_in_force = meta.get("time_in_force", "gtc")
+
         client_order_id = str(uuid.uuid4())
-        body = {
+        body: dict[str, Any] = {
             "ticker":           signal.ticker,
             "client_order_id":  client_order_id,
-            "type":             "limit",
-            "action":           "buy",
+            "type":             order_type,
+            "action":           action,
             "side":             signal.side.value,
             "count":            signal.size_cents,   # Kalshi uses cents as count unit
-            "yes_price":        signal.limit_price if signal.side.value == "yes" else 100 - signal.limit_price,
+            "time_in_force":    time_in_force,
             "expiration_ts":    None,   # GTC
         }
+
+        if order_type == "limit":
+            yes_price = meta.get("yes_price")
+            if yes_price is None:
+                yes_price = (
+                    signal.limit_price
+                    if signal.side.value == "yes"
+                    else 100 - signal.limit_price
+                )
+            body["yes_price"] = yes_price
 
         body_str = json.dumps(body)
         path     = "/trade-api/v2/portfolio/orders"
@@ -107,6 +127,9 @@ class ExecutionManager:
             strategy=signal.strategy,
             edge=signal.edge,
             edge_to_vig=signal.edge_to_vig,
+            order_type=order_type,
+            action=action,
+            time_in_force=time_in_force,
         )
 
         async with self._limiter.throttle(BucketType.WRITE):
