@@ -5,3 +5,7 @@ __pycache__/
 
 # Versioned snapshots (*_v0*, *_v1*, *_v10*, ...)
 *_v[0-9]*
+
+# Local databases and logs
+*.db
+kalshi_bot.jsonl

@@ -8,7 +8,6 @@ Handles all authentication concerns:
 """
 
 import base64
-import hashlib
 import os
 import time
 from typing import Dict
@@ -18,10 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.backends import default_backend
 
 import config
-
-
-class CredentialError(Exception):
-    """Raised when credentials are missing or malformed."""
+from credentials.env_credentials import CredentialError, normalize_env, resolve_credentials
 
 
 class CredentialManager:
@@ -29,21 +25,31 @@ class CredentialManager:
     Loads credentials from environment variables and produces signed
     request headers for the Kalshi REST API.
 
-    Required env vars:
-        KALSHI_API_KEY_ID        — your Kalshi API key UUID
-        KALSHI_PRIVATE_KEY_B64   — base64 of an RSA private key: PEM file (ASCII), DER
-                                   binary (PKCS#1 / PKCS#8), or a quoted PEM block in .env
+    Store both demo and prod keys in .env; set ``KALSHI_ENV`` to select which pair
+    is used (see ``credentials/env_credentials.py``).
     """
 
-    def __init__(self) -> None:
-        self._api_key_id   = self._require_env("KALSHI_API_KEY_ID")
-        self._private_key  = self._load_private_key()
+    def __init__(self, env: str | None = None) -> None:
+        self._env = normalize_env(env or config.ENV)
+        api_key_id, key_b64, source = resolve_credentials(self._env)
+        self._credential_source = source
+        self._api_key_id = api_key_id
+        self._private_key = self._load_private_key(key_b64)
 
     # ── Public interface ────────────────────────────────────────────────────
 
     @property
+    def env(self) -> str:
+        return self._env
+
+    @property
     def api_key_id(self) -> str:
         return self._api_key_id
+
+    @property
+    def credential_source(self) -> str:
+        """Which env vars supplied the active key (for logs)."""
+        return self._credential_source
 
     def sign_request(
         self,
@@ -65,7 +71,7 @@ class CredentialManager:
             Dict of headers to merge into the outgoing request.
         """
         ts = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
-        message = self._build_message(method.upper(), path, ts, body)
+        message = self._build_message(method, path, ts)
         signature = self._sign(message)
 
         return {
@@ -87,9 +93,9 @@ class CredentialManager:
             )
         return value
 
-    def _load_private_key(self):
+    def _load_private_key(self, raw: str):
         """
-        Load an RSA private key from KALSHI_PRIVATE_KEY_B64.
+        Load an RSA private key from a base64 or PEM string.
 
         Accepts:
           - Base64 of a PEM file (decodes to ASCII starting with ``-----BEGIN``).
@@ -99,7 +105,6 @@ class CredentialManager:
 
         Whitespace in base64 strings is ignored.
         """
-        raw = self._require_env("KALSHI_PRIVATE_KEY_B64")
         stripped = raw.strip()
         if stripped.startswith("-----BEGIN") and "PRIVATE KEY" in stripped:
             key_bytes = raw.encode("utf-8")
@@ -109,7 +114,7 @@ class CredentialManager:
                 key_bytes = base64.b64decode(b64_compact, validate=False)
             except Exception as exc:
                 raise CredentialError(
-                    "KALSHI_PRIVATE_KEY_B64 is not valid base64 (check for truncated lines "
+                    "Private key is not valid base64 (check for truncated lines "
                     "or stray characters). Encode PEM with: "
                     "python -c \"import base64, pathlib; "
                     "print(base64.b64encode(pathlib.Path('key.pem').read_bytes()).decode())\""
@@ -152,18 +157,21 @@ class CredentialManager:
 
         assert last_exc is not None
         raise CredentialError(
-            "Could not read KALSHI_PRIVATE_KEY_B64. Use base64 of your Kalshi RSA private "
+            "Could not read private key material. Use base64 of your Kalshi RSA private "
             "key as PEM or DER, or paste the PEM block in double quotes in .env."
         ) from last_exc
 
     @staticmethod
-    def _build_message(method: str, path: str, timestamp_ms: int, body: str) -> bytes:
+    def _build_message(method: str, path: str, timestamp_ms: int) -> bytes:
         """
-        Kalshi signing payload format:
-            <timestamp_ms><METHOD><path><SHA256(body)>
+        Kalshi signing payload (see docs.kalshi.com quick start):
+            <timestamp_ms><METHOD><path>
+
+        Path is the full API path from root (e.g. /trade-api/v2/portfolio/orders),
+        without query string. Request body is NOT included in the signature.
         """
-        body_hash = hashlib.sha256(body.encode()).hexdigest() if body else ""
-        raw = f"{timestamp_ms}{method}{path}{body_hash}"
+        path_clean = path.split("?")[0]
+        raw = f"{timestamp_ms}{method.upper()}{path_clean}"
         return raw.encode()
 
     def _sign(self, message: bytes) -> str:
@@ -172,7 +180,7 @@ class CredentialManager:
             message,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA256(),
         )

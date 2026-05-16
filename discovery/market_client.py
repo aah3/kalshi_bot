@@ -162,29 +162,10 @@ class MarketSummary:
         }
 
 
-@dataclass
-class OrderBookSnapshot:
-    """Full order book for one ticker at a point in time."""
-    ticker:      str
-    fetched_at:  datetime
-    yes_bids:    list[tuple[int, int]]   # [(price, qty), ...] descending
-    yes_asks:    list[tuple[int, int]]   # [(price, qty), ...] ascending
-    best_bid:    int | None
-    best_ask:    int | None
-    spread:      int | None
-    mid_price:   float | None
+from discovery.orderbook_parse import OrderBookSnapshot, parse_orderbook_response
 
-    def to_tick(self) -> dict[str, Any]:
-        """Convert to the normalised tick format consumed by strategy engines."""
-        return {
-            "ticker":        self.ticker,
-            "best_bid":      self.best_bid,
-            "best_ask":      self.best_ask,
-            "spread":        self.spread,
-            "mid_price":     self.mid_price,
-            "event_type":    "snapshot",
-            "updated_at_us": int(self.fetched_at.timestamp() * 1_000_000),
-        }
+# Re-export for callers that import from market_client
+__all__ = ["MarketClient", "MarketSummary", "OrderBookSnapshot"]
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -435,36 +416,7 @@ class MarketClient:
                 return None
             raise
 
-        book = data.get("orderbook", data)
-        now  = datetime.now(timezone.utc)
-
-        yes_bids_raw = book.get("yes", [])   # [[price, qty], ...]
-        yes_asks_raw = book.get("no", [])    # Kalshi: "no" side = YES asks
-
-        yes_bids = sorted(
-            [(int(lvl[0]), int(lvl[1])) for lvl in yes_bids_raw],
-            key=lambda x: x[0], reverse=True,
-        )
-        yes_asks = sorted(
-            [(int(lvl[0]), int(lvl[1])) for lvl in yes_asks_raw],
-            key=lambda x: x[0],
-        )
-
-        best_bid  = yes_bids[0][0] if yes_bids else None
-        best_ask  = yes_asks[0][0] if yes_asks else None
-        spread    = (best_ask - best_bid) if best_bid and best_ask else None
-        mid       = (best_bid + best_ask) / 2.0 if best_bid and best_ask else None
-
-        return OrderBookSnapshot(
-            ticker=ticker,
-            fetched_at=now,
-            yes_bids=yes_bids,
-            yes_asks=yes_asks,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            spread=spread,
-            mid_price=mid,
-        )
+        return parse_orderbook_response(data, ticker)
 
     # ── Price history ─────────────────────────────────────────────────────────
 

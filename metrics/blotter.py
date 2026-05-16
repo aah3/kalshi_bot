@@ -359,6 +359,8 @@ class Blotter:
 
     def _init_schema(self) -> None:
         with self._conn() as conn:
+            from metrics.metrics_store import _migrate_legacy_tables
+            _migrate_legacy_tables(conn)
             conn.execute(_CREATE_LEGS)
             conn.execute(_CREATE_PARENTS)
             conn.execute(_CREATE_SEQUENCES)

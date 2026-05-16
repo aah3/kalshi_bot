@@ -5,8 +5,9 @@ SQLite persistence layer for all trade and P&L data.
 Used by calculator.py to compute daily dashboard metrics.
 
 Schema:
-    trades  — one row per fill received
-    equity  — daily equity snapshots for drawdown / Sharpe calculation
+    metrics_fills — one row per fill (Sharpe / drawdown; separate from blotter legs)
+    equity        — daily equity snapshots for drawdown / Sharpe calculation
+    signals       — signal intent log
 """
 
 import sqlite3
@@ -18,8 +19,8 @@ import config
 from logging_.structured_logger import logger
 
 
-_CREATE_TRADES = """
-CREATE TABLE IF NOT EXISTS trades (
+_CREATE_FILLS = """
+CREATE TABLE IF NOT EXISTS metrics_fills (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_us           INTEGER NOT NULL,
     ticker          TEXT NOT NULL,
@@ -33,6 +34,38 @@ CREATE TABLE IF NOT EXISTS trades (
     is_closed       INTEGER DEFAULT 0
 );
 """
+
+
+def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
+    """
+    Rename pre-blotter ``trades`` (metrics-only schema) to ``metrics_fills`` so
+    Blotter can use ``trades`` for per-leg rows with parent_trade_id.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='trades'"
+    ).fetchone()
+    if not row:
+        return
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+    if "parent_trade_id" in cols:
+        return
+
+    if "ts_us" not in cols:
+        return
+
+    if conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_fills'"
+    ).fetchone():
+        logger.warning(
+            "Legacy metrics trades table present but metrics_fills already exists — "
+            "renaming to trades_legacy_metrics"
+        )
+        conn.execute("ALTER TABLE trades RENAME TO trades_legacy_metrics")
+        return
+
+    conn.execute("ALTER TABLE trades RENAME TO metrics_fills")
+    logger.info("Migrated legacy metrics table: trades -> metrics_fills")
 
 _CREATE_EQUITY = """
 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -69,7 +102,8 @@ class MetricsStore:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
-            conn.execute(_CREATE_TRADES)
+            _migrate_legacy_tables(conn)
+            conn.execute(_CREATE_FILLS)
             conn.execute(_CREATE_EQUITY)
             conn.execute(_CREATE_SIGNALS)
 
@@ -90,7 +124,7 @@ class MetricsStore:
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO trades
+                INSERT INTO metrics_fills
                     (ts_us, ticker, side, size_cents, entry_price, strategy, order_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -110,7 +144,7 @@ class MetricsStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                UPDATE trades
+                UPDATE metrics_fills
                 SET exit_price = ?, realised_pnl = ?, is_closed = 1
                 WHERE order_id = ?
                 """,
@@ -156,7 +190,7 @@ class MetricsStore:
         cutoff = int((time.time() - days * 86_400) * 1_000_000)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM trades WHERE is_closed = 1 AND ts_us >= ? ORDER BY ts_us",
+                "SELECT * FROM metrics_fills WHERE is_closed = 1 AND ts_us >= ? ORDER BY ts_us",
                 (cutoff,),
             ).fetchall()
         return [dict(r) for r in rows]

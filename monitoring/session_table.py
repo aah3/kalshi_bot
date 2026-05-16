@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import config
+from discovery.orderbook_parse import OrderBookSnapshot
 from ingestion.market_ingestor import MarketIngestor
 from logging_.structured_logger import logger
 from metrics.blotter import Blotter
@@ -53,10 +54,32 @@ def _action_hint(state: str, bid: int | None, hedge_at: int, stop_at: int, entry
     return state
 
 
+def _book_quotes(
+    ticker: str,
+    ingestor: MarketIngestor | None,
+    rest_books: dict[str, OrderBookSnapshot] | None,
+) -> tuple[int | None, int | None, float | None, int | None]:
+    """Best bid/ask/mid/spread from WS book or REST fallback."""
+    bid = ask = mid = spread = None
+    if ingestor:
+        ob = ingestor.get_book(ticker)
+        if ob and ob.best_bid is not None:
+            bid, ask = ob.best_bid, ob.best_ask
+            mid, spread = ob.mid_price, ob.spread
+    if (bid is None or ask is None) and rest_books and ticker in rest_books:
+        snap = rest_books[ticker]
+        bid    = snap.best_bid
+        ask    = snap.best_ask
+        mid    = snap.mid_price
+        spread = snap.spread
+    return bid, ask, mid, spread
+
+
 def build_ticker_rows(
     tickers: list[str],
     ingestor: MarketIngestor | None,
     strategy: BaseStrategy | None,
+    rest_books: dict[str, OrderBookSnapshot] | None = None,
 ) -> list[dict[str, Any]]:
     """Merge order book, strategy state, and green-up previews per ticker."""
     rows: list[dict[str, Any]] = []
@@ -69,11 +92,7 @@ def build_ticker_rows(
             summaries[s["ticker"]] = s
 
     for ticker in tickers:
-        book = ingestor.get_book(ticker) if ingestor else None
-        bid  = book.best_bid if book else None
-        ask  = book.best_ask if book else None
-        mid  = book.mid_price if book else None
-        spread = book.spread if book else None
+        bid, ask, mid, spread = _book_quotes(ticker, ingestor, rest_books)
 
         s = summaries.get(ticker, {})
         state = s.get("state", "—")
@@ -124,6 +143,7 @@ def render_session_table(
     strategy_name: str,
     ingestor: MarketIngestor | None,
     strategy: BaseStrategy | None,
+    rest_books: dict[str, OrderBookSnapshot] | None = None,
     execution_open: int,
     portfolio: PortfolioSnapshot | None,
     alerts: list[dict],
@@ -174,7 +194,7 @@ def render_session_table(
     # Per-ticker strategy + market table
     print("-" * W)
     print(
-        f"  {'TICKER':<28} {'BID':>4} {'ASK':>4} {'MID%':>5} "
+        f"  {'TICKER':<28} {'BID':>4} {'ASK':>4} {'SPR':>4} {'MID%':>5} "
         f"{'STATE':<9} {'ENTRY':>5} {'ODDS':>5} {'STAKE':>7} "
         f"{'HEDGE@':>6} {'STOP@':>5} {'LOCK$':>7} {'PREV$':>7} "
         f"{'UNRL$':>8} {'NEXT':<14}"
@@ -185,10 +205,11 @@ def render_session_table(
         p.ticker: p for p in (portfolio.positions if portfolio else [])
     }
 
-    for row in build_ticker_rows(tickers, ingestor, strategy):
+    for row in build_ticker_rows(tickers, ingestor, strategy, rest_books):
         ticker = row["ticker"]
         bid_s  = f"{row['bid']:>3}c" if row["bid"] is not None else "  — "
         ask_s  = f"{row['ask']:>3}c" if row["ask"] is not None else "  — "
+        spr_s  = f"{row['spread']:>3}c" if row["spread"] is not None else "  —"
         mid_s  = f"{row['mid_pct']:>4.0f}" if row["mid_pct"] is not None else "   —"
         entry_s = f"{row['entry_c']:>4}c" if row["entry_c"] else "   —"
         odds_s  = f"{row['entry_odds']:>4.1f}" if row["entry_odds"] else "  — "
@@ -214,7 +235,7 @@ def render_session_table(
         )
 
         print(
-            f"  {ticker:<28} {bid_s:>4} {ask_s:>4} {mid_s:>5} "
+            f"  {ticker:<28} {bid_s:>4} {ask_s:>4} {spr_s:>4} {mid_s:>5} "
             f"{row['state']:<9} {entry_s:>5} {odds_s:>5} {stake_s:>7} "
             f"{hedge_s:>6} {stop_s:>5} {lock_s:>7} {prev_s:>7} "
             f"{unrl_s:>8} {row['action']:<14}"
@@ -278,6 +299,7 @@ class SessionMonitor:
         self._interval = interval_seconds
         self._clear_screen = clear_screen
         self._running = False
+        self._market_client = None
 
     async def run(self) -> None:
         self._running = True
@@ -307,12 +329,36 @@ class SessionMonitor:
             open_orders = len(self._execution.open_orders) if self._execution else 0
             blotter_open = len(self._blotter.open_positions_summary())
 
+            rest_books: dict[str, OrderBookSnapshot] = {}
+            need_rest = any(
+                _book_quotes(t, self._ingestor, None)[0] is None
+                for t in self._tickers
+            )
+            if need_rest and self._portfolio_monitor._session:
+                from discovery.market_client import MarketClient
+                if self._market_client is None:
+                    self._market_client = MarketClient(
+                        self._portfolio_monitor._creds,
+                        self._portfolio_monitor._limiter,
+                    )
+                    self._market_client._session = self._portfolio_monitor._session
+                for t in self._tickers:
+                    if _book_quotes(t, self._ingestor, None)[0] is not None:
+                        continue
+                    try:
+                        book = await self._market_client.get_order_book(t, depth=5)
+                        if book:
+                            rest_books[t] = book
+                    except Exception as exc:
+                        logger.warning(f"REST book fetch failed for {t}: {exc}")
+
             try:
                 render_session_table(
                     tickers=self._tickers,
                     strategy_name=self._strategy.name,
                     ingestor=self._ingestor,
                     strategy=self._strategy,
+                    rest_books=rest_books or None,
                     execution_open=open_orders,
                     portfolio=portfolio,
                     alerts=alerts,

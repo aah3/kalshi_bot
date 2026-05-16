@@ -40,6 +40,7 @@ COMMANDS
   ────────────────
   # Show current positions with live mark-to-market P&L
   python tools/trade.py portfolio
+  python tools/trade.py positions   # alias for portfolio
 
   # Continuous P&L monitor, refresh every 30 seconds
   python tools/trade.py monitor --interval 30
@@ -65,6 +66,7 @@ import config
 from credentials.credential_manager import CredentialManager
 from discovery.market_client import MarketClient
 from execution.rate_limiter import RateLimiter
+from trading.auth_check import verify_portfolio_credentials
 from trading.order_entry import OrderEntry, OrderRequest, OrderSide, OrderType, TimeInForce
 from trading.portfolio_monitor import PortfolioMonitor
 
@@ -89,17 +91,23 @@ def _print_preview(preview: dict) -> None:
     print(f"{'─' * 65}")
     print(f"  {'Ticker:':<28} {preview['ticker']}")
     print(f"  {'Contracts:':<28} {preview['count']}")
-    print(f"  {'Limit price:':<28} {preview.get('limit_price') or 'MARKET'}c")
-    print(f"  {'YES price:':<28} {preview.get('yes_price') or 'MARKET'}c")
-    print(f"  {'Estimated cost:':<28} ${preview.get('estimated_cost_usd') or '?'}")
+    lp = preview.get("limit_price")
+    yp = preview.get("yes_price")
+    print(f"  {'Limit price:':<28} {f'{lp}c' if lp is not None else 'MARKET'}")
+    print(f"  {'YES price:':<28} {f'{yp}c' if yp is not None else 'MARKET'}")
+    est = preview.get("estimated_cost_usd")
+    roi = preview.get("implied_roi_pct")
+    print(f"  {'Estimated cost:':<28} ${est:.2f}" if est is not None else f"  {'Estimated cost:':<28} ?")
     print(f"  {'Max payout:':<28} ${preview['max_payout_usd']}")
-    print(f"  {'Implied ROI:':<28} {preview.get('implied_roi_pct', 0):+.1f}%")
+    print(f"  {'Implied ROI:':<28} {roi:+.1f}%" if roi is not None else f"  {'Implied ROI:':<28} —")
 
     book = preview.get("book", {})
+    bid, ask = book.get("best_bid"), book.get("best_ask")
     print(f"\n  LIVE BOOK")
-    print(f"  {'Best bid / ask:':<28} {book.get('best_bid')}c / {book.get('best_ask')}c")
-    print(f"  {'Spread:':<28} {book.get('spread')}c")
-    print(f"  {'Mid price:':<28} {book.get('mid_price')}c")
+    print(f"  {'Best bid / ask:':<28} {bid}c / {ask}c" if bid is not None and ask is not None else f"  {'Best bid / ask:':<28} —")
+    print(f"  {'Spread:':<28} {book.get('spread')}c" if book.get("spread") is not None else f"  {'Spread:':<28} —")
+    mid = book.get("mid_price")
+    print(f"  {'Mid (implied %):':<28} {mid}c" if mid is not None else f"  {'Mid (implied %):':<28} —")
     print(f"  {'Book position:':<28} {preview.get('book_position') or '—'}")
 
     slip = preview.get("slippage_estimate")
@@ -125,7 +133,7 @@ async def cmd_preview(args):
         order_type=OrderType.MARKET if args.market else OrderType.LIMIT,
         count=args.count,
         limit_price=None if args.market else args.price,
-        time_in_force=TimeInForce(args.tif),
+        time_in_force=TimeInForce.from_cli(args.tif),
         note=args.note or "",
     )
     async with OrderEntry(creds, limiter) as oe, \
@@ -142,7 +150,8 @@ async def cmd_buy(args):
         order_type=OrderType.MARKET if args.market else OrderType.LIMIT,
         count=args.count,
         limit_price=None if args.market else args.price,
-        time_in_force=TimeInForce(args.tif),
+        market_max_price=getattr(args, "max_price", None) if args.market else None,
+        time_in_force=TimeInForce.from_cli(args.tif),
         note=args.note or "",
     )
 
@@ -150,9 +159,14 @@ async def cmd_buy(args):
     async with OrderEntry(creds, limiter) as oe, \
                MarketClient(creds, limiter) as mc:
         preview = await oe.preview_order(req, mc)
+        ok, auth_msg = await verify_portfolio_credentials(creds, limiter, oe._session)
     _print_preview(preview)
 
     if not preview.get("valid"):
+        sys.exit(1)
+
+    if not ok:
+        print(f"\n  ✗ Cannot place orders: {auth_msg}\n")
         sys.exit(1)
 
     # Confirm unless --yes flag given
@@ -161,6 +175,9 @@ async def cmd_buy(args):
         if confirm != "y":
             print("  Order cancelled by user.")
             return
+
+    if args.market and preview.get("market_cap") is not None:
+        req.market_max_price = int(preview["market_cap"])
 
     async with OrderEntry(creds, limiter) as oe:
         receipt = await oe.place_order(req)
@@ -303,7 +320,9 @@ def _add_order_args(p):
     p.add_argument("--side",    required=True, choices=["yes", "no"])
     p.add_argument("--count",   required=True, type=int, help="Number of contracts")
     p.add_argument("--price",   type=int,      help="Limit price in cents (1-99)")
-    p.add_argument("--market",  action="store_true", help="Market order (no price needed)")
+    p.add_argument("--market",  action="store_true", help="Market order (IOC at book cap)")
+    p.add_argument("--max-price", type=int, metavar="CENTS",
+                   help="Max YES/NO price in cents for market orders (default: from book)")
     p.add_argument("--tif",     default="gtc", choices=["gtc","ioc","fok"], help="Time in force")
     p.add_argument("--note",    default="",    help="Optional label for this trade")
 
@@ -339,8 +358,9 @@ p_can.add_argument("--order-id", required=True)
 p_ca = sub.add_parser("cancel-all", help="Cancel all resting orders")
 p_ca.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
-# portfolio
+# portfolio / positions
 sub.add_parser("portfolio", help="Show positions with live P&L")
+sub.add_parser("positions", help="Alias for portfolio")
 
 # monitor
 p_mon = sub.add_parser("monitor", help="Continuous live P&L monitor")
@@ -361,6 +381,7 @@ _HANDLERS = {
     "cancel":     cmd_cancel,
     "cancel-all": cmd_cancel_all,
     "portfolio":  cmd_portfolio,
+    "positions":  cmd_portfolio,
     "monitor":    cmd_monitor,
     "position":   cmd_position,
     "balance":    cmd_balance,

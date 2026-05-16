@@ -38,6 +38,7 @@ from credentials.credential_manager import CredentialManager
 from discovery.market_client import MarketClient, OrderBookSnapshot
 from execution.rate_limiter import BucketType, RateLimiter
 from logging_.structured_logger import logger
+from trading.position_parse import parse_market_position
 
 
 # ── Position model ────────────────────────────────────────────────────────────
@@ -259,8 +260,12 @@ class PortfolioMonitor:
             self._fetch_fills(limit=100),
         )
 
-        # Parse positions
-        positions = [self._parse_position(p) for p in positions_raw]
+        # Parse positions (skip zero-size rows)
+        positions: list[Position] = []
+        for raw in positions_raw:
+            parsed = parse_market_position(raw)
+            if parsed:
+                positions.append(self._parse_position(parsed))
 
         # Mark-to-market: bulk fetch order books
         if positions:
@@ -380,70 +385,41 @@ class PortfolioMonitor:
         concurrency: int = 5,
     ) -> dict[str, OrderBookSnapshot]:
         """Fetch order books concurrently for mark-to-market."""
-        from discovery.market_client import MarketClient as MC
-        sem     = asyncio.Semaphore(concurrency)
-        results = {}
+        from discovery.market_client import MarketClient
+
+        mc = MarketClient(self._creds, self._limiter)
+        mc._session = self._session
+        sem = asyncio.Semaphore(concurrency)
+        results: dict[str, OrderBookSnapshot] = {}
 
         async def _one(ticker: str) -> None:
             async with sem:
-                path    = f"/markets/{ticker}/orderbook"
-                headers = self._creds.sign_request("GET", f"/trade-api/v2{path}")
-                async with self._limiter.throttle(BucketType.READ):
-                    try:
-                        resp = await self._session.get(
-                            f"{config.BASE_URL}{path}",
-                            params={"depth": 5},
-                            headers=headers,
-                        )
-                        if resp.status != 200:
-                            return
-                        data = await resp.json()
-                        book = data.get("orderbook", {})
-                        from datetime import datetime, timezone
-                        now = datetime.now(timezone.utc)
-                        yes_bids = sorted(
-                            [(int(l[0]), int(l[1])) for l in book.get("yes", [])],
-                            key=lambda x: x[0], reverse=True,
-                        )
-                        yes_asks = sorted(
-                            [(int(l[0]), int(l[1])) for l in book.get("no", [])],
-                            key=lambda x: x[0],
-                        )
-                        best_bid = yes_bids[0][0] if yes_bids else None
-                        best_ask = yes_asks[0][0] if yes_asks else None
-                        mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
-
-                        from discovery.market_client import OrderBookSnapshot
-                        results[ticker] = OrderBookSnapshot(
-                            ticker=ticker,
-                            fetched_at=now,
-                            yes_bids=yes_bids,
-                            yes_asks=yes_asks,
-                            best_bid=best_bid,
-                            best_ask=best_ask,
-                            spread=(best_ask - best_bid) if best_bid and best_ask else None,
-                            mid_price=mid,
-                        )
-                    except Exception as exc:
-                        logger.warning(f"Book fetch failed for {ticker}: {exc}")
+                try:
+                    book = await mc.get_order_book(ticker, depth=5)
+                    if book:
+                        results[ticker] = book
+                except Exception as exc:
+                    logger.warning(f"Book fetch failed for {ticker}: {exc}")
 
         await asyncio.gather(*[_one(t) for t in tickers])
         return results
 
     @staticmethod
-    def _parse_position(raw: dict[str, Any]) -> Position:
-        """Normalise a raw Kalshi position dict."""
-        contracts       = int(raw.get("position", raw.get("contracts", 0)))
-        avg_price       = int(raw.get("market_exposure", raw.get("avg_price", 0)))
+    def _parse_position(parsed: dict[str, Any]) -> Position:
+        """Build Position from ``parse_market_position`` output."""
+        contracts = int(parsed["contracts"])
+        cost_basis = int(parsed.get("cost_basis_cents", 0))
+        avg_price = int(parsed.get("avg_entry_price", 0))
+        if avg_price == 0 and cost_basis > 0 and contracts > 0:
+            avg_price = cost_basis // contracts
 
-        # Kalshi returns market_exposure in cents total; convert to per-contract
-        if "market_exposure" in raw and contracts > 0:
-            avg_price = avg_price // contracts
-
-        return Position(
-            ticker=raw.get("ticker", ""),
-            side=raw.get("side", "yes"),
+        pos = Position(
+            ticker=parsed["ticker"],
+            side=parsed["side"],
             contracts=contracts,
             avg_entry_price=avg_price,
-            market_title=raw.get("market_title", raw.get("title", "")),
+            market_title=parsed.get("market_title", ""),
         )
+        if cost_basis > 0:
+            pos.cost_basis = cost_basis
+        return pos

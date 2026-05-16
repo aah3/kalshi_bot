@@ -90,7 +90,18 @@ class ExecutionManager:
         meta          = signal.meta or {}
         order_type    = meta.get("order_type", "limit")
         action        = meta.get("action", "buy")
-        time_in_force = meta.get("time_in_force", "gtc")
+        time_in_force = meta.get("time_in_force", "good_till_canceled")
+        if order_type == "market" and time_in_force == "good_till_canceled":
+            time_in_force = "immediate_or_cancel"
+        # Legacy short aliases from older strategy meta
+        _tif_aliases = {
+            "gtc": "good_till_canceled",
+            "ioc": "immediate_or_cancel",
+            "fok": "fill_or_kill",
+        }
+        time_in_force = _tif_aliases.get(time_in_force, time_in_force)
+
+        contracts = max(signal.size_cents // max(signal.limit_price or 1, 1), 1)
 
         client_order_id = str(uuid.uuid4())
         body: dict[str, Any] = {
@@ -99,9 +110,9 @@ class ExecutionManager:
             "type":             order_type,
             "action":           action,
             "side":             signal.side.value,
-            "count":            signal.size_cents,   # Kalshi uses cents as count unit
+            "count":            contracts,
+            "count_fp":         f"{contracts:.2f}",
             "time_in_force":    time_in_force,
-            "expiration_ts":    None,   # GTC
         }
 
         if order_type == "limit":
@@ -113,10 +124,25 @@ class ExecutionManager:
                     else 100 - signal.limit_price
                 )
             body["yes_price"] = yes_price
+        elif order_type == "market":
+            cap = meta.get("yes_price") if signal.side.value == "yes" else meta.get("no_price")
+            if cap is None and signal.limit_price is not None:
+                cap = (
+                    signal.limit_price
+                    if signal.side.value == "yes"
+                    else 100 - signal.limit_price
+                )
+            if cap is None:
+                cap = 99
+            if signal.side.value == "yes":
+                body["yes_price"] = cap
+            else:
+                body["no_price"] = cap
 
-        body_str = json.dumps(body)
-        path     = "/trade-api/v2/portfolio/orders"
-        headers  = self._creds.sign_request("POST", path, body=body_str)
+        body_str  = json.dumps(body, separators=(",", ":"))
+        path      = "/portfolio/orders"
+        sign_path = f"/trade-api/v2{path}"
+        headers   = self._creds.sign_request("POST", sign_path, body=body_str)
 
         logger.order_sent(
             ticker=signal.ticker,

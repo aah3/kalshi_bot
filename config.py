@@ -1,10 +1,11 @@
 """
 config.py — single source of truth for all tunable parameters.
 
-To run in production:
-    export KALSHI_ENV=production
-    export KALSHI_API_KEY_ID=<your-key-id>
-    export KALSHI_PRIVATE_KEY_B64=<base64-encoded-pem>
+Credentials (both environments can live in .env at once):
+    KALSHI_ENV=demo | production
+    KALSHI_DEMO_API_KEY_ID / KALSHI_DEMO_PRIVATE_KEY_B64
+    KALSHI_PROD_API_KEY_ID / KALSHI_PROD_PRIVATE_KEY_B64
+    (optional legacy fallback: KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_B64)
 
 On Windows, you can skip `export` and put the same assignments in a `.env` file
 next to this module; values are loaded into `os.environ` on import (real env
@@ -32,15 +33,32 @@ PROD_WS_URL   = "wss://api.kalshi.co/trade-api/ws/v2"
 BASE_URL = DEMO_BASE_URL if ENV != "production" else PROD_BASE_URL
 WS_URL   = DEMO_WS_URL   if ENV != "production" else PROD_WS_URL
 
+def _credential_status_line() -> str:
+    try:
+        from credentials.env_credentials import resolve_credentials
+        _id, _b64, source = resolve_credentials(ENV)
+        return f"credentials from {source} (key …{_id[-8:]})"
+    except Exception as exc:
+        return f"credentials not loaded: {exc}"
+
+
 if ENV == "production":
     print("[CONFIG] *** PRODUCTION MODE ACTIVE ***")
+    print(f"[CONFIG] {BASE_URL}")
+    print(f"[CONFIG] {_credential_status_line()}")
 else:
     print(f"[CONFIG] Running in DEMO mode → {BASE_URL}")
+    print(f"[CONFIG] {_credential_status_line()}")
 
-# ─── Authentication ───────────────────────────────────────────────────────────
+# ─── Authentication (resolved for active KALSHI_ENV) ─────────────────────────
 
-API_KEY_ID: str      = os.getenv("KALSHI_API_KEY_ID", "")
-PRIVATE_KEY_B64: str = os.getenv("KALSHI_PRIVATE_KEY_B64", "")
+try:
+    from credentials.env_credentials import resolve_credentials as _resolve_creds
+    API_KEY_ID, PRIVATE_KEY_B64, CREDENTIAL_SOURCE = _resolve_creds(ENV)
+except Exception:
+    API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
+    PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "")
+    CREDENTIAL_SOURCE = "KALSHI_API_KEY_ID (unresolved)"
 
 TOKEN_REFRESH_INTERVAL_SECONDS: int = 25 * 60   # refresh 5 min before 30-min expiry
 

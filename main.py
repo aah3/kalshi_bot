@@ -57,6 +57,7 @@ from discovery.ticker_selector import (
 from strategy.base_strategy import BaseStrategy
 from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_probs, build_strategy
 from monitoring.session_table import SessionMonitor
+from trading.auth_check import verify_portfolio_credentials
 from trading.portfolio_monitor import PortfolioMonitor
 
 
@@ -673,13 +674,23 @@ async def main(args: argparse.Namespace | None = None) -> None:
     # ── Start services ────────────────────────────────────────────────────────
     await _execution.start()
 
-    # Open shared HTTP session for portfolio monitor and alert manager
     import aiohttp
     shared_session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=config.ORDER_TIMEOUT_SECONDS)
     )
     _portfolio_monitor._session = shared_session
     _settlement_watcher._session = shared_session
+
+    auth_ok, auth_msg = await verify_portfolio_credentials(
+        credentials, rate_limiter, shared_session
+    )
+    if not auth_ok:
+        logger.error(auth_msg)
+        print(f"\n[AUTH] {auth_msg}\n")
+        await shared_session.close()
+        await _execution.stop()
+        sys.exit(1)
+    logger.info(auth_msg)
 
     # Background tasks
     settlement_task = asyncio.create_task(

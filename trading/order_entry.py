@@ -42,6 +42,7 @@ import aiohttp
 import config
 from credentials.credential_manager import CredentialManager
 from discovery.market_client import MarketClient, OrderBookSnapshot
+from discovery.orderbook_parse import worst_market_fill_price
 from execution.rate_limiter import BucketType, RateLimiter
 from logging_.structured_logger import logger
 
@@ -59,9 +60,25 @@ class OrderSide(str, Enum):
 
 
 class TimeInForce(str, Enum):
-    GTC = "gtc"   # Good Till Cancelled — rests in book
-    IOC = "ioc"   # Immediate Or Cancel — fill what you can, cancel rest
-    FOK = "fok"   # Fill Or Kill — full fill or nothing
+    """Kalshi API values (CLI aliases: gtc / ioc / fok)."""
+    GTC = "good_till_canceled"
+    IOC = "immediate_or_cancel"
+    FOK = "fill_or_kill"
+
+    @classmethod
+    def from_cli(cls, value: str) -> "TimeInForce":
+        aliases = {
+            "gtc": cls.GTC,
+            "good_till_canceled": cls.GTC,
+            "ioc": cls.IOC,
+            "immediate_or_cancel": cls.IOC,
+            "fok": cls.FOK,
+            "fill_or_kill": cls.FOK,
+        }
+        key = value.strip().lower()
+        if key not in aliases:
+            raise ValueError(f"Unknown time_in_force {value!r}")
+        return aliases[key]
 
 
 class OrderStatus(str, Enum):
@@ -70,6 +87,21 @@ class OrderStatus(str, Enum):
     FILLED    = "filled"
     CANCELLED = "cancelled"
     REJECTED  = "rejected"
+
+    @classmethod
+    def from_kalshi(cls, value: str | None) -> "OrderStatus":
+        """Map Kalshi API status strings to internal enum values."""
+        key = (value or "pending").strip().lower()
+        aliases = {
+            "pending": cls.PENDING,
+            "resting": cls.RESTING,
+            "executed": cls.FILLED,
+            "filled": cls.FILLED,
+            "canceled": cls.CANCELLED,
+            "cancelled": cls.CANCELLED,
+            "rejected": cls.REJECTED,
+        }
+        return aliases.get(key, cls.PENDING)
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -91,6 +123,7 @@ class OrderRequest:
     order_type:   OrderType
     count:        int              # number of contracts (integer, not cents)
     limit_price:  int | None       # cents (1-99) for limit; None for market
+    market_max_price: int | None = None  # optional cap for market (else from book)
     time_in_force: TimeInForce    = TimeInForce.GTC
     note:         str             = ""   # optional human label for this trade
 
@@ -128,6 +161,10 @@ class OrderRequest:
                 errors.append(f"limit_price must be 1-99, got {self.limit_price}")
         if self.order_type == OrderType.MARKET and self.limit_price is not None:
             errors.append("limit_price must be None for MARKET orders")
+        if self.market_max_price is not None and not (1 <= self.market_max_price <= 99):
+            errors.append(
+                f"market_max_price must be 1-99, got {self.market_max_price}"
+            )
         return errors
 
 
@@ -271,27 +308,70 @@ class OrderEntry:
                 else:
                     book_position = "passive — rests below best NO bid"
 
-        # Slippage estimate for market orders
+        # Slippage / cost estimate for market orders (walk YES ask ladder)
         slippage_estimate = None
-        if request.order_type == OrderType.MARKET and book.yes_asks:
-            runnable  = 0
-            cost      = 0
-            remaining = request.count
-            for lvl_price, lvl_qty in book.yes_asks:
-                take = min(remaining, lvl_qty)
-                cost     += take * lvl_price
-                runnable += take
-                remaining -= take
-                if remaining <= 0:
-                    break
-            avg_fill  = cost // runnable if runnable else None
-            slippage  = (avg_fill - best_ask) if avg_fill and best_ask else None
-            slippage_estimate = {
-                "avg_fill_price_cents": avg_fill,
-                "slippage_cents":       slippage,
-                "fully_fillable":       remaining == 0,
-                "fillable_count":       runnable,
-            }
+        est_cost_cents: int | None = request.estimated_cost_cents
+        est_yes_price: int | None = request.yes_price
+
+        if request.order_type == OrderType.MARKET and request.side == OrderSide.YES:
+            if book.yes_asks:
+                runnable  = 0
+                cost      = 0
+                remaining = request.count
+                for lvl_price, lvl_qty in book.yes_asks:
+                    take = min(remaining, lvl_qty)
+                    cost     += take * lvl_price
+                    runnable += take
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+                avg_fill  = cost // runnable if runnable else None
+                slippage  = (avg_fill - best_ask) if avg_fill is not None and best_ask else None
+                est_cost_cents = cost if runnable else None
+                est_yes_price  = worst_market_fill_price(book, "yes", request.count)
+                slippage_estimate = {
+                    "avg_fill_price_cents": avg_fill,
+                    "total_cost_cents":     cost,
+                    "slippage_cents":       slippage,
+                    "fully_fillable":       remaining == 0,
+                    "fillable_count":       runnable,
+                }
+            elif best_ask is not None:
+                est_cost_cents = best_ask * request.count
+                est_yes_price  = best_ask
+                slippage_estimate = {
+                    "avg_fill_price_cents": best_ask,
+                    "total_cost_cents":     est_cost_cents,
+                    "slippage_cents":       0,
+                    "fully_fillable":       None,
+                    "fillable_count":       None,
+                }
+        elif request.order_type == OrderType.MARKET and request.side == OrderSide.NO:
+            cap = worst_market_fill_price(book, "no", request.count)
+            est_yes_price = 100 - cap
+            est_cost_cents = cap * request.count
+            if best_bid is not None:
+                slippage_estimate = {
+                    "avg_fill_price_cents": cap,
+                    "total_cost_cents":     est_cost_cents,
+                    "slippage_cents":       cap - (100 - best_bid),
+                    "fully_fillable":       None,
+                    "fillable_count":       None,
+                }
+
+        market_cap = None
+        if request.order_type == OrderType.MARKET:
+            market_cap = request.market_max_price
+            if market_cap is None and book:
+                market_cap = worst_market_fill_price(
+                    book, request.side.value, request.count
+                )
+
+        implied_roi = None
+        if est_cost_cents and est_cost_cents > 0:
+            implied_roi = round(
+                (request.max_payout_cents - est_cost_cents) / est_cost_cents * 100, 1
+            )
 
         return {
             "valid":              True,
@@ -300,18 +380,16 @@ class OrderEntry:
             "order_type":         request.order_type.value,
             "count":              request.count,
             "limit_price":        price,
-            "yes_price":          request.yes_price,
-            "estimated_cost_usd": round(request.estimated_cost_cents / 100, 2) if request.estimated_cost_cents else None,
+            "yes_price":          est_yes_price,
+            "market_cap":         market_cap,
+            "estimated_cost_usd": round(est_cost_cents / 100, 2) if est_cost_cents else None,
             "max_payout_usd":     round(request.max_payout_cents / 100, 2),
-            "implied_roi_pct":    round(
-                (request.max_payout_cents - (request.estimated_cost_cents or 0)) /
-                max(request.estimated_cost_cents or 1, 1) * 100, 1
-            ),
+            "implied_roi_pct":    implied_roi,
             "book": {
                 "best_bid":  best_bid,
                 "best_ask":  best_ask,
                 "spread":    spread,
-                "mid_price": book.mid_price,
+                "mid_price": round(book.mid_price, 1) if book.mid_price is not None else None,
             },
             "book_position":       book_position,
             "slippage_estimate":   slippage_estimate,
@@ -332,6 +410,9 @@ class OrderEntry:
             return None
 
         client_order_id = str(uuid.uuid4())
+        tif = request.time_in_force.value
+        if request.order_type == OrderType.MARKET and tif == TimeInForce.GTC.value:
+            tif = TimeInForce.IOC.value
 
         body: dict[str, Any] = {
             "ticker":          request.ticker,
@@ -340,15 +421,40 @@ class OrderEntry:
             "action":          "buy",
             "side":            request.side.value,
             "count":           request.count,
-            "time_in_force":   request.time_in_force.value,
+            "count_fp":        f"{request.count:.2f}",
+            "time_in_force":   tif,
         }
 
-        if request.order_type == OrderType.LIMIT and request.yes_price is not None:
-            body["yes_price"] = request.yes_price
+        submit_yes_price: int | None = None
+        submit_no_price: int | None = None
 
-        body_str = json.dumps(body)
+        if request.order_type == OrderType.LIMIT and request.yes_price is not None:
+            if request.side == OrderSide.YES:
+                body["yes_price"] = request.yes_price
+                submit_yes_price = request.yes_price
+            else:
+                body["no_price"] = 100 - request.yes_price
+                submit_no_price = body["no_price"]
+        elif request.order_type == OrderType.MARKET:
+            cap = request.market_max_price
+            if cap is None:
+                async with MarketClient(self._creds, self._limiter) as mc:
+                    book = await mc.get_order_book(request.ticker)
+                if book is None:
+                    logger.error("No order book for market order", ticker=request.ticker)
+                    return None
+                cap = worst_market_fill_price(book, request.side.value, request.count)
+            if request.side == OrderSide.YES:
+                body["yes_price"] = cap
+                submit_yes_price = cap
+            else:
+                body["no_price"] = cap
+                submit_no_price = cap
+
+        body_str = json.dumps(body, separators=(",", ":"))
         path     = "/portfolio/orders"
-        headers  = self._creds.sign_request("POST", f"/trade-api/v2{path}", body=body_str)
+        sign_path = f"/trade-api/v2{path}"
+        headers  = self._creds.sign_request("POST", sign_path, body=body_str)
 
         logger.order_sent(
             ticker=request.ticker,
@@ -356,8 +462,8 @@ class OrderEntry:
             order_type=request.order_type.value,
             count=request.count,
             limit_price=request.limit_price,
-            yes_price=request.yes_price,
-            time_in_force=request.time_in_force.value,
+            yes_price=submit_yes_price or request.yes_price,
+            time_in_force=tif,
             client_order_id=client_order_id,
             note=request.note,
         )
@@ -396,8 +502,8 @@ class OrderEntry:
                     order_type=request.order_type,
                     count=request.count,
                     limit_price=request.limit_price,
-                    yes_price=request.yes_price,
-                    status=OrderStatus(order.get("status", "pending")),
+                    yes_price=submit_yes_price or request.yes_price,
+                    status=OrderStatus.from_kalshi(order.get("status")),
                     submitted_at=datetime.now(timezone.utc),
                     estimated_cost_cents=request.estimated_cost_cents,
                     max_payout_cents=request.max_payout_cents,
@@ -493,16 +599,21 @@ class OrderEntry:
             except ValueError:
                 return None
 
-        filled_count   = int(raw.get("filled_count", 0) or 0)
-        count          = int(raw.get("count", 0) or 0)
+        def _fp_count(key: str) -> int:
+            val = raw.get(key)
+            if val is None:
+                return 0
+            try:
+                return int(float(val))
+            except (TypeError, ValueError):
+                return int(val or 0)
+
+        filled_count   = _fp_count("fill_count_fp") or int(raw.get("filled_count", 0) or 0)
+        count          = _fp_count("initial_count_fp") or int(raw.get("count", 0) or 0)
         avg_fill_price = raw.get("avg_price") or raw.get("yes_price")
         total_cost     = int(raw.get("total_cost", 0) or 0)
 
-        status_raw = raw.get("status", "pending")
-        try:
-            status = OrderStatus(status_raw)
-        except ValueError:
-            status = OrderStatus.PENDING
+        status = OrderStatus.from_kalshi(raw.get("status"))
 
         return OrderStatus_Detail(
             order_id=raw.get("order_id", ""),
