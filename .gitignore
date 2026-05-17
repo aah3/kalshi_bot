@@ -10,3 +10,4 @@ __pycache__/
 *.db
 kalshi_bot.jsonl
 testing.txt
+reports/

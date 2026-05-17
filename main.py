@@ -48,6 +48,8 @@ from discovery.discovery_presets import (
     preset_for_strategy,
 )
 from discovery.ticker_selector import (
+    DEFAULT_DISCOVER_CATEGORY,
+    resolve_discover_category,
     TickerCriteria,
     criteria_from_env,
     discover_tickers,
@@ -484,7 +486,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--discover-category",
         type=str,
         default=None,
-        help="Category for discovery, e.g. Sports (or KALSHI_DISCOVER_CATEGORY)",
+        help=(
+            "Category for discovery, e.g. Sports (default Trending if omitted; "
+            "or KALSHI_DISCOVER_CATEGORY)"
+        ),
     )
     parser.add_argument("--discover-top", type=int, default=None,
                         help="Max tickers to trade (default 10; env KALSHI_DISCOVER_TOP)")
@@ -626,9 +631,13 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
         return None
 
     env = criteria_from_env()
-    category = (args.discover_category or (env.category if env else "") or "").strip()
-    if not category:
-        return None
+    raw_category = args.discover_category or (env.category if env else None)
+    category = resolve_discover_category(raw_category)
+    if not (raw_category or "").strip():
+        logger.info(
+            "Discovery category not set; using default",
+            category=DEFAULT_DISCOVER_CATEGORY,
+        )
 
     def _pick(cli_val, env_val, default):
         if cli_val is not None:
@@ -701,8 +710,8 @@ async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
     criteria = _discover_criteria_from_args(args)
     if criteria is None:
         logger.error(
-            "Discovery requires --discover-category NAME "
-            "(or KALSHI_DISCOVER_CATEGORY in .env)"
+            "Discovery could not build criteria — use --discover "
+            f"(category defaults to {DEFAULT_DISCOVER_CATEGORY})"
         )
         sys.exit(1)
 
@@ -770,7 +779,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
     if not tickers:
         logger.error(
             "No tickers configured — set KALSHI_TICKERS, pass --tickers, "
-            "or use --discover --discover-category <NAME>"
+            f"or use --discover (defaults to {DEFAULT_DISCOVER_CATEGORY})"
         )
         sys.exit(1)
 

@@ -317,9 +317,22 @@ class MarketClient:
             competition: League/competition id on event product_metadata
                 (e.g. EPL, Champions League). Use with Sports + sport/tag.
             scope: Competition scope (e.g. Games, Futures) from product_metadata.
+
+        When category is ``Trending`` (case-insensitive), scans open events across
+        all categories and ranks by 24h volume — Kalshi has no Trending category
+        on the events API.
         """
+        trending = self.is_trending_category(category)
+        if trending:
+            full_scan = True
         category_lc = category.lower()
         tag_filter = (tag or sport or "").strip() or None
+        if trending and tag_filter:
+            logger.warning(
+                "Trending discovery ignores tag/sport filters",
+                tag=tag_filter,
+            )
+            tag_filter = None
         competition_lc = competition.strip().lower() if competition else None
         scope_lc = self._normalize_scope(scope) if scope else None
 
@@ -360,7 +373,7 @@ class MarketClient:
             pages += 1
 
             for event in batch:
-                if (event.get("category") or "").lower() != category_lc:
+                if not trending and (event.get("category") or "").lower() != category_lc:
                     continue
                 if series_tickers is not None:
                     if event.get("series_ticker", "") not in series_tickers:
@@ -376,7 +389,9 @@ class MarketClient:
                         continue
                     if not raw.get("series_ticker"):
                         raw["series_ticker"] = series_tk
-                    raw["_category_override"] = category
+                    raw["_category_override"] = (
+                        event.get("category") if trending else category
+                    ) or category
                     m = self._parse_market(raw)
                     if m.volume_24h < min_volume_24h:
                         continue
@@ -621,6 +636,11 @@ class MarketClient:
             if ev_scope != want:
                 return False
         return True
+
+    @staticmethod
+    def is_trending_category(category: str) -> bool:
+        """True when discovery should scan all categories by volume (Kalshi UI Trending)."""
+        return category.strip().lower() == "trending"
 
     @staticmethod
     def _normalize_scope(scope: str) -> str:

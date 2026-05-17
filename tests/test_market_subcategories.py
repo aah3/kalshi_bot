@@ -21,6 +21,12 @@ def test_event_matches_competition_filters_scope():
     assert not MarketClient._event_matches_competition_filters(event, "epl", "futures")
 
 
+def test_is_trending_category():
+    assert MarketClient.is_trending_category("Trending")
+    assert MarketClient.is_trending_category("trending")
+    assert not MarketClient.is_trending_category("Sports")
+
+
 def test_normalize_scope():
     assert MarketClient._normalize_scope("Games") == "game"
     assert MarketClient._normalize_scope("Futures") == "future"

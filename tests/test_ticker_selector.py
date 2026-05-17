@@ -2,8 +2,10 @@
 
 from discovery.market_client import MarketClient
 from discovery.ticker_selector import (
+    DEFAULT_DISCOVER_CATEGORY,
     TickerCriteria,
     filter_markets,
+    resolve_discover_category,
     select_tickers,
 )
 
@@ -56,6 +58,13 @@ def test_tradeable_only_excludes_wide_spread():
     criteria = TickerCriteria(category="Sports", top_n=5, tradeable_only=True)
     filtered = filter_markets([wide, ok], criteria)
     assert [m.ticker for m in filtered] == ["OK"]
+
+
+def test_resolve_discover_category_defaults_to_trending():
+    assert resolve_discover_category(None) == DEFAULT_DISCOVER_CATEGORY
+    assert resolve_discover_category("") == DEFAULT_DISCOVER_CATEGORY
+    assert resolve_discover_category("  ") == DEFAULT_DISCOVER_CATEGORY
+    assert resolve_discover_category("Sports") == "Sports"
 
 
 def test_min_volume_filter():

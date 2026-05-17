@@ -23,6 +23,15 @@ from logging_.structured_logger import logger
 
 RankBy = Literal["volume", "fee_adjusted_roi", "screener"]
 
+# Kalshi UI "Trending" tab — not an API category; cross-category volume scan.
+DEFAULT_DISCOVER_CATEGORY = "Trending"
+
+
+def resolve_discover_category(category: str | None) -> str:
+    """Use Trending when CLI/env omit a category (matches Kalshi home default)."""
+    name = (category or "").strip()
+    return name or DEFAULT_DISCOVER_CATEGORY
+
 
 @dataclass(frozen=True)
 class TickerCriteria:
@@ -144,9 +153,7 @@ def criteria_from_env() -> TickerCriteria | None:
     if flag not in ("1", "true", "yes", "on"):
         return None
 
-    category = os.getenv("KALSHI_DISCOVER_CATEGORY", "").strip()
-    if not category:
-        return None
+    category = resolve_discover_category(os.getenv("KALSHI_DISCOVER_CATEGORY"))
 
     def _opt_int(key: str) -> int | None:
         raw = os.getenv(key, "").strip()
