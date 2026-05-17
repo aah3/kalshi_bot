@@ -5,7 +5,11 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from discovery.orderbook_parse import parse_orderbook_response, worst_market_fill_price
+from discovery.orderbook_parse import (
+    market_order_yes_price,
+    parse_orderbook_response,
+    worst_market_fill_price,
+)
 
 
 def test_orderbook_fp_yes_no_dollars():
@@ -50,6 +54,22 @@ def test_worst_market_fill_price_walks_ladder():
     book = parse_orderbook_response(data, "T")
     assert worst_market_fill_price(book, "yes", 1) == 8
     assert worst_market_fill_price(book, "yes", 2) == 12
+
+
+def test_market_sell_uses_bid_floor_not_ask_cap():
+    """Sell YES must not use buy-side ask cap (would sit above bid and IOC-cancel)."""
+    data = {
+        "orderbook": {
+            "yes": {
+                "bids": [{"price": 8, "quantity": 200}],
+                "asks": [{"price": 10, "quantity": 200}],
+            }
+        }
+    }
+    book = parse_orderbook_response(data, "T")
+    assert worst_market_fill_price(book, "yes", 150) == 10
+    assert market_order_yes_price(book, "yes", "sell", 150) == 8
+    assert market_order_yes_price(book, "yes", "buy", 150) == 10
 
 
 def test_websocket_nested_shape():

@@ -71,7 +71,9 @@ The bot watches **all N discovered tickers** in parallel. Each order is priced f
 | `--stop-loss` | 0.40 | Stop if YES bid falls 40% below entry |
 | `--gu-entry-mode` | `passive` | How to price **buy YES** entries (see order pricing) |
 | `--gu-exit-mode` | `passive` | How to price **buy NO** hedge/stop legs |
-| `--max-concurrent-positions` | `0` (unlimited) | Cap simultaneous open/pending positions |
+| `--max-concurrent-positions` | `0` (unlimited) | Cap simultaneous open/pending entry legs (hedges/stops still allowed) |
+
+**Sizing:** fractional Kelly from entry vs hedge-trigger odds, capped by `MAX_POSITION_CENTS` (default $100). Contract count = `size_cents // entry_price`.
 
 **Order pricing** (`--gu-entry-mode` / `--gu-exit-mode`, same set as high-prob):
 
@@ -87,12 +89,12 @@ The bot watches **all N discovered tickers** in parallel. Each order is priced f
 python main.py --discover --discover-category Sports --strategy green_up \
   --discover-top 5 --discover-only
 
-# Autonomous demo: 5 markets, passive entries, max 5 open positions
+# Autonomous demo: 5 live Sports markets, market entries, max 5 open positions
 python main.py --discover --discover-category Sports --strategy green_up \
   --discover-top 5 --max-concurrent-positions 5 \
   --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
-  --gu-entry-mode passive --gu-exit-mode cross_spread \
-  --monitor-interval 5
+  --gu-entry-mode market --gu-exit-mode cross_spread \
+  --monitor-interval 30
 ```
 
 ### High-probability strategy
@@ -132,7 +134,7 @@ When you use `--discover` (or `KALSHI_DISCOVER=true`), the bot applies a **disco
 | Preset | Used for | Default filters |
 |--------|----------|-----------------|
 | `high_prob` | `high_prob` | YES ask 85–97¢, spread ≤8¢, min vol 200, rank by **fee-adjusted ROI** |
-| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, activity 48h, rank by **screener score** |
+| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, updated ≤2h, closing ≤6h, rank by **screener score** |
 | `kelly` | `kelly` | Spread ≤10¢, min vol 100 |
 | `arb` | `arb` | Top 25 by volume, full scan |
 
@@ -174,7 +176,85 @@ python main.py --discover --discover-category Sports --strategy green_up \
 | `KALSHI_DISCOVER_MIN_VOLUME` | Min 24h volume |
 | `KALSHI_DISCOVER_ACTIVITY_HOURS` | Only recently updated markets |
 | `KALSHI_DISCOVER_RANK_BY` | `volume`, `fee_adjusted_roi`, or `screener` |
+| `KALSHI_DISCOVER_MAX_MINUTES_TO_CLOSE` | Only markets closing within N minutes (preset / live filter) |
 | `KALSHI_MAX_CONCURRENT_POSITIONS` | Cap open/pending positions (`0` = unlimited) |
+
+**CLI discovery flags:** `--discover-top`, `--discover-min-volume`, `--discover-min-yes-ask`, `--discover-max-yes-ask`, `--discover-max-spread`, `--discover-activity-hours`, `--discover-max-minutes-to-close`, `--discover-rank-by`, `--discover-min-fee-roi`, `--discover-full-scan`, `--discover-only`, `--discover-preset`, `--no-live-only`.
+
+### Live markets only (default on)
+
+By default the bot only **discovers** and **enters** markets that are:
+
+- Updated on Kalshi within the last **2 hours** (`KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE`)
+- Closing within the next **6 hours** (`KALSHI_LIVE_MAX_MINUTES_TO_CLOSE`) — in-play / soon window for Sports
+- Showing a **fresh WebSocket** book (≤30 min) and a **recent trade** on the tape (≤2 h) before each entry
+
+Disable with `--no-live-only` or `KALSHI_LIVE_ONLY=false`.
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `KALSHI_LIVE_ONLY` | `true` | Master switch for live gates |
+| `KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE` | `120` | Discovery: market updated within N minutes |
+| `KALSHI_LIVE_MAX_MINUTES_TO_CLOSE` | `360` | Discovery + entry: closes within N minutes |
+| `KALSHI_LIVE_MAX_BOOK_STALE_MINUTES` | `30` | Entry: WebSocket book must be fresh |
+| `KALSHI_LIVE_MAX_TRADE_STALE_MINUTES` | `120` | Entry: recent trade on the tape |
+
+```bash
+# Stricter: only markets updated in the last 30 minutes, closing within 3 hours
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-activity-hours 0.5 --discover-max-minutes-to-close 180 ...
+```
+
+---
+
+## Manual trading (`tools/trade.py`)
+
+The bot does **not** auto-flatten on shutdown. Use `tools/trade.py` to inspect the exchange portfolio and close legs manually. Orders placed only here are **not** written to the bot blotter (see [Trade history](#trade-history-and-blotter)).
+
+### Portfolio and orders
+
+```bash
+python tools/trade.py portfolio      # open positions + mark-to-market P&L
+python tools/trade.py positions      # alias for portfolio
+python tools/trade.py position --ticker TICKER
+python tools/trade.py balance
+python tools/trade.py orders         # resting orders
+python tools/trade.py cancel --order-id ORDER_ID
+python tools/trade.py cancel-all --yes   # --yes = skip confirmation
+```
+
+### Buy, sell, and close
+
+```bash
+# Preview (shows BUY vs SELL in the header)
+python tools/trade.py preview --ticker TICKER --side yes --count 10 --price 32
+python tools/trade.py preview --ticker TICKER --side yes --count 150 --market
+
+# Buy
+python tools/trade.py buy --ticker TICKER --side yes --count 10 --price 32
+python tools/trade.py buy --ticker TICKER --side yes --count 10 --market
+
+# Sell (reduce / close a long you already hold)
+python tools/trade.py sell --ticker TICKER --side yes --count 150 --market
+python tools/trade.py sell --ticker TICKER --side yes --count 150 --market --yes   # skip confirm
+
+# Close entire position on one ticker (reads size from portfolio)
+python tools/trade.py close --ticker KXNBASPREAD-26MAY17CLEDET-CLE12
+python tools/trade.py close --ticker TICKER --count 50    # partial
+```
+
+**Market order pricing on Kalshi:** every order includes `yes_price` or `no_price`, even when `type=market`:
+
+| Action | `yes_price` meaning |
+|--------|---------------------|
+| **Buy** YES | Maximum you will pay (walks the **ask** ladder) |
+| **Sell** YES | Minimum you will accept (walks the **bid** ladder) |
+
+`tools/trade.py` sets these from the live book via `market_order_yes_price()` in `discovery/orderbook_parse.py`. A sell preview with bid 8¢ / ask 10¢ should show **SELL MARKET YES** and **YES price: 8c**, not 10c.
+
+**IOC + `status=cancelled`:** market orders use immediate-or-cancel. `cancelled` with zero fills means nothing matched (e.g. sell floor above the best bid, no position to sell, or thin demo liquidity)—not an API rejection. Check `python tools/trade.py portfolio` before selling.
+
+Green-up **hedges** are separate **NO** legs. To flatten fully you may need to close both YES and NO if both are open (`close` defaults to the side you hold; use `sell --side no` for NO).
 
 ---
 
@@ -205,13 +285,18 @@ python main.py --discover --discover-category Politics --strategy high_prob \
 
 Defaults to **demo** (`KALSHI_ENV=demo`). Real money only when `KALSHI_ENV=production`.
 
-### 3. Manual orders
+### 3. Manual orders and portfolio
 
 ```bash
+python tools/trade.py portfolio
 python tools/trade.py preview --ticker TICKER-A --side yes --count 10 --price 32
 python tools/trade.py buy --ticker TICKER-A --side yes --count 10 --price 32
+python tools/trade.py sell --ticker TICKER-A --side yes --count 10 --market
+python tools/trade.py close --ticker TICKER-A
 python tools/trade.py monitor --interval 15
 ```
+
+See [Manual trading](#manual-trading-toolstradepy) for the full command list.
 
 ### 4. Live monitor table
 
@@ -224,7 +309,9 @@ python main.py --strategy green_up --tickers TICKER-A \
 python main.py --strategy high_prob --tickers TICKER-A --monitor-interval 15
 ```
 
-The monitor can fall back to REST order books when the WebSocket book is empty; the strategy evaluates on **WebSocket ticks** (Kalshi `orderbook_delta` channel, including FP dollar snapshots/deltas).
+The monitor can fall back to REST order books when the WebSocket book is empty; the strategy evaluates entries on **WebSocket ticks** (Kalshi `orderbook_delta` channel, including FP dollar snapshots/deltas). With live filters enabled, stale books block new entries even if REST shows prices.
+
+**Fill rate in the monitor** counts signals where the bot’s fill listener saw an exchange fill—not every resting limit or IOC that was sent. Use `tools/trade.py orders` / `portfolio` to reconcile exchange state.
 
 ### 5. Dashboard and session reports
 
@@ -321,6 +408,102 @@ python tools/replay.py replay --input data/session.jsonl --strategy high_prob
 
 ---
 
+## Troubleshooting
+
+Common issues when running the bot or `tools/trade.py`. Check structured logs in `kalshi_bot.jsonl` (`KALSHI_LOG_FILE`) for `ORDER_SENT`, `SYSTEM`, and strategy events.
+
+### Market order shows `status=cancelled`
+
+**Symptom:** `tools/trade.py` prints “Order placed successfully” but `status=cancelled` and position size unchanged.
+
+**Cause:** Kalshi market orders use **immediate-or-cancel (IOC)**. `cancelled` usually means **zero contracts filled**, not an API error.
+
+| Check | What to do |
+|-------|------------|
+| Sell floor above bid | Sell preview must show **SELL** and `yes_price` at the **bid** (e.g. 8¢), not the ask (10¢). Update to latest code; see [Manual trading](#manual-trading-toolstradepy). |
+| No position | `python tools/trade.py portfolio` — you can only sell what you hold. Wrong side? Use `--side no` or `close` (auto-detects side). |
+| Thin demo book | Large `--count` may not fully fill; try a smaller size or `cross_spread` limit at the bid. |
+| Resting limits | Use `python tools/trade.py orders` and `cancel-all` if old GTC orders block intent. |
+
+### Bot runs but never enters (stuck in `watching` / `scanning`)
+
+**Symptom:** Monitor shows tickers and prices; strategy state stays `watching` or `scanning`; few or no `ORDER_SENT` lines.
+
+| Check | What to do |
+|-------|------------|
+| Live gates | Default requires fresh WS book (≤30 min) and recent tape (≤2 h). Wait for WS snapshots or temporarily `--no-live-only` to test. |
+| Entry price | Green-up only buys when YES **ask** ≤ `--entry-max` (default 25¢). Prices above that are expected skips. |
+| WebSocket | Strategy entries need WS ticks, not REST-only monitor prices. Confirm ingestor connected (no repeated WS errors in logs). |
+| Concurrent cap | `--max-concurrent-positions N` blocks **new entries** when N legs are open; hedges/stops still fire. |
+| Passive mode | `--gu-entry-mode passive` rests at the bid; may not fill in fast markets. Try `cross_spread` or `market`. |
+
+### Fill rate `0%` in the monitor
+
+**Symptom:** Session table shows `Fill rate: 0% (0/N)`.
+
+**Cause:** That metric counts signals where the bot’s **fill listener** confirmed an exchange fill—not every order submitted.
+
+| Check | What to do |
+|-------|------------|
+| Resting orders | Passive limits may be open but unfilled; check `tools/trade.py orders`. |
+| IOC / market | Entries can be sent and cancelled with 0 fill; see cancelled-market section above. |
+| Ground truth | Use `tools/trade.py portfolio` and Kalshi’s UI for actual positions. |
+
+### Discovery picks “dead” or far-dated markets
+
+**Symptom:** Tickers look like old game lines; no tape activity; entries never pass live gates.
+
+**Cause:** Older builds used a 48h activity window; current **green_up** preset uses **2h** update + **6h** close.
+
+**Fix:** Restart with current code; keep `KALSHI_LIVE_ONLY=true` (default). Tighten with `--discover-activity-hours 0.5 --discover-max-minutes-to-close 180`. Preview only: `--discover-only`.
+
+### Monitor shows prices; strategy does not react
+
+**Symptom:** Terminal table updates bid/ask via REST fallback; no state changes.
+
+**Cause:** The **monitor** can use REST when the WS book is empty; the **strategy** evaluates on WebSocket `orderbook_delta` ticks.
+
+**Fix:** Ensure tickers are subscribed and WS is healthy. Avoid relying on monitor prices alone to debug entry logic.
+
+### Cannot flatten / position still open after “sell”
+
+| Check | What to do |
+|-------|------------|
+| Partial fill | IOC may fill fewer than `--count`; re-run `portfolio` and sell remainder. |
+| Green-up hedge | You may hold **YES and NO**. Close each leg: `close --ticker T` (uses portfolio side) or sell YES and NO separately. |
+| Bot shutdown | `main.py` does not auto-flatten. Use `tools/trade.py close` or `cancel-all` for resting bot orders. |
+
+### Blotter missing manual trades
+
+**Symptom:** `tools/blotter.py trades` empty or incomplete after using `tools/trade.py`.
+
+**Cause:** Only trades opened through **`main.py`** are recorded automatically.
+
+**Fix:** Use Kalshi account history for manual legs, or annotate via blotter CLI if you import them later.
+
+### Credentials / environment
+
+| Symptom | Fix |
+|---------|-----|
+| `401` / auth errors | Match `KALSHI_ENV` to keys: `KALSHI_DEMO_*` for demo, `KALSHI_PROD_*` for production. |
+| Wrong account | Startup log shows `ENV=demo` and key suffix; verify in [Kalshi API settings](https://kalshi.com/account/api-keys). |
+| `429` rate limited | Bot backs off automatically; reduce parallel tickers or discovery `--discover-full-scan` frequency. |
+
+### Windows WebSocket errors
+
+**Symptom:** `TypeError` on connect or immediate disconnect.
+
+**Fix:** `ingestion/market_ingestor.py` retries with compatible header kwargs. Update dependencies (`pip install -r requirements.txt`) and restart. If it persists, paste the traceback from `kalshi_bot.jsonl` or the console.
+
+### Still stuck?
+
+1. `python -m pytest tests/ -v` — confirm install is healthy.  
+2. `python main.py --discover ... --discover-only` — verify ticker set before trading.  
+3. `python tools/trade.py preview ... --market` — confirm BUY/SELL and prices before sending.  
+4. Search logs for `ORDER_SENT`, `rejected`, `live_gate`, and `circuit_breaker`.
+
+---
+
 ## Production checklist
 
 - [ ] Two+ weeks demo trading without unhandled exceptions
@@ -342,6 +525,7 @@ kalshi_bot/
 ├── strategy/
 │   ├── base_strategy.py          Signal interface
 │   ├── factory.py                build_strategy() by name
+│   ├── execution_price.py        Passive / cross_spread / market pricing
 │   ├── kelly_strategy.py         Fractional Kelly + edge-to-vig
 │   ├── green_up_strategy.py      Back high / lay low hedging
 │   ├── high_prob_strategy.py     High P(YES), fee-aware ROI, exit modes
@@ -351,6 +535,8 @@ kalshi_bot/
 │   ├── screener.py               Score markets per strategy
 │   ├── ticker_selector.py        Filter, rank, select tickers
 │   ├── discovery_presets.py      Strategy-aligned discovery defaults
+│   ├── live_market.py            Live-only discovery + entry gates
+│   ├── orderbook_parse.py        Book parse + market buy/sell price helpers
 │   └── market_math.py            Gross / fee-adjusted ROI helpers
 ├── execution/
 │   ├── execution_manager.py      Orders (limit/market, buy/sell, TIF)
@@ -386,6 +572,12 @@ kalshi_bot/
 | `POSITION_STOP_LOSS_PCT` | 0.40 | Alert when unrealised loss ≥ 40% of cost |
 | `KALSHI_DB_PATH` | `kalshi_bot.db` | Blotter + metrics SQLite file |
 | `KALSHI_MONITOR_INTERVAL` | 15 | Live table refresh (seconds); `0` = off |
+| `KALSHI_MAX_CONCURRENT_POSITIONS` | `0` | Cap entry legs per strategy (`0` = unlimited) |
+| `KALSHI_LIVE_ONLY` | `true` | Live discovery + entry gates |
+| `KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE` | 120 | Max age since Kalshi market update |
+| `KALSHI_LIVE_MAX_MINUTES_TO_CLOSE` | 360 | Max time until market close |
+| `KALSHI_LIVE_MAX_BOOK_STALE_MINUTES` | 30 | Max WebSocket book age at entry |
+| `KALSHI_LIVE_MAX_TRADE_STALE_MINUTES` | 120 | Max tape age at entry |
 
 ### Green-up environment variables
 
@@ -398,9 +590,11 @@ KALSHI_GREEN_UP_STOP_LOSS=0.40
 KALSHI_GREEN_UP_ENTRY_MODE=passive
 KALSHI_GREEN_UP_EXIT_MODE=passive
 KALSHI_MAX_CONCURRENT_POSITIONS=5
+KALSHI_LIVE_ONLY=true
+KALSHI_LIVE_MAX_MINUTES_TO_CLOSE=360
 ```
 
-CLI flags (`--entry-max`, `--hedge-trigger`, `--hedge-mode`, `--stop-loss`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`) override these at runtime.
+CLI flags (`--entry-max`, `--hedge-trigger`, `--hedge-mode`, `--stop-loss`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--discover-max-minutes-to-close`) override these at runtime.
 
 ### High-probability environment variables
 

@@ -51,6 +51,7 @@ class OrderBook:
     yes_bids: dict[int, int] = field(default_factory=dict)  # price -> qty
     yes_asks: dict[int, int] = field(default_factory=dict)
     last_trade_price: int | None = None
+    last_trade_at_us: int = 0
     updated_at_us: int = 0
 
     @property
@@ -253,7 +254,7 @@ class MarketIngestor:
             try:
                 await self._connect_and_stream()
                 self._reconnect_delay = self._RECONNECT_BASE_DELAY  # reset on clean exit
-            except (ConnectionClosedError, OSError) as exc:
+            except (ConnectionClosedError, OSError, TypeError) as exc:
                 logger.warning(
                     f"WS disconnected: {exc} — reconnecting in {self._reconnect_delay:.1f}s",
                     reconnect_delay=self._reconnect_delay,
@@ -273,25 +274,44 @@ class MarketIngestor:
     # ── Private ──────────────────────────────────────────────────────────────
 
     async def _connect_and_stream(self) -> None:
-        extra_headers = {}
+        extra_headers: dict[str, str] = {}
         if self._credentials:
-            # Authenticated WebSocket handshake
             extra_headers = self._credentials.sign_request("GET", "/trade-api/ws/v2")
 
         logger.info(f"Connecting to WebSocket: {config.WS_URL}", tickers=self._tickers)
 
-        async with websockets.connect(
-            config.WS_URL,
-            additional_headers=extra_headers,
-            ping_interval=config.WS_PING_INTERVAL_SECONDS,
-        ) as ws:
-            await self._subscribe(ws)
-            logger.info("WebSocket connected and subscribed", tickers=self._tickers)
+        ping_kw = {"ping_interval": config.WS_PING_INTERVAL_SECONDS}
+        header_attempts: list[dict[str, dict[str, str]]] = []
+        if extra_headers:
+            header_attempts.append({"additional_headers": extra_headers})
+            header_attempts.append({"extra_headers": extra_headers})
+        header_attempts.append({})
 
-            async for raw_message in ws:
-                if not self._running:
-                    break
-                await self._handle_message(raw_message)
+        last_type_error: TypeError | None = None
+        for header_kw in header_attempts:
+            try:
+                async with websockets.connect(
+                    config.WS_URL,
+                    **ping_kw,
+                    **header_kw,
+                ) as ws:
+                    await self._subscribe(ws)
+                    logger.info(
+                        "WebSocket connected and subscribed",
+                        tickers=self._tickers,
+                        auth=bool(extra_headers),
+                    )
+                    async for raw_message in ws:
+                        if not self._running:
+                            break
+                        await self._handle_message(raw_message)
+                    return
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+
+        if last_type_error is not None:
+            raise last_type_error
 
     async def _subscribe(self, ws) -> None:
         """Send subscription commands for all tickers."""
@@ -363,6 +383,7 @@ class MarketIngestor:
             return
 
         book.last_trade_price = data.get("yes_price")
+        book.last_trade_at_us = int(time.time() * 1_000_000)
         self._emit_tick(book, event_type="trade")
 
     def _apply_fill(self, data: dict) -> None:

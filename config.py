@@ -118,6 +118,27 @@ MAX_OPEN_POSITIONS: int         = 20     # absolute open position count
 MAX_CONCURRENT_POSITIONS: int   = int(
     os.getenv("KALSHI_MAX_CONCURRENT_POSITIONS", "0")
 )  # 0 = unlimited; cap simultaneous entry legs per strategy
+
+# Live-market gates (discovery + entry) — avoid stale / far-dated contracts
+LIVE_TRADING_ONLY: bool = os.getenv("KALSHI_LIVE_ONLY", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+LIVE_MAX_MINUTES_SINCE_UPDATE: float = float(
+    os.getenv("KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE", "120")
+)
+LIVE_MAX_MINUTES_TO_CLOSE: float | None = (
+    float(os.getenv("KALSHI_LIVE_MAX_MINUTES_TO_CLOSE"))
+    if os.getenv("KALSHI_LIVE_MAX_MINUTES_TO_CLOSE", "").strip()
+    else 360.0
+)
+LIVE_MAX_BOOK_STALE_MINUTES: float = float(
+    os.getenv("KALSHI_LIVE_MAX_BOOK_STALE_MINUTES", "30")
+)
+LIVE_MAX_TRADE_STALE_MINUTES: float | None = (
+    float(os.getenv("KALSHI_LIVE_MAX_TRADE_STALE_MINUTES"))
+    if os.getenv("KALSHI_LIVE_MAX_TRADE_STALE_MINUTES", "").strip()
+    else 120.0
+)
 DAILY_LOSS_LIMIT_CENTS: int     = 50_000 # $500 daily stop-loss
 
 # Per-position risk thresholds (used by alert_manager)

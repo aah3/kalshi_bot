@@ -185,11 +185,16 @@ def render_session_table(
     if metrics:
         fill = metrics.get("fill_rate", {})
         dd   = metrics.get("max_drawdown", {})
-        print(
-            f"  Fill rate {fill.get('fill_rate', 0)*100:.0f}% "
-            f"({fill.get('filled', 0)}/{fill.get('total_signals', 0)})  |  "
-            f"Drawdown {dd.get('max_drawdown_pct', 0)*100:.1f}%"
-        )
+        total_sig = fill.get("total_signals", 0)
+        filled    = fill.get("filled", 0)
+        if total_sig == 0:
+            fill_line = "Fill rate n/a (no signals yet — strategy needs WS ticks to enter)"
+        else:
+            fill_line = (
+                f"Fill rate {fill.get('fill_rate', 0)*100:.0f}% "
+                f"({filled}/{total_sig})"
+            )
+        print(f"  {fill_line}  |  Drawdown {dd.get('max_drawdown_pct', 0)*100:.1f}%")
 
     # Per-ticker strategy + market table
     print("-" * W)

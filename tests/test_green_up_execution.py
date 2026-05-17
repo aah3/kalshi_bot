@@ -106,6 +106,8 @@ def test_market_entry_meta():
 def test_green_up_preset_ranks_by_screener():
     merged = apply_preset(TickerCriteria(category="Sports"), "green_up")
     assert merged.rank_by == "screener"
+    assert merged.activity_hours == 2.0
+    assert merged.max_minutes_to_close == 360.0
 
 
 def test_select_tickers_by_screener_score():

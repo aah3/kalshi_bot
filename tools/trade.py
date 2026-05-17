@@ -36,6 +36,14 @@ COMMANDS
   # Cancel all resting orders
   python tools/trade.py cancel-all
 
+  CLOSE POSITIONS
+  ───────────────
+  # Market-sell entire YES position (flatten)
+  python tools/trade.py close --ticker KXNBASPREAD-26MAY17CLEDET-CLE12 --yes
+
+  # Market-sell with explicit contract count
+  python tools/trade.py sell --ticker TICKER --side yes --count 10 --market --yes
+
   PORTFOLIO & P&L
   ────────────────
   # Show current positions with live mark-to-market P&L
@@ -87,7 +95,8 @@ def _print_preview(preview: dict) -> None:
         return
 
     print(f"\n{'─' * 65}")
-    print(f"  ORDER PREVIEW  ({preview['order_type'].upper()} {preview['side'].upper()})")
+    action = (preview.get("action") or "buy").upper()
+    print(f"  ORDER PREVIEW  ({action} {preview['order_type'].upper()} {preview['side'].upper()})")
     print(f"{'─' * 65}")
     print(f"  {'Ticker:':<28} {preview['ticker']}")
     print(f"  {'Contracts:':<28} {preview['count']}")
@@ -142,6 +151,47 @@ async def cmd_preview(args):
     _print_preview(preview)
 
 
+async def cmd_sell(args):
+    """Place a sell order (reduce / close a long)."""
+    args.action = "sell"
+    await cmd_buy(args)
+
+
+async def cmd_close(args):
+    """Market-sell the full open position on one ticker."""
+    creds, limiter = _make_deps()
+    async with PortfolioMonitor(creds, limiter) as pm:
+        snap = await pm.refresh()
+    pos = next((p for p in snap.positions if p.ticker == args.ticker), None)
+    if not pos or pos.contracts <= 0:
+        print(f"\n  No open position on {args.ticker}.\n")
+        return
+
+    count = args.count if getattr(args, "count", None) else pos.contracts
+    count = min(count, pos.contracts)
+    side = pos.side.lower()
+    print(
+        f"\n  Closing {count} {side.upper()} contract(s) on {args.ticker} "
+        f"(entry ~{pos.avg_entry_price}c, mark ~{pos.mark_price or '?'}c)\n"
+    )
+
+    class _CloseArgs:
+        pass
+
+    close_args = _CloseArgs()
+    close_args.ticker = args.ticker
+    close_args.side = side
+    close_args.count = count
+    close_args.market = True
+    close_args.price = None
+    close_args.max_price = getattr(args, "max_price", None)
+    close_args.tif = "ioc"
+    close_args.note = args.note or "manual close"
+    close_args.yes = getattr(args, "yes", False)
+    close_args.action = "sell"
+    await cmd_buy(close_args)
+
+
 async def cmd_buy(args):
     creds, limiter = _make_deps()
     req = OrderRequest(
@@ -152,6 +202,7 @@ async def cmd_buy(args):
         limit_price=None if args.market else args.price,
         market_max_price=getattr(args, "max_price", None) if args.market else None,
         time_in_force=TimeInForce.from_cli(args.tif),
+        action=getattr(args, "action", "buy"),
         note=args.note or "",
     )
 
@@ -339,9 +390,22 @@ p_prev = sub.add_parser("preview", help="Preview an order (no submission)")
 _add_order_args(p_prev)
 
 # buy
-p_buy = sub.add_parser("buy", help="Place a market or limit order")
+p_buy = sub.add_parser("buy", help="Place a market or limit order (buy)")
 _add_order_args(p_buy)
 p_buy.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+# sell
+p_sell = sub.add_parser("sell", help="Place a market or limit sell (close / reduce)")
+_add_order_args(p_sell)
+p_sell.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+# close
+p_close = sub.add_parser("close", help="Market-sell your full position on a ticker")
+p_close.add_argument("--ticker", required=True)
+p_close.add_argument("--count", type=int, help="Contracts to sell (default: entire position)")
+p_close.add_argument("--max-price", type=int, metavar="CENTS", help="Min YES/NO price for market sell")
+p_close.add_argument("--note", default="")
+p_close.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
 # status
 p_stat = sub.add_parser("status", help="Check order status")
@@ -376,6 +440,8 @@ sub.add_parser("balance", help="Show account balance")
 _HANDLERS = {
     "preview":    cmd_preview,
     "buy":        cmd_buy,
+    "sell":       cmd_sell,
+    "close":      cmd_close,
     "status":     cmd_status,
     "orders":     cmd_orders,
     "cancel":     cmd_cancel,

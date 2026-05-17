@@ -42,7 +42,7 @@ import aiohttp
 import config
 from credentials.credential_manager import CredentialManager
 from discovery.market_client import MarketClient, OrderBookSnapshot
-from discovery.orderbook_parse import worst_market_fill_price
+from discovery.orderbook_parse import market_order_yes_price, worst_market_fill_price
 from execution.rate_limiter import BucketType, RateLimiter
 from logging_.structured_logger import logger
 
@@ -125,6 +125,7 @@ class OrderRequest:
     limit_price:  int | None       # cents (1-99) for limit; None for market
     market_max_price: int | None = None  # optional cap for market (else from book)
     time_in_force: TimeInForce    = TimeInForce.GTC
+    action:       str             = "buy"   # buy | sell
     note:         str             = ""   # optional human label for this trade
 
     @property
@@ -154,6 +155,8 @@ class OrderRequest:
             errors.append("ticker is required")
         if self.count <= 0:
             errors.append(f"count must be > 0, got {self.count}")
+        if self.action not in ("buy", "sell"):
+            errors.append(f"action must be buy or sell, got {self.action!r}")
         if self.order_type == OrderType.LIMIT:
             if self.limit_price is None:
                 errors.append("limit_price required for LIMIT orders")
@@ -363,8 +366,11 @@ class OrderEntry:
         if request.order_type == OrderType.MARKET:
             market_cap = request.market_max_price
             if market_cap is None and book:
-                market_cap = worst_market_fill_price(
-                    book, request.side.value, request.count
+                market_cap = market_order_yes_price(
+                    book,
+                    request.side.value,
+                    request.action,
+                    request.count,
                 )
 
         implied_roi = None
@@ -376,6 +382,7 @@ class OrderEntry:
         return {
             "valid":              True,
             "ticker":             request.ticker,
+            "action":             request.action,
             "side":               request.side.value,
             "order_type":         request.order_type.value,
             "count":              request.count,
@@ -418,7 +425,7 @@ class OrderEntry:
             "ticker":          request.ticker,
             "client_order_id": client_order_id,
             "type":            request.order_type.value,
-            "action":          "buy",
+            "action":          request.action,
             "side":            request.side.value,
             "count":           request.count,
             "count_fp":        f"{request.count:.2f}",
@@ -443,7 +450,12 @@ class OrderEntry:
                 if book is None:
                     logger.error("No order book for market order", ticker=request.ticker)
                     return None
-                cap = worst_market_fill_price(book, request.side.value, request.count)
+                cap = market_order_yes_price(
+                    book,
+                    request.side.value,
+                    request.action,
+                    request.count,
+                )
             if request.side == OrderSide.YES:
                 body["yes_price"] = cap
                 submit_yes_price = cap
@@ -459,6 +471,7 @@ class OrderEntry:
         logger.order_sent(
             ticker=request.ticker,
             side=request.side.value,
+            action=request.action,
             order_type=request.order_type.value,
             count=request.count,
             limit_price=request.limit_price,

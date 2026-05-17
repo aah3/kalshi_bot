@@ -43,6 +43,84 @@ class OrderBookSnapshot:
         }
 
 
+def market_order_yes_price(
+    book: OrderBookSnapshot,
+    side: str,
+    action: str,
+    count: int,
+    *,
+    fallback: int = 99,
+) -> int:
+    """
+    Kalshi ``yes_price`` on market orders:
+
+    - **buy** YES: maximum you will pay (walk the ask ladder).
+    - **sell** YES: minimum you will accept (walk the bid ladder).
+
+    Using the buy cap on a sell leaves ``yes_price`` above the best bid, so IOC
+    orders cancel with zero fills.
+    """
+    action = (action or "buy").lower()
+    if action == "sell" and side == "yes":
+        return _market_sell_yes_floor(book, count, fallback=1)
+    if action == "sell" and side == "no":
+        return _market_sell_no_floor(book, count, fallback=1)
+    return worst_market_fill_price(book, side, count, fallback=fallback)
+
+
+def _market_sell_yes_floor(
+    book: OrderBookSnapshot,
+    count: int,
+    *,
+    fallback: int = 1,
+) -> int:
+    """Minimum YES price to sell ``count`` contracts aggressively (hit bids)."""
+    if count <= 0:
+        return fallback
+
+    floor = 99
+    remaining = count
+    for price, qty in book.yes_bids:
+        if remaining <= 0:
+            break
+        if qty > 0:
+            floor = min(floor, price)
+        remaining -= min(remaining, qty)
+
+    if floor < 99:
+        return max(1, floor)
+    if book.best_bid is not None:
+        return max(1, book.best_bid)
+    return max(1, fallback)
+
+
+def _market_sell_no_floor(
+    book: OrderBookSnapshot,
+    count: int,
+    *,
+    fallback: int = 1,
+) -> int:
+    """Minimum NO price to sell ``count`` contracts aggressively (lift NO bids)."""
+    if count <= 0:
+        return fallback
+
+    floor = 99
+    remaining = count
+    for yes_ask, qty in book.yes_asks:
+        if remaining <= 0:
+            break
+        no_bid = 100 - yes_ask
+        if qty > 0:
+            floor = min(floor, no_bid)
+        remaining -= min(remaining, qty)
+
+    if floor < 99:
+        return max(1, floor)
+    if book.best_ask is not None:
+        return max(1, 100 - book.best_ask)
+    return max(1, fallback)
+
+
 def worst_market_fill_price(
     book: OrderBookSnapshot,
     side: str,

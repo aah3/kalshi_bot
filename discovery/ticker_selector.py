@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from credentials.credential_manager import CredentialManager
+from discovery.live_market import LiveMarketRules, is_market_live
 from discovery.market_client import MarketClient, MarketSummary
 from discovery.market_math import fee_adjusted_roi_if_yes_wins_pct
 from execution.rate_limiter import RateLimiter
@@ -41,6 +42,9 @@ class TickerCriteria:
     status: str = "open"
     preset_name: str | None = None
     screener_strategy: str | None = None
+    live_only: bool = True
+    max_minutes_to_close: float | None = None
+    max_minutes_since_update: float | None = None
 
 
 def filter_markets(
@@ -70,6 +74,19 @@ def filter_markets(
                 round_trip_fees=False,
             )
             if roi < criteria.min_fee_adjusted_roi_pct:
+                continue
+        if criteria.live_only:
+            max_since = criteria.max_minutes_since_update
+            if max_since is None and criteria.activity_hours is not None:
+                max_since = criteria.activity_hours * 60.0
+            rules = LiveMarketRules(
+                enabled=True,
+                max_minutes_since_update=max_since,
+                max_minutes_to_close=criteria.max_minutes_to_close,
+                min_volume_24h=criteria.min_volume_24h,
+            )
+            ok, _ = is_market_live(m, rules)
+            if not ok:
                 continue
         out.append(m)
     return out

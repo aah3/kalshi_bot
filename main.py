@@ -97,6 +97,7 @@ _shutdown_event = asyncio.Event()
 # is linked to the correct blotter parent row.
 _active_trades: dict[str, str] = {}
 _max_concurrent_positions: int = 0
+_live_rules = None
 
 
 # ── Tick callback ─────────────────────────────────────────────────────────────
@@ -113,7 +114,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
              → alert_manager.register_order()
     """
     global _strategy, _circuit_breaker, _execution, _store, _blotter
-    global _active_trades, _alert_manager, _max_concurrent_positions
+    global _active_trades, _alert_manager, _max_concurrent_positions, _live_rules
 
     signal_obj = _strategy.evaluate(tick)
     if signal_obj is None:
@@ -121,6 +122,30 @@ async def on_tick(tick: dict[str, Any]) -> None:
 
     meta = signal_obj.meta or {}
     phase = meta.get("phase", "entry")
+
+    if phase in ("entry", "leg_1") and _live_rules and _live_rules.enabled:
+        from discovery.live_market import is_tick_live
+        from discovery.market_registry import get_market
+
+        ticker = signal_obj.ticker
+        book = _ingestor.get_book(ticker) if _ingestor else None
+        ok, reason = is_tick_live(
+            tick, book, _live_rules, market=get_market(ticker)
+        )
+        if not ok:
+            logger.info(
+                "Skipping entry — market not live",
+                ticker=ticker,
+                reason=reason,
+            )
+            from strategy.green_up_strategy import GreenUpStrategy, PositionState
+
+            if isinstance(_strategy, GreenUpStrategy):
+                pos = _strategy.get_position(ticker)
+                if pos and pos.state == PositionState.WATCHING:
+                    pos.state = PositionState.SCANNING
+            return
+
     if (
         _max_concurrent_positions > 0
         and phase in ("entry", "leg_1")
@@ -540,6 +565,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PCT",
         help="Minimum fee-adjusted ROI if YES wins (high-prob discovery)",
     )
+    parser.add_argument(
+        "--discover-max-minutes-to-close",
+        type=float,
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "Live filter: only markets closing within MINUTES "
+            "(env KALSHI_LIVE_MAX_MINUTES_TO_CLOSE)"
+        ),
+    )
+    parser.add_argument(
+        "--no-live-only",
+        action="store_true",
+        help="Disable live-market filters (recent activity + close window + WS freshness)",
+    )
 
     return parser.parse_args(argv)
 
@@ -565,6 +605,8 @@ def _explicit_discover_fields(args: argparse.Namespace) -> frozenset[str]:
         explicit.add("rank_by")
     if args.discover_min_fee_roi is not None:
         explicit.add("min_fee_adjusted_roi_pct")
+    if args.discover_max_minutes_to_close is not None:
+        explicit.add("max_minutes_to_close")
     return frozenset(explicit)
 
 
@@ -624,6 +666,8 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
         full_scan=full_scan,
         tradeable_only=not args.discover_no_tradeable_filter
         and (env.tradeable_only if env else True),
+        live_only=not args.no_live_only and config.LIVE_TRADING_ONLY,
+        max_minutes_to_close=args.discover_max_minutes_to_close,
     )
 
     preset_name = _resolve_discover_preset(args)
@@ -679,7 +723,12 @@ async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
         print(f"\n  KALSHI_TICKERS=\"{','.join(tickers)}\"\n")
         sys.exit(0)
 
-    tickers = await discover_tickers(credentials, rate_limiter, criteria)
+    tickers, markets = await discover_with_details(
+        credentials, rate_limiter, criteria
+    )
+    from discovery.market_registry import set_markets
+
+    set_markets(markets)
     if not tickers:
         logger.error(
             "Discovery matched no tickers — relax filters, add --discover-full-scan, "
@@ -696,10 +745,20 @@ async def main(args: argparse.Namespace | None = None) -> None:
     global _ingestor, _execution, _strategy, _circuit_breaker
     global _store, _blotter, _settlement_watcher
     global _portfolio_monitor, _alert_manager, _session_monitor
-    global _max_concurrent_positions
+    global _max_concurrent_positions, _live_rules
 
     if args is None:
         args = parse_args()
+
+    from discovery.live_market import LiveMarketRules
+
+    _live_rules = LiveMarketRules(
+        enabled=not args.no_live_only and config.LIVE_TRADING_ONLY,
+        max_minutes_since_update=config.LIVE_MAX_MINUTES_SINCE_UPDATE,
+        max_minutes_to_close=config.LIVE_MAX_MINUTES_TO_CLOSE,
+        max_book_stale_minutes=config.LIVE_MAX_BOOK_STALE_MINUTES,
+        max_trade_stale_minutes=config.LIVE_MAX_TRADE_STALE_MINUTES,
+    )
 
     _max_concurrent_positions = (
         args.max_concurrent_positions
@@ -855,6 +914,9 @@ async def main(args: argparse.Namespace | None = None) -> None:
         alert_interval_seconds=ALERT_INTERVAL_SECONDS,
         monitor_interval_seconds=monitor_interval,
         max_concurrent_positions=_max_concurrent_positions,
+        live_trading_only=_live_rules.enabled if _live_rules else False,
+        live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
+        live_max_minutes_to_close=_live_rules.max_minutes_to_close if _live_rules else None,
     )
     if args.strategy == "green_up":
         from strategy.green_up_strategy import GreenUpStrategy

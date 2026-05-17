@@ -32,6 +32,7 @@ class DiscoveryPreset:
     min_fee_adjusted_roi_pct: float | None = None
     rank_by: RankBy = "volume"
     activity_hours: float | None = None
+    max_minutes_to_close: float | None = None
     full_scan: bool = False
 
 
@@ -51,13 +52,14 @@ STRATEGY_DISCOVERY_PRESETS: dict[str, DiscoveryPreset] = {
     ),
     "green_up": DiscoveryPreset(
         name="green_up",
-        description="Underdog YES entries (low ask), active markets, screener-ranked",
+        description="Underdog YES, screener-ranked, recently updated & closing soon",
         top_n=10,
         min_volume_24h=500,
         max_yes_ask=35,
         max_spread=12,
         rank_by="screener",
-        activity_hours=48.0,
+        activity_hours=2.0,
+        max_minutes_to_close=360.0,
     ),
     "kelly": DiscoveryPreset(
         name="kelly",
@@ -125,6 +127,11 @@ def apply_preset(
         full_scan = preset.full_scan
 
     activity = _pick("activity_hours", criteria.activity_hours, preset.activity_hours)
+    max_mtc = _pick(
+        "max_minutes_to_close",
+        criteria.max_minutes_to_close,
+        preset.max_minutes_to_close,
+    )
 
     return replace(
         criteria,
@@ -140,6 +147,7 @@ def apply_preset(
         ),
         rank_by=criteria.rank_by if "rank_by" in skip_fields else preset.rank_by,
         activity_hours=activity,
+        max_minutes_to_close=max_mtc,
         full_scan=full_scan,
         preset_name=preset.name,
     )
