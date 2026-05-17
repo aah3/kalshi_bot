@@ -30,6 +30,9 @@ cfg.MAX_SECTOR_CONCENTRATION = 0.50   # 50% concentration limit
 cfg.MAX_DRAWDOWN_PCT         = 0.10   # 10% drawdown trigger
 cfg.DAILY_LOSS_LIMIT_CENTS   = 5_000  # $50 daily loss limit
 cfg.FEE_PER_CONTRACT_CENTS   = 0.0
+cfg.DB_PATH                  = ":memory:"
+cfg.USE_POSTGRES             = False
+cfg.POSTGRES_URL             = ""
 sys.modules["config"] = cfg
 
 # ── Logger shim ───────────────────────────────────────────────────────────────

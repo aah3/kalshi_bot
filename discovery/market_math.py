@@ -6,6 +6,8 @@ Shared ROI helpers for high-probability strategy, discovery filters, and screene
 
 from __future__ import annotations
 
+import math
+
 import config
 
 
@@ -99,3 +101,35 @@ def passes_roi_gate(
 def round_trip_fees_for_post_fill(post_fill_mode: str) -> bool:
     """Whether to count an exit fee when gating entries."""
     return post_fill_mode not in ("hold", "")
+
+
+def vig_proxy_cents(spread_cents: int | None) -> int:
+    """
+    Half-spread vig proxy in cents (matches Kelly / high-prob edge-to-vig).
+
+    Uses max(spread/2, 0.5) so even a 1¢ spread contributes 0.5¢ vig.
+    """
+    spread = spread_cents if spread_cents is not None else 2
+    return int(math.ceil(max(spread / 2.0, 0.5)))
+
+
+def take_profit_price_cents(
+    entry_cents: int,
+    vig_cents: int,
+    profit_pct: float,
+    *,
+    price_cap: int = 99,
+) -> int:
+    """
+    Resting take-profit YES price: entry + profit_pct × (entry + vig).
+
+    ``profit_pct`` is a fraction (0.30 = 30% gain on entry+vig basis).
+    Values > 1 are treated as a whole-number percent (30 → 0.30).
+    """
+    if profit_pct > 1.0:
+        profit_pct = profit_pct / 100.0
+    if profit_pct < 0:
+        profit_pct = 0.0
+    basis = entry_cents + vig_cents
+    gain = int(round(basis * profit_pct))
+    return min(price_cap, max(1, entry_cents + max(gain, 0)))

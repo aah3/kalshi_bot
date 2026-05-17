@@ -117,7 +117,7 @@ Stop-loss exits use `cross_spread` when exit mode is `passive`, so stops actuall
 | Mode | Behaviour |
 |------|-----------|
 | `hold` | Hold to settlement |
-| `resting_take_profit` | Resting sell YES at entry + offset |
+| `resting_take_profit` | Resting sell YES at entry + offset, or entry + pct×(entry+vig) when `KALSHI_HP_TAKE_PROFIT_PCT` / `--hp-take-profit-pct` is set |
 | `resting_stop` | IOC sell if bid breaches stop |
 | `tp_and_stop` | Resting TP plus stop on breach |
 
@@ -279,8 +279,7 @@ export KALSHI_TICKERS="TICKER-A,TICKER-B"
 python main.py --strategy kelly --model-prob TICKER-A:0.62
 
 # Auto-discovery + high-probability strategy
-python main.py --discover --discover-category Politics --strategy high_prob \
-  --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
+python main.py --discover --discover-category Politics --strategy high_prob --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
 ```
 
 Defaults to **demo** (`KALSHI_ENV=demo`). Real money only when `KALSHI_ENV=production`.
@@ -510,7 +509,9 @@ Common issues when running the bot or `tools/trade.py`. Check structured logs in
 - [ ] `python -m pytest tests/ -v` all green
 - [ ] Kelly calibration ratio 0.85–1.10 (30+ settled trades per strategy)
 - [ ] Clean SIGINT shutdown (orders cancelled)
-- [ ] Circuit breaker tested in demo (`MAX_DRAWDOWN_PCT=0.01`)
+- [ ] Circuit breaker tested in demo (`MAX_DRAWDOWN_PCT=0.01`) — uses live portfolio sync every `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS`
+- [ ] Pre-trade gates verified: low balance and `KALSHI_MIN_MINUTES_TO_EXPIRY` block new entries
+- [ ] Blotter legs match exchange fills only (no optimistic submit-time rows)
 - [ ] `config.py` reviewed: `MAX_POSITION_CENTS`, `DAILY_LOSS_LIMIT_CENTS`, fees
 - [ ] `KALSHI_ENV=production` not set in shell profiles by accident
 
@@ -607,6 +608,7 @@ KALSHI_HP_USE_FEE_ADJUSTED_ROI=true
 KALSHI_HP_ENTRY_MODE=passive
 KALSHI_HP_EXIT_MODE=passive
 KALSHI_HP_POST_FILL=resting_take_profit
+KALSHI_HP_TAKE_PROFIT_PCT=0.30
 KALSHI_HP_STAKE_CENTS=5000
 
 KALSHI_DISCOVER=true

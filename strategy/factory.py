@@ -80,6 +80,7 @@ def build_strategy(
     hp_entry_mode: str | None = None,
     hp_post_fill: str | None = None,
     hp_stake_cents: int | None = None,
+    hp_take_profit_pct: float | None = None,
     gu_entry_mode: str | None = None,
     gu_exit_mode: str | None = None,
     hp_exit_mode: str | None = None,
@@ -152,6 +153,11 @@ def build_strategy(
             post_fill_mode=post_map.get(post_key, PostFillMode.HOLD_TO_SETTLEMENT),
             take_profit_offset_cents=_env_int(
                 "KALSHI_HP_TAKE_PROFIT_OFFSET", config.HP_TAKE_PROFIT_OFFSET
+            ),
+            take_profit_pct=(
+                hp_take_profit_pct
+                if hp_take_profit_pct is not None
+                else getattr(config, "HP_TAKE_PROFIT_PCT", None)
             ),
             stop_loss_pct=_env_float("KALSHI_HP_STOP_LOSS", config.HP_STOP_LOSS_PCT),
             require_model_edge=os.getenv("KALSHI_HP_REQUIRE_MODEL_EDGE", "").lower()

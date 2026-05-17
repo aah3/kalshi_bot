@@ -104,11 +104,29 @@ HP_MAX_SPREAD_CENTS: int  = int(os.getenv("KALSHI_HP_MAX_SPREAD", "8"))
 HP_STAKE_CENTS: int       = int(os.getenv("KALSHI_HP_STAKE_CENTS", "5000"))
 HP_LIMIT_OFFSET: int      = int(os.getenv("KALSHI_HP_LIMIT_OFFSET", "0"))
 HP_TAKE_PROFIT_OFFSET: int = int(os.getenv("KALSHI_HP_TAKE_PROFIT_OFFSET", "3"))
+_hp_tp_pct_raw = os.getenv("KALSHI_HP_TAKE_PROFIT_PCT", "").strip()
+HP_TAKE_PROFIT_PCT: float | None = (
+    float(_hp_tp_pct_raw) if _hp_tp_pct_raw else None
+)
 HP_STOP_LOSS_PCT: float   = float(os.getenv("KALSHI_HP_STOP_LOSS", "0.12"))
 
-# Pre-trade checks
-MIN_ACCOUNT_BALANCE_CENTS: int = 5_000   # refuse new trades if balance drops below $50
-MIN_MINUTES_TO_EXPIRY: float   = 10.0    # refuse entries on markets closing in < 10 min
+# Pre-trade checks (enforced in main.py via risk.entry_gates)
+MIN_ACCOUNT_BALANCE_CENTS: int = int(os.getenv("KALSHI_MIN_BALANCE_CENTS", "5000"))
+MIN_MINUTES_TO_EXPIRY: float   = float(os.getenv("KALSHI_MIN_MINUTES_TO_EXPIRY", "10"))
+BLOCK_ENTRIES_ON_LOW_BALANCE: bool = os.getenv(
+    "KALSHI_BLOCK_LOW_BALANCE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Default strategy when not set on CLI (KALSHI_STRATEGY env overrides)
+DEFAULT_STRATEGY: str = os.getenv("KALSHI_DEFAULT_STRATEGY", "high_prob")
+
+# Order submit retries after HTTP 429 (same client_order_id for idempotency)
+ORDER_SUBMIT_MAX_RETRIES: int = int(os.getenv("KALSHI_ORDER_MAX_RETRIES", "3"))
+
+# Portfolio ↔ circuit breaker sync interval (seconds)
+PORTFOLIO_RISK_SYNC_SECONDS: float = float(
+    os.getenv("KALSHI_PORTFOLIO_RISK_SYNC_SECONDS", "30")
+)
 
 # ─── Risk / Circuit Breaker ───────────────────────────────────────────────────
 

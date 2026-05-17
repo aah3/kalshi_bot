@@ -22,6 +22,11 @@ Post-fill behaviour (PostFillMode):
   - RESTING_STOP_LOSS      — after entry fill, place resting sell if bid breaches stop
   - TAKE_PROFIT_AND_STOP   — resting TP plus aggressive stop on breach
 
+Take-profit target (when not holding to settlement):
+  - take_profit_pct set  → sell at entry + pct × (entry + vig_proxy), capped at 99¢
+  - else                 → sell at entry + take_profit_offset_cents (legacy)
+  vig_proxy = max(spread/2, 0.5) cents, frozen at entry signal time.
+
 Signal meta consumed by ExecutionManager:
   - order_type:     "limit" | "market"
   - action:         "buy" | "sell"
@@ -41,6 +46,8 @@ from discovery.market_math import (
     gross_roi_if_yes_wins_pct,
     passes_roi_gate,
     round_trip_fees_for_post_fill,
+    take_profit_price_cents,
+    vig_proxy_cents,
 )
 from logging_.structured_logger import logger
 from strategy.base_strategy import BaseStrategy, Side, Signal
@@ -90,6 +97,7 @@ class HighProbPosition:
     entry_price_cents: int = 0
     entry_stake_cents: int = 0
     entry_order_id: str = ""
+    entry_vig_cents: int = 0
 
     take_profit_price: int = 0
     stop_loss_trigger: int = 0
@@ -119,6 +127,7 @@ class HighProbStrategy(BaseStrategy):
         limit_offset_cents: int = DEFAULT_LIMIT_OFFSET,
         post_fill_mode: PostFillMode = PostFillMode.HOLD_TO_SETTLEMENT,
         take_profit_offset_cents: int = DEFAULT_TAKE_PROFIT_OFFSET,
+        take_profit_pct: float | None = None,
         take_profit_price_cap: int = DEFAULT_TAKE_PROFIT_PRICE,
         stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
         require_model_edge: bool = False,
@@ -133,6 +142,7 @@ class HighProbStrategy(BaseStrategy):
         self._limit_offset = limit_offset_cents
         self._post_fill_mode = post_fill_mode
         self._tp_offset = take_profit_offset_cents
+        self._tp_pct = take_profit_pct
         self._tp_cap = take_profit_price_cap
         self._stop_loss_pct = stop_loss_pct
         self._require_model_edge = require_model_edge
@@ -146,6 +156,15 @@ class HighProbStrategy(BaseStrategy):
         self._model_probs: dict[str, float] = {}
         self._positions: dict[str, HighProbPosition] = {}
         self._watch_tickers: set[str] = set()
+
+    def _resolve_take_profit_price(
+        self, entry_cents: int, vig_cents: int,
+    ) -> int:
+        if self._tp_pct is not None:
+            return take_profit_price_cents(
+                entry_cents, vig_cents, self._tp_pct, price_cap=self._tp_cap,
+            )
+        return min(self._tp_cap, entry_cents + self._tp_offset)
 
     @property
     def name(self) -> str:
@@ -198,9 +217,8 @@ class HighProbStrategy(BaseStrategy):
             pos.entry_price_cents = price
             pos.entry_stake_cents = size_c or self._stake_cents
             pos.entry_order_id = order_id
-            pos.take_profit_price = min(
-                self._tp_cap,
-                price + self._tp_offset,
+            pos.take_profit_price = self._resolve_take_profit_price(
+                price, pos.entry_vig_cents,
             )
             pos.stop_loss_trigger = max(
                 1,
@@ -218,6 +236,8 @@ class HighProbStrategy(BaseStrategy):
                     gross_roi_if_yes_wins_pct(price), 2
                 ),
                 take_profit_price=pos.take_profit_price,
+                take_profit_pct=self._tp_pct,
+                entry_vig_cents=pos.entry_vig_cents,
                 stop_loss_trigger=pos.stop_loss_trigger,
                 strategy=self.name,
             )
@@ -288,9 +308,11 @@ class HighProbStrategy(BaseStrategy):
         if size_cents < 1:
             return None
 
+        entry_vig = vig_proxy_cents(spread)
         self._positions[ticker] = HighProbPosition(
             ticker=ticker,
             state=PositionState.WATCHING,
+            entry_vig_cents=entry_vig,
         )
 
         payout_cents = 100 - best_ask
@@ -327,6 +349,8 @@ class HighProbStrategy(BaseStrategy):
                 ),
                 "entry_price_mode":   self._entry_mode.value,
                 "post_fill_mode":     self._post_fill_mode.value,
+                "take_profit_pct":    self._tp_pct,
+                "entry_vig_cents":    entry_vig,
                 "implied_prob":       round(market_prob, 4),
                 "roi_if_win_pct":     round(applied_roi, 2),
                 "gross_roi_if_win_pct": round(gross_roi, 2),

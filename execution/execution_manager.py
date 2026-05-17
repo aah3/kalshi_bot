@@ -158,35 +158,52 @@ class ExecutionManager:
             time_in_force=time_in_force,
         )
 
-        async with self._limiter.throttle(BucketType.WRITE):
-            try:
-                resp = await self._session.post(
-                    f"{config.BASE_URL}{path}",
-                    data=body_str,
-                    headers=headers,
-                )
-
-                if resp.status == 429:
-                    await self._limiter.on_429(BucketType.WRITE)
-                    return None
-
-                if resp.status not in (200, 201):
-                    text = await resp.text()
-                    logger.error(
-                        f"Order rejected: HTTP {resp.status}",
-                        ticker=signal.ticker,
-                        response=text[:300],
+        max_attempts = max(config.ORDER_SUBMIT_MAX_RETRIES, 1)
+        for attempt in range(max_attempts):
+            async with self._limiter.throttle(BucketType.WRITE):
+                try:
+                    resp = await self._session.post(
+                        f"{config.BASE_URL}{path}",
+                        data=body_str,
+                        headers=headers,
                     )
+
+                    if resp.status == 429:
+                        await self._limiter.on_429(BucketType.WRITE)
+                        if attempt < max_attempts - 1:
+                            logger.warning(
+                                "Order rate-limited (429), retrying",
+                                ticker=signal.ticker,
+                                attempt=attempt + 1,
+                                max_attempts=max_attempts,
+                            )
+                            continue
+                        return None
+
+                    if resp.status not in (200, 201):
+                        text = await resp.text()
+                        logger.error(
+                            f"Order rejected: HTTP {resp.status}",
+                            ticker=signal.ticker,
+                            response=text[:300],
+                        )
+                        return None
+
+                    self._limiter.reset_backoff(BucketType.WRITE)
+                    order = (await resp.json()).get("order", {})
+                    self._open_orders[order.get("order_id", client_order_id)] = order
+                    return order
+
+                except aiohttp.ClientError as exc:
+                    logger.error(
+                        f"HTTP error placing order: {exc}",
+                        ticker=signal.ticker,
+                        attempt=attempt + 1,
+                    )
+                    if attempt < max_attempts - 1:
+                        continue
                     return None
-
-                self._limiter.reset_backoff(BucketType.WRITE)
-                order = (await resp.json()).get("order", {})
-                self._open_orders[order.get("order_id", client_order_id)] = order
-                return order
-
-            except aiohttp.ClientError as exc:
-                logger.error(f"HTTP error placing order: {exc}", ticker=signal.ticker)
-                return None
+        return None
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a single resting order by ID. Returns True on success."""

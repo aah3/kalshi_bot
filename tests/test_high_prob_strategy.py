@@ -39,7 +39,11 @@ sys.modules["logging_.structured_logger"] = log_mod
 
 sys.modules["config"] = cfg
 
-from discovery.market_math import gross_roi_if_yes_wins_pct
+from discovery.market_math import (
+    gross_roi_if_yes_wins_pct,
+    take_profit_price_cents,
+    vig_proxy_cents,
+)
 from strategy.execution_price import EntryPriceMode, resolve_yes_buy
 from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
 
@@ -51,6 +55,26 @@ def _tick(bid: int, ask: int, ticker: str = "TEST-MKT") -> dict:
         "best_ask": ask,
         "spread": ask - bid,
     }
+
+
+class TestTakeProfitMath:
+    def test_vig_proxy_half_spread(self):
+        assert vig_proxy_cents(4) == 2
+        assert vig_proxy_cents(1) == 1
+        assert vig_proxy_cents(None) == 1  # default spread 2 -> vig 1
+
+    def test_take_profit_pct_entry_plus_vig(self):
+        # entry 90, vig 1, 30% gain -> 117, capped at 99
+        assert take_profit_price_cents(90, vig_proxy_cents(2), 0.30) == 99
+
+    def test_take_profit_pct_uncapped(self):
+        assert take_profit_price_cents(50, 1, 0.10) == 55
+
+    def test_take_profit_whole_number_percent(self):
+        assert take_profit_price_cents(88, 1, 30) == 99
+
+    def test_take_profit_capped_at_99(self):
+        assert take_profit_price_cents(95, 2, 0.50) == 99
 
 
 class TestRoiAndEntryPrice:
@@ -140,6 +164,29 @@ class TestHighProbExit:
         assert exit_sig.meta["order_type"] == "limit"
         assert exit_sig.meta["time_in_force"] == "gtc"
         assert exit_sig.limit_price == 93
+
+    def test_resting_take_profit_pct_of_entry_plus_vig(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            entry_price_mode=EntryPriceMode.LIMIT_AT_ASK,
+            post_fill_mode=PostFillMode.RESTING_TAKE_PROFIT,
+            take_profit_pct=0.30,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))  # spread 2 -> vig 1
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "ord-1",
+        })
+        pos = strat._positions["TEST-MKT"]
+        assert pos.take_profit_price == 99  # 30% of (90+1) capped at 99¢
+        exit_sig = strat.evaluate(_tick(96, 98))
+        assert exit_sig is not None
+        assert exit_sig.limit_price >= 99
 
     def test_stop_loss_trigger(self):
         strat = HighProbStrategy(

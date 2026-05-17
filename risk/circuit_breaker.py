@@ -27,6 +27,11 @@ import config
 from logging_.structured_logger import logger
 from strategy.base_strategy import Signal
 
+try:
+    from trading.portfolio_monitor import PortfolioSnapshot
+except ImportError:
+    PortfolioSnapshot = Any  # type: ignore[misc, assignment]
+
 
 KillSwitchCallback = Callable[[], Coroutine[Any, Any, None]]
 
@@ -65,6 +70,8 @@ class CircuitBreaker:
         self._realised_pnl     = 0           # cumulative P&L this session
         self._daily_pnl        = 0           # resets at start of each day
         self._day_start_epoch  = self._today_epoch()
+        self._session_start_equity: int | None = None  # set on first portfolio sync
+        self._last_portfolio_equity: int | None = None  # from last sync_from_portfolio
 
         # Position state
         self._positions: dict[str, Position] = {}   # ticker -> Position
@@ -124,20 +131,73 @@ class CircuitBreaker:
     def record_fill(self, fill: dict[str, Any]) -> None:
         """Update position state when a fill arrives from the exchange."""
         ticker     = fill.get("ticker", "")
+        if not ticker:
+            return
         side       = fill.get("side", "yes")
-        price      = fill.get("price", 0)
-        size_cents = fill.get("size_cents", 0)
+        price      = int(fill.get("price") or 0)
+        contracts  = int(fill.get("contracts") or fill.get("count") or 0)
+        size_cents = int(fill.get("size_cents") or 0)
+        if size_cents <= 0 and contracts > 0 and price > 0:
+            size_cents = contracts * price
         sector     = fill.get("sector", "unknown")
+
+        existing = self._positions.get(ticker)
+        if existing:
+            existing.size_cents += size_cents
+            existing.current_price = price or existing.current_price
+            self._sector_exposure[sector] += size_cents
+            return
 
         self._positions[ticker] = Position(
             ticker=ticker,
             sector=sector,
             size_cents=size_cents,
-            entry_price=price,
-            current_price=price,
+            entry_price=price or 1,
+            current_price=price or 1,
             side=side,
         )
         self._sector_exposure[sector] += size_cents
+
+    def sync_from_portfolio(self, snapshot: "PortfolioSnapshot") -> None:
+        """
+        Reconcile breaker state from an exchange-backed portfolio snapshot.
+
+        Used by the background risk sync loop so drawdown and daily loss limits
+        reflect real account equity, not fill-only approximations.
+        """
+        from discovery.market_registry import get_market
+
+        old_tickers = set(self._positions)
+        new_tickers = {p.ticker for p in snapshot.positions}
+
+        for ticker in old_tickers - new_tickers:
+            pos = self._positions[ticker]
+            self.record_close(ticker, pos.current_price or pos.entry_price)
+
+        self._positions.clear()
+        self._sector_exposure.clear()
+
+        for p in snapshot.positions:
+            market = get_market(p.ticker)
+            sector = market.category if market else "unknown"
+            mark = p.mark_price or p.avg_entry_price
+            self._positions[p.ticker] = Position(
+                ticker=p.ticker,
+                sector=sector,
+                size_cents=p.cost_basis,
+                entry_price=p.avg_entry_price or 1,
+                current_price=mark,
+                side=p.side,
+                unrealised_pnl=p.unrealised_pnl,
+            )
+            self._sector_exposure[sector] += p.cost_basis
+
+        equity = snapshot.portfolio_value_cents
+        if self._session_start_equity is None:
+            self._session_start_equity = equity
+
+        self._last_portfolio_equity = equity
+        self._check_drawdown()
 
     def record_close(self, ticker: str, exit_price: int) -> None:
         """Record a position being closed and update P&L."""
@@ -183,7 +243,11 @@ class CircuitBreaker:
         )
 
     def _check_drawdown(self) -> None:
-        equity = self._total_equity()
+        equity = (
+            self._last_portfolio_equity
+            if self._last_portfolio_equity is not None
+            else self._total_equity()
+        )
         if equity > self._peak_equity:
             self._peak_equity = equity
 
@@ -195,6 +259,16 @@ class CircuitBreaker:
                     drawdown=round(drawdown, 4),
                     peak_equity=self._peak_equity,
                     current_equity=equity,
+                )
+                return
+
+        if self._session_start_equity is not None:
+            session_pnl = equity - self._session_start_equity
+            if session_pnl < -config.DAILY_LOSS_LIMIT_CENTS:
+                self._trip(
+                    reason="session loss limit exceeded",
+                    session_pnl=session_pnl,
+                    limit=-config.DAILY_LOSS_LIMIT_CENTS,
                 )
                 return
 

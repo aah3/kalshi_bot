@@ -42,6 +42,7 @@ from metrics.metrics_store import MetricsStore
 from metrics.settlement import SettlementWatcher
 from risk.alert_manager import AlertManager
 from risk.circuit_breaker import CircuitBreaker
+from risk.entry_gates import check_entry_allowed
 from discovery.discovery_presets import (
     STRATEGY_DISCOVERY_PRESETS,
     apply_preset,
@@ -98,8 +99,10 @@ _shutdown_event = asyncio.Event()
 # Maps each market to its currently open logical trade so every fill
 # is linked to the correct blotter parent row.
 _active_trades: dict[str, str] = {}
+_pending_orders: dict[str, dict[str, Any]] = {}  # order_id -> submit context for blotter
 _max_concurrent_positions: int = 0
 _live_rules = None
+_portfolio_snapshot = None  # latest exchange-backed snapshot (risk sync)
 
 
 # ── Tick callback ─────────────────────────────────────────────────────────────
@@ -110,13 +113,17 @@ async def on_tick(tick: dict[str, Any]) -> None:
 
     Flow:
         tick → strategy.evaluate()
-             → circuit_breaker.approve()
-             → execution.submit_order()
-             → blotter.open_trade() / record_fill()
+             → entry gates (balance, expiry) + live gates + circuit_breaker.approve()
+             → execution.submit_order() (retries on 429)
+             → pending order tracked → blotter.record_fill() on WS fill only
              → alert_manager.register_order()
     """
     global _strategy, _circuit_breaker, _execution, _store, _blotter
     global _active_trades, _alert_manager, _max_concurrent_positions, _live_rules
+    global _portfolio_snapshot
+
+    if _circuit_breaker and _circuit_breaker.is_tripped:
+        return
 
     signal_obj = _strategy.evaluate(tick)
     if signal_obj is None:
@@ -146,6 +153,28 @@ async def on_tick(tick: dict[str, Any]) -> None:
                 pos = _strategy.get_position(ticker)
                 if pos and pos.state == PositionState.WATCHING:
                     pos.state = PositionState.SCANNING
+            return
+
+    if phase in ("entry", "leg_1"):
+        from discovery.market_registry import get_market
+
+        cash = (
+            _portfolio_snapshot.cash_balance_cents
+            if _portfolio_snapshot is not None
+            else None
+        )
+        ok, reason = check_entry_allowed(
+            phase=phase,
+            ticker=signal_obj.ticker,
+            cash_balance_cents=cash,
+            market=get_market(signal_obj.ticker),
+        )
+        if not ok:
+            logger.info(
+                "Skipping entry — pre-trade gate",
+                ticker=signal_obj.ticker,
+                reason=reason,
+            )
             return
 
     if (
@@ -192,65 +221,25 @@ async def on_tick(tick: dict[str, Any]) -> None:
     phase      = meta.get("phase", "entry")      # "entry"|"hedge"|"stop_loss"
     arb_leg    = meta.get("leg_number")          # 1|2|None
     trade_type = f"leg_{arb_leg}" if arb_leg else phase
+    ticker     = signal_obj.ticker
 
-    # Open a new parent trade row for entries; reuse existing for hedges/stops
-    ticker = signal_obj.ticker
-    if trade_type in ("entry", "leg_1") and ticker not in _active_trades:
-        trade_id = _blotter.open_trade(
-            ticker=ticker,
-            category=meta.get("category", "Unknown"),
-            strategy=signal_obj.strategy,
-            trade_type="multi_leg" if arb_leg else "single",
-        )
-        _active_trades[ticker] = trade_id
-    else:
-        trade_id = _active_trades.get(ticker)
-
-    # Submit order to exchange
+    # Submit order to exchange (blotter records on confirmed WS fill only)
     order = await _execution.submit_order(signal_obj)
     if not order:
         return
 
-    order_id    = order.get("order_id", "")
-    order_status = order.get("status", "pending")
+    order_id = order.get("order_id", "")
+    _pending_orders[order_id] = {
+        "ticker":     ticker,
+        "trade_type": trade_type,
+        "meta":       meta,
+        "strategy":   signal_obj.strategy,
+        "category":   meta.get("category", "Unknown"),
+        "side":       signal_obj.side.value,
+    }
 
-    # Track order for fill-timeout alerts
     if _alert_manager:
         _alert_manager.register_order(order_id, ticker)
-
-    # Record fill in blotter — optimistic for market/aggressive orders.
-    # The on_fill_received() WebSocket handler will confirm or correct this.
-    price_cents = signal_obj.limit_price or 50
-    contracts   = max(signal_obj.size_cents // price_cents, 1)
-
-    if trade_id:
-        leg_id = _blotter.record_fill(
-            parent_trade_id=trade_id,
-            order_id=order_id,
-            side=signal_obj.side.value,
-            trade_type=trade_type,
-            contracts=contracts,
-            entry_price=price_cents,
-            strategy=signal_obj.strategy,
-            strategy_meta=meta,
-        )
-        logger.info(
-            "Blotter: leg recorded",
-            leg_id=leg_id,
-            trade_id=trade_id,
-            order_id=order_id,
-            order_status=order_status,
-        )
-
-    # Also record in legacy MetricsStore (Sharpe / drawdown calculator)
-    _store.record_fill({
-        "ticker":     ticker,
-        "side":       signal_obj.side.value,
-        "size_cents": signal_obj.size_cents,
-        "price":      price_cents,
-        "strategy":   signal_obj.strategy,
-        "order_id":   order_id,
-    })
 
 
 # ── Fill confirmed (WebSocket) ────────────────────────────────────────────────
@@ -261,13 +250,63 @@ def on_fill_received(fill: dict[str, Any]) -> None:
     Called when a confirmed fill arrives via the WebSocket ``fill`` channel.
 
     Authoritative fill record — advances strategy state machines, updates risk,
-    and clears fill-timeout alerts.
+    blotter legs, and clears fill-timeout alerts.
     """
     order_id = fill.get("order_id", "")
     ticker   = fill.get("ticker", "")
+    pending  = _pending_orders.get(order_id)
 
     if _strategy:
         _strategy.on_fill(fill)
+
+    # Blotter: record only on confirmed exchange fills
+    if _blotter and pending and ticker:
+        trade_type = pending.get("trade_type", "entry")
+        meta       = pending.get("meta") or {}
+        if trade_type in ("entry", "leg_1") and ticker not in _active_trades:
+            trade_id = _blotter.open_trade(
+                ticker=ticker,
+                category=pending.get("category", "Unknown"),
+                strategy=pending.get("strategy", ""),
+                trade_type="multi_leg" if str(trade_type).startswith("leg") else "single",
+            )
+            _active_trades[ticker] = trade_id
+        else:
+            trade_id = _active_trades.get(ticker)
+
+        if trade_id:
+            price     = int(fill.get("price") or 0)
+            contracts = int(fill.get("contracts") or 0)
+            leg_id = _blotter.record_fill(
+                parent_trade_id=trade_id,
+                order_id=order_id,
+                side=fill.get("side", pending.get("side", "yes")),
+                trade_type=trade_type,
+                contracts=contracts,
+                entry_price=price,
+                strategy=pending.get("strategy", ""),
+                strategy_meta=meta,
+            )
+            logger.info(
+                "Blotter: leg recorded (fill confirmed)",
+                leg_id=leg_id,
+                trade_id=trade_id,
+                order_id=order_id,
+                contracts=contracts,
+            )
+
+        if _store:
+            size_cents = int(fill.get("size_cents") or 0)
+            if size_cents <= 0 and contracts > 0 and price > 0:
+                size_cents = contracts * price
+            _store.record_fill({
+                "ticker":     ticker,
+                "side":       fill.get("side", ""),
+                "size_cents": size_cents,
+                "price":      price,
+                "strategy":   pending.get("strategy", ""),
+                "order_id":   order_id,
+            })
 
     if _strategy and _blotter and ticker:
         from strategy.green_up_strategy import GreenUpStrategy, PositionState
@@ -281,15 +320,15 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
     if _execution:
         _execution.record_fill(fill)
+        if order_id not in _execution.open_orders:
+            _pending_orders.pop(order_id, None)
 
     if _circuit_breaker:
         _circuit_breaker.record_fill(fill)
 
-    # Clear fill-timeout alert timer
     if _alert_manager:
         _alert_manager.confirm_fill(order_id)
 
-    # Mark signal as filled in MetricsStore
     if _store:
         _store.mark_signal_filled(ticker=ticker, order_id=order_id)
 
@@ -303,6 +342,29 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
 
 # ── Kill switch (circuit breaker callback) ────────────────────────────────────
+
+async def _portfolio_risk_sync_loop(interval_seconds: float) -> None:
+    """Refresh exchange portfolio and sync circuit breaker + entry-gate cache."""
+    global _portfolio_snapshot
+
+    while not _shutdown_event.is_set():
+        try:
+            if _portfolio_monitor:
+                snap = await _portfolio_monitor.refresh()
+                _portfolio_snapshot = snap
+                if _circuit_breaker:
+                    _circuit_breaker.sync_from_portfolio(snap)
+        except Exception as exc:
+            logger.warning(f"Portfolio risk sync failed: {exc}")
+        try:
+            await asyncio.wait_for(
+                _shutdown_event.wait(),
+                timeout=interval_seconds,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
 
 async def kill_switch() -> None:
     """
@@ -328,9 +390,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Kalshi prediction market trading bot")
     parser.add_argument(
         "--strategy",
-        default=os.getenv("KALSHI_STRATEGY", "kelly"),
+        default=os.getenv("KALSHI_STRATEGY", config.DEFAULT_STRATEGY),
         choices=list(VALID_STRATEGIES),
-        help="Strategy engine (default: kelly, or KALSHI_STRATEGY env)",
+        help=(
+            f"Strategy engine (default: {config.DEFAULT_STRATEGY}, "
+            "or KALSHI_STRATEGY env)"
+        ),
     )
     parser.add_argument(
         "--tickers",
@@ -457,6 +522,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="High-prob: stake per entry in cents (default 5000)",
+    )
+    parser.add_argument(
+        "--hp-take-profit-pct",
+        type=float,
+        default=None,
+        help=(
+            "High-prob: take-profit as fraction of (entry+vig), e.g. 0.30 for 30%% "
+            "(values >1 treated as percent); env KALSHI_HP_TAKE_PROFIT_PCT"
+        ),
     )
     parser.add_argument(
         "--monitor-interval",
@@ -754,7 +828,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
     global _ingestor, _execution, _strategy, _circuit_breaker
     global _store, _blotter, _settlement_watcher
     global _portfolio_monitor, _alert_manager, _session_monitor
-    global _max_concurrent_positions, _live_rules
+    global _max_concurrent_positions, _live_rules, _portfolio_snapshot
 
     if args is None:
         args = parse_args()
@@ -765,6 +839,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
         enabled=not args.no_live_only and config.LIVE_TRADING_ONLY,
         max_minutes_since_update=config.LIVE_MAX_MINUTES_SINCE_UPDATE,
         max_minutes_to_close=config.LIVE_MAX_MINUTES_TO_CLOSE,
+        min_minutes_to_close=config.MIN_MINUTES_TO_EXPIRY,
         max_book_stale_minutes=config.LIVE_MAX_BOOK_STALE_MINUTES,
         max_trade_stale_minutes=config.LIVE_MAX_TRADE_STALE_MINUTES,
     )
@@ -814,6 +889,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             hp_entry_mode=args.hp_entry_mode,
             hp_post_fill=args.hp_post_fill,
             hp_stake_cents=args.hp_stake_cents,
+            hp_take_profit_pct=args.hp_take_profit_pct,
             hp_exit_mode=args.hp_exit_mode,
         )
     except ValueError as exc:
@@ -875,6 +951,13 @@ async def main(args: argparse.Namespace | None = None) -> None:
         sys.exit(1)
     logger.info(auth_msg)
 
+    global _portfolio_snapshot
+    try:
+        _portfolio_snapshot = await _portfolio_monitor.refresh()
+        _circuit_breaker.sync_from_portfolio(_portfolio_snapshot)
+    except Exception as exc:
+        logger.warning(f"Initial portfolio risk sync failed: {exc}")
+
     # Background tasks
     settlement_task = asyncio.create_task(
         _settlement_watcher.run(), name="settlement_watcher"
@@ -885,6 +968,10 @@ async def main(args: argparse.Namespace | None = None) -> None:
             interval_seconds=ALERT_INTERVAL_SECONDS,
         ),
         name="alert_manager",
+    )
+    risk_sync_task = asyncio.create_task(
+        _portfolio_risk_sync_loop(config.PORTFOLIO_RISK_SYNC_SECONDS),
+        name="portfolio_risk_sync",
     )
     ingestor_task = asyncio.create_task(
         _ingestor.run(), name="market_ingestor"
@@ -982,10 +1069,15 @@ async def main(args: argparse.Namespace | None = None) -> None:
         except asyncio.CancelledError:
             pass
 
-    # Stop alert manager
+    # Stop alert manager and portfolio risk sync
     alert_task.cancel()
+    risk_sync_task.cancel()
     try:
         await alert_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await risk_sync_task
     except asyncio.CancelledError:
         pass
 

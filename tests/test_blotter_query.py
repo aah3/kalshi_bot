@@ -1,16 +1,30 @@
 """Blotter query_trades / query_legs filter tests."""
 
+import importlib
+import sys
+from pathlib import Path
+
 import pytest
 
-from metrics.blotter import Blotter
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
 def blotter(tmp_path):
+    # Other tests may shim sys.modules['config']; reload the real module here.
+    sys.modules.pop("config", None)
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    import config  # noqa: F401
+
+    importlib.reload(sys.modules["config"])
+    sys.modules.pop("metrics.blotter", None)
+    from metrics.blotter import Blotter
+
     return Blotter(db_path=str(tmp_path / "test.db"))
 
 
-def test_query_trades_by_resolution_and_trade_id(blotter: Blotter):
+def test_query_trades_by_resolution_and_trade_id(blotter):
     tid = blotter.open_trade(
         ticker="T-A",
         category="Sports",
@@ -32,7 +46,7 @@ def test_query_trades_by_resolution_and_trade_id(blotter: Blotter):
     assert blotter.query_trades(resolution="no") == []
 
 
-def test_query_legs_by_trade_type(blotter: Blotter):
+def test_query_legs_by_trade_type(blotter):
     tid = blotter.open_trade(ticker="T-B", strategy="kelly")
     blotter.record_fill(
         parent_trade_id=tid,
