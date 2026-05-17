@@ -64,6 +64,18 @@ from logging_.structured_logger import logger
 # ── Screener tunables ─────────────────────────────────────────────────────────
 
 MIN_SCORE_THRESHOLD: float    = 0.30   # drop results below this score
+SCREENER_MIN_VOLUME_24H: int  = 200    # hard floor — all strategy scorers
+
+# Strategy names accepted by score_for_strategy() / discovery rank_by=screener
+SCREENER_STRATEGY_ALIASES: dict[str, str] = {
+    "green_up":  "green_up",
+    "greenup":   "green_up",
+    "kelly":     "kelly",
+    "high_prob": "high_prob",
+    "highprob":  "high_prob",
+    "arb":       "arb",
+    "arbitrage": "arb",
+}
 MAX_SPREAD_CENTS: int         = 10     # reject illiquid markets
 MIN_VOLUME_24H: int           = 50     # minimum daily contract volume
 MIN_MINUTES_TO_CLOSE: float   = 30.0  # skip markets closing very soon
@@ -75,7 +87,7 @@ GREEN_UP_MIN_ENTRY_PRICE: int   = 10   # skip if too cheap (near-zero liquidity)
 # High-probability entry window (cents)
 HP_MIN_YES_ASK: int = 85
 HP_MAX_YES_ASK: int = 97
-HP_MIN_ROI_PCT: float = config.HP_MIN_ROI_PCT
+HP_MIN_ROI_PCT: float = getattr(config, "HP_MIN_ROI_PCT", 2.0)
 
 # Arbitrage detection
 ARB_SUM_THRESHOLD: int = 98    # flag if sum of YES asks in event < this
@@ -330,6 +342,19 @@ class MarketScreener:
 
     # ── Individual scorers ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _volume_gate(
+        market: MarketSummary,
+        min_volume: int = SCREENER_MIN_VOLUME_24H,
+    ) -> tuple[float, list[str]] | None:
+        """Return (0, reasons) when 24h volume is below the liquidity floor."""
+        if market.volume_24h < min_volume:
+            return 0.0, [
+                f"Volume 24h {market.volume_24h:,} below screener minimum "
+                f"{min_volume:,}"
+            ]
+        return None
+
     def _score_kelly(
         self, market: MarketSummary, book: OrderBookSnapshot | None
     ) -> tuple[float, list[str]]:
@@ -344,6 +369,10 @@ class MarketScreener:
         """
         reasons: list[str] = []
         score = 0.0
+
+        vol_fail = self._volume_gate(market)
+        if vol_fail:
+            return vol_fail
 
         if market.spread is None:
             return 0.0, ["No spread data"]
@@ -369,7 +398,7 @@ class MarketScreener:
         elif market.volume_24h >= 1_000:
             vol_score = 0.20
             reasons.append(f"Volume 24h: {market.volume_24h:,} (high)")
-        elif market.volume_24h >= 100:
+        elif market.volume_24h >= SCREENER_MIN_VOLUME_24H:
             vol_score = 0.10
             reasons.append(f"Volume 24h: {market.volume_24h:,} (moderate)")
         else:
@@ -414,6 +443,10 @@ class MarketScreener:
         reasons: list[str] = []
         score = 0.0
 
+        vol_fail = self._volume_gate(market)
+        if vol_fail:
+            return vol_fail
+
         yes_ask = market.yes_ask
         if yes_ask is None:
             return 0.0, ["No ask price"]
@@ -440,11 +473,11 @@ class MarketScreener:
         elif market.volume_24h >= 1_000:
             score += 0.25
             reasons.append(f"Volume 24h: {market.volume_24h:,} — reasonable activity")
-        elif market.volume_24h >= 200:
+        elif market.volume_24h >= SCREENER_MIN_VOLUME_24H:
             score += 0.10
-            reasons.append(f"Volume 24h: {market.volume_24h:,} — low activity")
+            reasons.append(f"Volume 24h: {market.volume_24h:,} — meets floor")
         else:
-            return 0.0, [f"Volume 24h {market.volume_24h} too low for green-up"]
+            return 0.0, [f"Volume 24h {market.volume_24h} below green-up minimum"]
 
         # Factor 3: time to close — need time for the market to move (0–0.25)
         mins = market.minutes_to_close
@@ -478,6 +511,10 @@ class MarketScreener:
         """
         reasons: list[str] = []
         score = 0.0
+
+        vol_fail = self._volume_gate(market)
+        if vol_fail:
+            return vol_fail
 
         yes_ask = market.yes_ask
         if yes_ask is None:
@@ -523,10 +560,11 @@ class MarketScreener:
         if market.volume_24h >= 1_000:
             score += 0.25
             reasons.append(f"Volume 24h: {market.volume_24h:,}")
-        elif market.volume_24h >= 200:
+        elif market.volume_24h >= SCREENER_MIN_VOLUME_24H:
             score += 0.10
+            reasons.append(f"Volume 24h: {market.volume_24h:,} — meets floor")
         else:
-            return 0.0, [f"Volume 24h {market.volume_24h} too low"]
+            return 0.0, [f"Volume 24h {market.volume_24h} below high-prob minimum"]
 
         mins = market.minutes_to_close
         if mins is not None and mins < MIN_MINUTES_TO_CLOSE:
@@ -550,6 +588,10 @@ class MarketScreener:
         Kalshi sometimes has this when the book is thin on one side.
         """
         reasons: list[str] = []
+
+        vol_fail = self._volume_gate(market)
+        if vol_fail:
+            return vol_fail
 
         yes_ask = market.yes_ask
         no_ask  = market.no_ask
@@ -715,10 +757,10 @@ class MarketScreener:
                 "fee_adjusted_roi_if_yes_wins_pct": round(net, 2),
                 "roi_if_yes_wins_pct":     round(net, 2),
                 "fee_per_contract_cents":  config.FEE_PER_CONTRACT_CENTS,
-                "example_stake_usd":       config.HP_STAKE_CENTS / 100,
+                "example_stake_usd":       getattr(config, "HP_STAKE_CENTS", 5000) / 100,
                 "entry_modes": [
-                    "market", "limit_at_ask", "limit_at_bid",
-                    "limit_at_mid", "limit_offset",
+                    "passive", "cross_spread", "market",
+                    "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
                 ],
                 "post_fill_modes": [
                     "hold", "resting_take_profit", "resting_stop", "tp_and_stop",
@@ -739,3 +781,30 @@ class MarketScreener:
             }
 
         return hints
+
+
+def score_for_strategy(
+    market: MarketSummary,
+    strategy: str,
+    book: OrderBookSnapshot | None = None,
+) -> float:
+    """
+    Synchronous screener score for one market and strategy name.
+
+    Used by discovery ``rank_by=screener`` to pick the top N tickers for a bot
+    strategy (e.g. green_up in Sports).
+    """
+    key = SCREENER_STRATEGY_ALIASES.get(strategy.strip().lower(), strategy.strip().lower())
+    scorer = MarketScreener.__new__(MarketScreener)
+
+    if key == "green_up":
+        score, _ = scorer._score_green_up(market, book)
+    elif key == "kelly":
+        score, _ = scorer._score_kelly(market, book)
+    elif key == "high_prob":
+        score, _ = scorer._score_high_prob(market, book)
+    elif key == "arb":
+        score, _ = scorer._score_arb_comp(market, book)
+    else:
+        return 0.0
+    return score

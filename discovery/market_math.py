@@ -75,10 +75,12 @@ def passes_roi_gate(
     """
     gross = gross_roi_if_yes_wins_pct(yes_ask_cents)
     use_fees = (
-        config.HP_USE_FEE_ADJUSTED_ROI if use_fee_adjusted is None else use_fee_adjusted
+        getattr(config, "HP_USE_FEE_ADJUSTED_ROI", True)
+        if use_fee_adjusted is None
+        else use_fee_adjusted
     )
     round_trip = (
-        config.HP_ASSUME_ROUND_TRIP_FEES
+        getattr(config, "HP_ASSUME_ROUND_TRIP_FEES", False)
         if round_trip_fees is None
         else round_trip_fees
     )

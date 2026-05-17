@@ -714,6 +714,7 @@ class Blotter:
         category:   str | None  = None,
         strategy:   str | None  = None,
         ticker:     str | None  = None,
+        trade_id:   str | None  = None,
         from_date:  str | None  = None,      # "YYYY-MM-DD"
         to_date:    str | None  = None,
         days:       int | None  = None,      # shortcut: last N days
@@ -727,9 +728,12 @@ class Blotter:
             blotter.query_trades(status="closed", category="Politics")
             blotter.query_trades(strategy="green_up_full_green", days=7)
             blotter.query_trades(ticker="PRES-2024-DEM")
+            blotter.query_trades(resolution="yes", days=30)
         """
         clauses, params = [], []
 
+        if trade_id:
+            clauses.append("trade_id = ?");   params.append(trade_id)
         if status:
             clauses.append("status = ?");     params.append(status)
         if category:
@@ -762,6 +766,9 @@ class Blotter:
         ticker:          str | None = None,
         trade_type:      str | None = None,
         status:          str | None = None,
+        resolution:      str | None = None,
+        from_date:       str | None = None,
+        to_date:         str | None = None,
         days:            int | None = None,
         limit:           int        = 500,
     ) -> list[LegRecord]:
@@ -774,8 +781,14 @@ class Blotter:
             clauses.append("trade_type = ?");      params.append(trade_type)
         if status:
             clauses.append("status = ?");          params.append(status)
+        if resolution:
+            clauses.append("resolution = ?");      params.append(resolution)
         if days:
             clauses.append("entry_time >= ?");     params.append(_days_ago_iso(days))
+        elif from_date:
+            clauses.append("entry_time >= ?");     params.append(from_date)
+        if to_date:
+            clauses.append("entry_time <= ?");     params.append(to_date + "T23:59:59")
 
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql   = f"SELECT * FROM trades {where} ORDER BY entry_time DESC LIMIT ?"

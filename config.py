@@ -47,7 +47,7 @@ if ENV == "production":
     print(f"[CONFIG] {BASE_URL}")
     print(f"[CONFIG] {_credential_status_line()}")
 else:
-    print(f"[CONFIG] Running in DEMO mode → {BASE_URL}")
+    print(f"[CONFIG] Running in DEMO mode -> {BASE_URL}")
     print(f"[CONFIG] {_credential_status_line()}")
 
 # ─── Authentication (resolved for active KALSHI_ENV) ─────────────────────────
@@ -115,6 +115,9 @@ MIN_MINUTES_TO_EXPIRY: float   = 10.0    # refuse entries on markets closing in 
 MAX_DRAWDOWN_PCT: float         = 0.10    # 10% peak-to-trough kills the bot
 MAX_SECTOR_CONCENTRATION: float = 0.30   # 30% of portfolio in one category
 MAX_OPEN_POSITIONS: int         = 20     # absolute open position count
+MAX_CONCURRENT_POSITIONS: int   = int(
+    os.getenv("KALSHI_MAX_CONCURRENT_POSITIONS", "0")
+)  # 0 = unlimited; cap simultaneous entry legs per strategy
 DAILY_LOSS_LIMIT_CENTS: int     = 50_000 # $500 daily stop-loss
 
 # Per-position risk thresholds (used by alert_manager)

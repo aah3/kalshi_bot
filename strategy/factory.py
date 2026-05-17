@@ -13,11 +13,8 @@ import config
 from strategy.arbitrage_strategy import ArbitrageStrategy
 from strategy.base_strategy import BaseStrategy
 from strategy.green_up_strategy import GreenUpStrategy, HedgeMode
-from strategy.high_prob_strategy import (
-    EntryPriceMode,
-    HighProbStrategy,
-    PostFillMode,
-)
+from strategy.execution_price import EntryPriceMode
+from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
 from strategy.kelly_strategy import KellyStrategy
 
 VALID_STRATEGIES = ("kelly", "green_up", "arb", "high_prob")
@@ -83,6 +80,9 @@ def build_strategy(
     hp_entry_mode: str | None = None,
     hp_post_fill: str | None = None,
     hp_stake_cents: int | None = None,
+    gu_entry_mode: str | None = None,
+    gu_exit_mode: str | None = None,
+    hp_exit_mode: str | None = None,
 ) -> BaseStrategy:
     """
     Build a strategy instance by name.
@@ -107,14 +107,18 @@ def build_strategy(
     if key == "kelly":
         return KellyStrategy(model_probabilities=model_probs or {})
 
+    price_mode_map = {
+        "passive":      EntryPriceMode.PASSIVE,
+        "cross_spread": EntryPriceMode.CROSS_SPREAD,
+        "market":       EntryPriceMode.MARKET,
+        "limit_at_ask": EntryPriceMode.LIMIT_AT_ASK,
+        "limit_at_bid": EntryPriceMode.LIMIT_AT_BID,
+        "limit_at_mid": EntryPriceMode.LIMIT_AT_MID,
+        "limit_offset": EntryPriceMode.LIMIT_OFFSET,
+    }
+
     if key == "high_prob":
-        entry_map = {
-            "market":       EntryPriceMode.MARKET,
-            "limit_at_ask": EntryPriceMode.LIMIT_AT_ASK,
-            "limit_at_bid": EntryPriceMode.LIMIT_AT_BID,
-            "limit_at_mid": EntryPriceMode.LIMIT_AT_MID,
-            "limit_offset": EntryPriceMode.LIMIT_OFFSET,
-        }
+        entry_map = price_mode_map
         post_map = {
             "hold":                PostFillMode.HOLD_TO_SETTLEMENT,
             "resting_take_profit": PostFillMode.RESTING_TAKE_PROFIT,
@@ -122,7 +126,10 @@ def build_strategy(
             "tp_and_stop":         PostFillMode.TAKE_PROFIT_AND_STOP,
         }
         entry_key = (
-            hp_entry_mode or os.getenv("KALSHI_HP_ENTRY_MODE", "limit_at_ask")
+            hp_entry_mode or os.getenv("KALSHI_HP_ENTRY_MODE", "passive")
+        ).lower()
+        exit_key = (
+            hp_exit_mode or os.getenv("KALSHI_HP_EXIT_MODE", "passive")
         ).lower()
         post_key = (
             hp_post_fill or os.getenv("KALSHI_HP_POST_FILL", "hold")
@@ -139,7 +146,8 @@ def build_strategy(
             stake_cents=hp_stake_cents if hp_stake_cents is not None else _env_int(
                 "KALSHI_HP_STAKE_CENTS", config.HP_STAKE_CENTS
             ),
-            entry_price_mode=entry_map.get(entry_key, EntryPriceMode.LIMIT_AT_ASK),
+            entry_price_mode=entry_map.get(entry_key, EntryPriceMode.PASSIVE),
+            exit_price_mode=entry_map.get(exit_key, EntryPriceMode.PASSIVE),
             limit_offset_cents=_env_int("KALSHI_HP_LIMIT_OFFSET", config.HP_LIMIT_OFFSET),
             post_fill_mode=post_map.get(post_key, PostFillMode.HOLD_TO_SETTLEMENT),
             take_profit_offset_cents=_env_int(
@@ -163,6 +171,12 @@ def build_strategy(
             "partial":    HedgeMode.PARTIAL,
         }
         mode_key = (hedge_mode or os.getenv("KALSHI_GREEN_UP_HEDGE_MODE", "full_green")).lower()
+        entry_key = (
+            gu_entry_mode or os.getenv("KALSHI_GREEN_UP_ENTRY_MODE", "passive")
+        ).lower()
+        exit_key = (
+            gu_exit_mode or os.getenv("KALSHI_GREEN_UP_EXIT_MODE", "passive")
+        ).lower()
         strat = GreenUpStrategy(
             entry_max_price=entry_max if entry_max is not None else int(
                 os.getenv("KALSHI_GREEN_UP_ENTRY_MAX", "25")
@@ -174,6 +188,8 @@ def build_strategy(
             stop_loss_threshold=stop_loss if stop_loss is not None else float(
                 os.getenv("KALSHI_GREEN_UP_STOP_LOSS", "0.40")
             ),
+            entry_price_mode=price_mode_map.get(entry_key, EntryPriceMode.PASSIVE),
+            exit_price_mode=price_mode_map.get(exit_key, EntryPriceMode.PASSIVE),
         )
         for ticker in tickers:
             strat.add_watch_ticker(ticker)

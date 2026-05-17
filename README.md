@@ -1,6 +1,6 @@
 # Kalshi Prediction Market Trading Bot
 
-Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports multiple pluggable strategies, automatic market discovery, manual order tools, offline replay, and a full trade blotter with settlement reconciliation.
+Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports multiple pluggable strategies, automatic market discovery, a live terminal monitor, manual order tools, offline replay, and a persistent trade blotter (queryable by date, category, ticker, strategy, and resolution) with performance analytics and settlement reconciliation.
 
 ## Requirements
 
@@ -22,7 +22,8 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env with KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_B64
+# Edit .env: KALSHI_DEMO_API_KEY_ID + KALSHI_DEMO_PRIVATE_KEY_B64 (demo)
+# For production: KALSHI_PROD_* and KALSHI_ENV=production
 ```
 
 Encode your private key:
@@ -54,19 +55,60 @@ python -m pytest tests/ -v
 | **Arbitrage** | `--strategy arb` | Complementary, exhaustive-set, and dominance arbs |
 | **High probability** | `--strategy high_prob` | Buy high-implied-P(YES) contracts; optional resting take-profit / stop |
 
+### Green-up strategy
+
+Back cheap **YES** (underdog), then hedge with **NO** when price runs. Hedge sizing uses full-green, stake-back, or partial formulas (see `strategy/green_up_strategy.py`).
+
+The bot watches **all N discovered tickers** in parallel. Each order is priced from that market’s live bid/ask on every tick.
+
+**CLI parameters** (also available via env — see below):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--entry-max` | 25¢ | Enter only when best YES ask ≤ this |
+| `--hedge-trigger` | 68¢ | Hedge when YES **bid** reaches this |
+| `--hedge-mode` | `full_green` | `full_green` \| `stake_back` \| `partial` |
+| `--stop-loss` | 0.40 | Stop if YES bid falls 40% below entry |
+| `--gu-entry-mode` | `passive` | How to price **buy YES** entries (see order pricing) |
+| `--gu-exit-mode` | `passive` | How to price **buy NO** hedge/stop legs |
+| `--max-concurrent-positions` | `0` (unlimited) | Cap simultaneous open/pending positions |
+
+**Order pricing** (`--gu-entry-mode` / `--gu-exit-mode`, same set as high-prob):
+
+| Mode | Buy | Sell |
+|------|-----|------|
+| `passive` (default) | Limit at **bid** (resting) | Limit at **ask** (resting) |
+| `cross_spread` | Limit at **ask** (IOC, cross) | Limit at **bid** (IOC, cross) |
+| `market` | IOC market | IOC market |
+| `limit_at_bid` / `limit_at_ask` | Explicit bid/ask limits | Same aliases as above |
+
+```bash
+# Preview top 5 Sports markets (screener-ranked, min volume enforced)
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-top 5 --discover-only
+
+# Autonomous demo: 5 markets, passive entries, max 5 open positions
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-top 5 --max-concurrent-positions 5 \
+  --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
+  --gu-entry-mode passive --gu-exit-mode cross_spread \
+  --monitor-interval 5
+```
+
 ### High-probability strategy
 
 Buys **YES** when the market already prices a high chance of winning (default YES ask **85–97¢**), with **fee-adjusted ROI** gating so entries still clear costs after `FEE_PER_CONTRACT_CENTS`.
 
-**Entry modes** (`--hp-entry-mode` / `KALSHI_HP_ENTRY_MODE`):
+**Entry / exit modes** (`--hp-entry-mode`, `--hp-exit-mode`):
 
-| Mode | Behaviour |
-|------|-----------|
-| `market` | Market order (IOC) |
-| `limit_at_ask` | Aggressive limit at best ask (default) |
-| `limit_at_bid` | Passive limit at best bid (resting) |
-| `limit_at_mid` | Limit at mid-price |
-| `limit_offset` | Limit at `bid + KALSHI_HP_LIMIT_OFFSET` |
+| Mode | Buy YES | Sell YES |
+|------|---------|----------|
+| `passive` (default) | Limit at bid (GTC) | Limit at ask (GTC) |
+| `cross_spread` | Limit at ask (IOC) | Limit at bid (IOC) |
+| `market` | IOC market | IOC market |
+| `limit_at_mid` / `limit_offset` | Mid or bid+offset | Mid or ask−offset |
+
+Stop-loss exits use `cross_spread` when exit mode is `passive`, so stops actually cross the book.
 
 **Post-fill** (`--hp-post-fill` / `KALSHI_HP_POST_FILL`):
 
@@ -90,9 +132,11 @@ When you use `--discover` (or `KALSHI_DISCOVER=true`), the bot applies a **disco
 | Preset | Used for | Default filters |
 |--------|----------|-----------------|
 | `high_prob` | `high_prob` | YES ask 85–97¢, spread ≤8¢, min vol 200, rank by **fee-adjusted ROI** |
-| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, activity 48h |
+| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, activity 48h, rank by **screener score** |
 | `kelly` | `kelly` | Spread ≤10¢, min vol 100 |
 | `arb` | `arb` | Top 25 by volume, full scan |
+
+**Screener volume floor:** every strategy scorer rejects markets below **200** contracts 24h volume (`SCREENER_MIN_VOLUME_24H` in `discovery/screener.py`). Discovery presets may set a higher `KALSHI_DISCOVER_MIN_VOLUME`.
 
 Force a preset: `--discover-preset high_prob`  
 Disable presets: `--discover-preset none`
@@ -110,8 +154,11 @@ python main.py --discover --discover-category Sports --strategy high_prob
 python main.py --discover --discover-category Politics --strategy high_prob \
   --discover-min-yes-ask 88 --discover-rank-by fee_adjusted_roi
 
-# Green-up discovery (underdog window)
-python main.py --discover --discover-category Sports --strategy green_up --discover-only
+# Green-up: top 5 Sports markets, screener-ranked, trade all in parallel
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-top 5 --max-concurrent-positions 5 \
+  --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
+  --gu-entry-mode passive --monitor-interval 5
 ```
 
 ### Discovery environment variables
@@ -126,6 +173,8 @@ python main.py --discover --discover-category Sports --strategy green_up --disco
 | `KALSHI_DISCOVER_MAX_SPREAD` | Max spread (cents) |
 | `KALSHI_DISCOVER_MIN_VOLUME` | Min 24h volume |
 | `KALSHI_DISCOVER_ACTIVITY_HOURS` | Only recently updated markets |
+| `KALSHI_DISCOVER_RANK_BY` | `volume`, `fee_adjusted_roi`, or `screener` |
+| `KALSHI_MAX_CONCURRENT_POSITIONS` | Cap open/pending positions (`0` = unlimited) |
 
 ---
 
@@ -164,21 +213,93 @@ python tools/trade.py buy --ticker TICKER-A --side yes --count 10 --price 32
 python tools/trade.py monitor --interval 15
 ```
 
-### 4. Dashboard and reports
+### 4. Live monitor table
+
+While `main.py` runs, a full-screen table shows cash, P&L, per-ticker bid/ask, strategy state (watching → entered → hedged), and alerts. Refresh interval defaults to `KALSHI_MONITOR_INTERVAL` (15s); override with `--monitor-interval` (use `0` to disable).
+
+```bash
+python main.py --strategy green_up --tickers TICKER-A \
+  --entry-max 10 --hedge-trigger 13 --monitor-interval 5
+
+python main.py --strategy high_prob --tickers TICKER-A --monitor-interval 15
+```
+
+The monitor can fall back to REST order books when the WebSocket book is empty; the strategy evaluates on **WebSocket ticks** (Kalshi `orderbook_delta` channel, including FP dollar snapshots/deltas).
+
+### 5. Dashboard and session reports
 
 ```bash
 python tools/dashboard.py --interval 15 --calibration
 python tools/session_report.py
-python tools/blotter.py trades --days 7
+python tools/session_report.py --date 2026-05-17 --json reports/session.json
 python tools/blotter_report.py performance --days 7
 python tools/blotter_report.py calibration --days 30
 ```
 
-### 5. Live monitor table
+---
+
+## Trade history and blotter
+
+Every trade opened through **`main.py`** is recorded in a SQLite database (default `kalshi_bot.db`, path via `KALSHI_DB_PATH`). Two tables:
+
+| Table | Contents |
+|-------|----------|
+| `parent_trades` | One row per logical trade (e.g. full green-up cycle) — net P&L, category, strategy, hold time, resolution |
+| `trades` | One row per **leg** (entry, hedge, stop) — side, prices, fees, `trade_type` |
+
+The same database also holds **metrics** tables (`signals`, `metrics_fills`, `equity_snapshots`) for fill rate, Sharpe, and drawdown. Structured JSON logs go to `kalshi_bot.jsonl` (`KALSHI_LOG_FILE`).
+
+**Not recorded automatically:** orders placed only via `tools/trade.py` (manual CLI) or directly on the Kalshi website — those live on the exchange, not in the bot blotter unless you add them manually.
+
+### Query CLI (`tools/blotter.py`)
+
+| Command | Purpose |
+|---------|---------|
+| `trades` | List parent trades (filterable) |
+| `search` | Same filters as `trades`; add `--legs` for fill-level rows |
+| `legs` | Individual fills (entry / hedge / stop) |
+| `detail` | Full parent trade + all legs (`--trade-id T-NNNN`) |
+| `open` | Open positions still in the blotter |
+| `pnl-by-strategy` / `pnl-by-category` | Aggregated P&L |
+| `best` / `worst` | Top N trades by net P&L |
+| `note` | Annotate a trade or leg |
+| `settle` | Manually mark settled (`--resolution yes\|no\|void`) |
+
+**Filters** (combinable on `trades`, `search`, and `legs` where applicable):
+
+| Filter | Flag | Example |
+|--------|------|---------|
+| Status | `--status` | `open`, `closed`, `settled` |
+| Category | `--category` | `Sports`, `Politics` |
+| Strategy | `--strategy` | `green_up` (substring match) |
+| Ticker | `--ticker` | exact market ticker |
+| Trade ID | `--trade-id` | `T-0042` |
+| Resolution | `--resolution` | `yes`, `no`, `void` |
+| Date range | `--days N` or `--from` / `--to` | last 7 days; `2026-05-01` … `2026-05-17` |
+| Leg type | `--trade-type` | `entry`, `hedge`, `stop_loss` (with `search --legs` or `legs`) |
+| Export | `--csv FILE` | write results to CSV |
+| Limit | `--limit` | default 200 trades / 500 legs |
 
 ```bash
-python main.py --strategy high_prob --tickers TICKER-A --monitor-interval 15
+# Parent trades
+python tools/blotter.py trades --days 7
+python tools/blotter.py trades --category Sports --strategy green_up --status closed
+python tools/blotter.py search --resolution yes --status settled --days 30
+python tools/blotter.py search --trade-id T-0042
+python tools/blotter.py detail --trade-id T-0042
+
+# Leg-level (entry / hedge / stop)
+python tools/blotter.py search --legs --ticker TICKER-A --days 14
+python tools/blotter.py search --legs --trade-type hedge --days 30
+python tools/blotter.py legs --trade-id T-0042
+
+# Aggregates and export
+python tools/blotter.py pnl-by-strategy --days 30
+python tools/blotter.py pnl-by-category --days 30 --csv category_pnl.csv
+python tools/blotter.py trades --status closed --days 30 --csv trades.csv
 ```
+
+On shutdown, `main.py` prints a short summary of closed/settled trades from the last 24 hours.
 
 ---
 
@@ -235,7 +356,7 @@ kalshi_bot/
 │   ├── execution_manager.py      Orders (limit/market, buy/sell, TIF)
 │   └── rate_limiter.py           Token bucket + 429 backoff
 ├── ingestion/
-│   └── market_ingestor.py        WebSocket order books + fills
+│   └── market_ingestor.py        WebSocket order books (FP snapshots/deltas) + fills
 ├── risk/
 │   ├── circuit_breaker.py        Kill switch, limits
 │   ├── alert_manager.py          P&L / expiry / fill-timeout alerts
@@ -262,6 +383,24 @@ kalshi_bot/
 | `HP_ASSUME_ROUND_TRIP_FEES` | false | Also count exit fee in ROI gate (or infer from post-fill) |
 | `MAX_DRAWDOWN_PCT` | 0.10 | Kill switch drawdown |
 | `DAILY_LOSS_LIMIT_CENTS` | 50,000 | Daily stop ($500) |
+| `POSITION_STOP_LOSS_PCT` | 0.40 | Alert when unrealised loss ≥ 40% of cost |
+| `KALSHI_DB_PATH` | `kalshi_bot.db` | Blotter + metrics SQLite file |
+| `KALSHI_MONITOR_INTERVAL` | 15 | Live table refresh (seconds); `0` = off |
+
+### Green-up environment variables
+
+```env
+KALSHI_STRATEGY=green_up
+KALSHI_GREEN_UP_ENTRY_MAX=25
+KALSHI_GREEN_UP_HEDGE_TRIGGER=68
+KALSHI_GREEN_UP_HEDGE_MODE=full_green
+KALSHI_GREEN_UP_STOP_LOSS=0.40
+KALSHI_GREEN_UP_ENTRY_MODE=passive
+KALSHI_GREEN_UP_EXIT_MODE=passive
+KALSHI_MAX_CONCURRENT_POSITIONS=5
+```
+
+CLI flags (`--entry-max`, `--hedge-trigger`, `--hedge-mode`, `--stop-loss`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`) override these at runtime.
 
 ### High-probability environment variables
 
@@ -271,7 +410,8 @@ KALSHI_HP_MIN_YES_ASK=85
 KALSHI_HP_MAX_YES_ASK=97
 KALSHI_HP_MIN_ROI_PCT=2.0
 KALSHI_HP_USE_FEE_ADJUSTED_ROI=true
-KALSHI_HP_ENTRY_MODE=limit_at_ask
+KALSHI_HP_ENTRY_MODE=passive
+KALSHI_HP_EXIT_MODE=passive
 KALSHI_HP_POST_FILL=resting_take_profit
 KALSHI_HP_STAKE_CENTS=5000
 

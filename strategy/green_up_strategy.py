@@ -98,6 +98,8 @@ from typing import Any
 import config
 from logging_.structured_logger import logger
 from strategy.base_strategy import BaseStrategy, Side, Signal
+from strategy.execution_price import execution_meta, resolve_no_buy, resolve_yes_buy
+from strategy.execution_price import EntryPriceMode
 
 
 # ── Module-level tunables ────────────────────────────────────────────────────
@@ -118,7 +120,8 @@ class HedgeMode(str, Enum):
 
 
 class PositionState(str, Enum):
-    WATCHING = "watching"   # no position yet, monitoring for entry
+    SCANNING = "scanning"   # registered ticker, no entry order yet
+    WATCHING = "watching"   # entry order sent, awaiting fill
     ENTERED  = "entered"    # YES bought, waiting for hedge trigger or stop
     HEDGING  = "hedging"    # hedge order sent, awaiting fill confirmation
     HEDGED   = "hedged"     # both legs filled — profit locked
@@ -138,7 +141,7 @@ class GreenUpPosition:
     """
 
     ticker: str
-    state:  PositionState = PositionState.WATCHING
+    state:  PositionState = PositionState.SCANNING
 
     # Entry leg
     entry_price_cents: int  = 0   # YES price paid (cents, 1-99)
@@ -288,6 +291,9 @@ class GreenUpStrategy(BaseStrategy):
         hedge_mode:             HedgeMode = HedgeMode.FULL_GREEN,
         stop_loss_threshold:    float     = DEFAULT_STOP_LOSS_THRESHOLD,
         partial_hedge_fraction: float     = DEFAULT_PARTIAL_HEDGE_FRACTION,
+        entry_price_mode:       EntryPriceMode = EntryPriceMode.PASSIVE,
+        exit_price_mode:        EntryPriceMode = EntryPriceMode.PASSIVE,
+        limit_offset_cents:     int       = 0,
     ) -> None:
         """
         Args:
@@ -303,12 +309,19 @@ class GreenUpStrategy(BaseStrategy):
                                     0.40 = stop if price drops 40% from entry.
             partial_hedge_fraction: For PARTIAL mode only — fraction of full-green
                                     stake to place (0.0 to 1.0).
+            entry_price_mode:       How to price entry (buy YES): market, limit_at_ask,
+                                    limit_at_bid, etc.
+            exit_price_mode:        How to price hedge/stop (buy NO).
+            limit_offset_cents:     For limit_offset mode on entry/exit legs.
         """
         self._entry_max_price        = entry_max_price
         self._hedge_trigger_price    = hedge_trigger_price
         self._hedge_mode             = hedge_mode
         self._stop_loss_threshold    = stop_loss_threshold
         self._partial_hedge_fraction = partial_hedge_fraction
+        self._entry_price_mode       = entry_price_mode
+        self._exit_price_mode        = exit_price_mode
+        self._limit_offset           = limit_offset_cents
 
         # ticker -> GreenUpPosition
         self._positions: dict[str, GreenUpPosition] = {}
@@ -317,7 +330,7 @@ class GreenUpStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
-        return f"green_up_{self._hedge_mode.value}"
+        return f"green_up_{self._hedge_mode.value}_{self._entry_price_mode.value}"
 
     def evaluate(self, tick: dict[str, Any]) -> Signal | None:
         """
@@ -336,6 +349,9 @@ class GreenUpStrategy(BaseStrategy):
 
         pos = self._positions.get(ticker)
 
+        if pos and pos.state in (PositionState.HEDGING, PositionState.STOPPING):
+            return None
+
         if pos and pos.state == PositionState.ENTERED:
             stop_sig = self._check_stop_loss(pos, tick)
             if stop_sig:
@@ -345,8 +361,11 @@ class GreenUpStrategy(BaseStrategy):
             if hedge_sig:
                 return hedge_sig
 
-        if pos is None or pos.state == PositionState.WATCHING:
+        if pos is None or pos.state == PositionState.SCANNING:
             return self._check_entry(ticker, tick)
+
+        if pos.state == PositionState.WATCHING:
+            return None
 
         return None
 
@@ -484,6 +503,13 @@ class GreenUpStrategy(BaseStrategy):
         if best_ask is None or best_ask > self._entry_max_price:
             return None
 
+        limit_price, order_type, tif = resolve_yes_buy(
+            self._entry_price_mode,
+            tick.get("best_bid", best_ask),
+            best_ask,
+            self._limit_offset,
+        )
+
         implied_fair = self._hedge_trigger_price / 100.0
         market_price = best_ask / 100.0
         edge         = implied_fair - market_price
@@ -509,7 +535,7 @@ class GreenUpStrategy(BaseStrategy):
         # Preview the expected hedge at the trigger price
         preview_pos = GreenUpPosition(
             ticker=ticker,
-            entry_price_cents=best_ask,
+            entry_price_cents=limit_price,
             entry_stake_cents=size_cents,
         )
         no_at_trigger = 100 - self._hedge_trigger_price
@@ -533,11 +559,13 @@ class GreenUpStrategy(BaseStrategy):
             ticker=ticker,
             side=Side.YES.value,
             size_cents=size_cents,
-            limit_price=best_ask,
+            limit_price=limit_price,
             edge=round(edge, 5),
             edge_to_vig=round(edge_to_vig, 4),
             phase="entry",
-            entry_decimal_odds=round(100.0 / best_ask, 3),
+            entry_price_mode=self._entry_price_mode.value,
+            order_type=order_type,
+            entry_decimal_odds=round(100.0 / limit_price, 3),
             hedge_trigger_price=self._hedge_trigger_price,
             preview_hedge_cents=p_hedge,
             preview_locked_profit_cents=p_profit,
@@ -549,16 +577,21 @@ class GreenUpStrategy(BaseStrategy):
             ticker=ticker,
             side=Side.YES,
             size_cents=size_cents,
-            limit_price=best_ask,
+            limit_price=limit_price,
             edge=round(edge, 5),
             edge_to_vig=round(edge_to_vig, 4),
             confidence=implied_fair,
             strategy=self.name,
             meta={
-                "phase":                        "entry",
+                **execution_meta(
+                    order_type=order_type,
+                    time_in_force=tif,
+                    price_mode=self._entry_price_mode.value,
+                    phase="entry",
+                ),
                 "hedge_mode":                   self._hedge_mode.value,
-                "entry_price_cents":            best_ask,
-                "entry_decimal_odds":           round(100.0 / best_ask, 3),
+                "entry_price_cents":            limit_price,
+                "entry_decimal_odds":           round(100.0 / limit_price, 3),
                 "hedge_trigger_price":          self._hedge_trigger_price,
                 "stop_loss_threshold":          self._stop_loss_threshold,
                 "kelly_full":                   round(kelly_full, 4),
@@ -590,7 +623,16 @@ class GreenUpStrategy(BaseStrategy):
         if best_bid is None or best_bid < self._hedge_trigger_price:
             return None
 
-        no_price = 100 - best_bid
+        best_ask = tick.get("best_ask")
+        if best_ask is None:
+            return None
+
+        no_price, order_type, tif = resolve_no_buy(
+            self._exit_price_mode,
+            best_bid,
+            best_ask,
+            self._limit_offset,
+        )
         if no_price <= 0 or no_price >= 100:
             return None
 
@@ -676,7 +718,12 @@ class GreenUpStrategy(BaseStrategy):
             confidence=0.99,   # near-certain locked profit
             strategy=self.name,
             meta={
-                "phase":                  "hedge",
+                **execution_meta(
+                    order_type=order_type,
+                    time_in_force=tif,
+                    price_mode=self._exit_price_mode.value,
+                    phase="hedge",
+                ),
                 "hedge_mode":             mode_label,
                 # Entry leg
                 "entry_price_cents":      pos.entry_price_cents,
@@ -720,7 +767,16 @@ class GreenUpStrategy(BaseStrategy):
         if best_bid is None or best_bid > pos.stop_loss_trigger_price:
             return None
 
-        no_price = 100 - best_bid
+        best_ask = tick.get("best_ask")
+        if best_ask is None:
+            return None
+
+        no_price, order_type, tif = resolve_no_buy(
+            self._exit_price_mode,
+            best_bid,
+            best_ask,
+            self._limit_offset,
+        )
         if no_price <= 0 or no_price >= 100:
             return None
 
@@ -762,7 +818,12 @@ class GreenUpStrategy(BaseStrategy):
             confidence=0.0,   # defensive exit, not an alpha trade
             strategy=self.name,
             meta={
-                "phase":                "stop_loss",
+                **execution_meta(
+                    order_type=order_type,
+                    time_in_force=tif,
+                    price_mode=self._exit_price_mode.value,
+                    phase="stop_loss",
+                ),
                 "entry_price_cents":    pos.entry_price_cents,
                 "entry_stake_cents":    pos.entry_stake_cents,
                 "stop_trigger_price":   pos.stop_loss_trigger_price,

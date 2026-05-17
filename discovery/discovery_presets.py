@@ -15,7 +15,7 @@ from typing import Literal
 
 from discovery.ticker_selector import TickerCriteria
 
-RankBy = Literal["volume", "fee_adjusted_roi"]
+RankBy = Literal["volume", "fee_adjusted_roi", "screener"]
 
 
 @dataclass(frozen=True)
@@ -51,12 +51,12 @@ STRATEGY_DISCOVERY_PRESETS: dict[str, DiscoveryPreset] = {
     ),
     "green_up": DiscoveryPreset(
         name="green_up",
-        description="Underdog YES entries (low ask), active markets",
+        description="Underdog YES entries (low ask), active markets, screener-ranked",
         top_n=10,
         min_volume_24h=500,
         max_yes_ask=35,
         max_spread=12,
-        rank_by="volume",
+        rank_by="screener",
         activity_hours=48.0,
     ),
     "kelly": DiscoveryPreset(

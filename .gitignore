@@ -9,3 +9,4 @@ __pycache__/
 # Local databases and logs
 *.db
 kalshi_bot.jsonl
+testing.txt

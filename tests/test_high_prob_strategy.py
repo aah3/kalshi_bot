@@ -20,9 +20,11 @@ cfg.POSITION_STOP_LOSS_PCT = 0.40
 cfg.MIN_ACCOUNT_BALANCE_CENTS = 5_000
 cfg.HP_USE_FEE_ADJUSTED_ROI = True
 cfg.HP_ASSUME_ROUND_TRIP_FEES = False
+cfg.HP_MIN_ROI_PCT = 2.0
+cfg.HP_MIN_YES_ASK = 85
+cfg.HP_MAX_YES_ASK = 97
+cfg.HP_STAKE_CENTS = 5000
 cfg.FEE_PER_CONTRACT_CENTS = 7.0
-sys.modules["config"] = cfg
-
 log_mod = types.ModuleType("logging_.structured_logger")
 
 
@@ -35,13 +37,11 @@ log_mod.logger = _StubLogger()
 sys.modules["logging_"] = types.ModuleType("logging_")
 sys.modules["logging_.structured_logger"] = log_mod
 
+sys.modules["config"] = cfg
+
 from discovery.market_math import gross_roi_if_yes_wins_pct
-from strategy.high_prob_strategy import (
-    EntryPriceMode,
-    HighProbStrategy,
-    PostFillMode,
-    _resolve_entry_price,
-)
+from strategy.execution_price import EntryPriceMode, resolve_yes_buy
+from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
 
 
 def _tick(bid: int, ask: int, ticker: str = "TEST-MKT") -> dict:
@@ -57,16 +57,16 @@ class TestRoiAndEntryPrice:
     def test_roi_at_90c(self):
         assert abs(gross_roi_if_yes_wins_pct(90) - 11.111) < 0.01
 
-    def test_limit_at_bid_is_passive(self):
-        price, order_type, tif = _resolve_entry_price(
-            EntryPriceMode.LIMIT_AT_BID, 88, 90, 0,
+    def test_passive_buy_at_bid(self):
+        price, order_type, tif = resolve_yes_buy(
+            EntryPriceMode.PASSIVE, 88, 90, 0,
         )
         assert price == 88
         assert order_type == "limit"
         assert tif == "gtc"
 
     def test_market_uses_ioc(self):
-        price, order_type, tif = _resolve_entry_price(
+        price, order_type, tif = resolve_yes_buy(
             EntryPriceMode.MARKET, 88, 90, 0,
         )
         assert price == 90

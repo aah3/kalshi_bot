@@ -20,7 +20,7 @@ from discovery.market_math import fee_adjusted_roi_if_yes_wins_pct
 from execution.rate_limiter import RateLimiter
 from logging_.structured_logger import logger
 
-RankBy = Literal["volume", "fee_adjusted_roi"]
+RankBy = Literal["volume", "fee_adjusted_roi", "screener"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,7 @@ class TickerCriteria:
     tradeable_only: bool = True
     status: str = "open"
     preset_name: str | None = None
+    screener_strategy: str | None = None
 
 
 def filter_markets(
@@ -84,8 +85,18 @@ def rank_markets(
     markets: list[MarketSummary],
     *,
     rank_by: RankBy = "volume",
+    screener_strategy: str | None = None,
 ) -> list[MarketSummary]:
-    """Sort markets for discovery (volume or fee-adjusted ROI)."""
+    """Sort markets for discovery (volume, fee-adjusted ROI, or screener score)."""
+    if rank_by == "screener":
+        from discovery.screener import score_for_strategy
+
+        strat = screener_strategy or "green_up"
+        return sorted(
+            markets,
+            key=lambda m: score_for_strategy(m, strat),
+            reverse=True,
+        )
     return sorted(
         markets,
         key=lambda m: _market_sort_key(m, rank_by),
@@ -101,6 +112,7 @@ def select_tickers(
     filtered = rank_markets(
         filter_markets(markets, criteria),
         rank_by=criteria.rank_by,
+        screener_strategy=criteria.screener_strategy or criteria.preset_name,
     )
     return [m.ticker for m in filtered[: criteria.top_n]]
 
@@ -213,12 +225,25 @@ def format_discovery_table(
             else ""
         )
         + f"  rank_by={criteria.rank_by}"
+        + (
+            f"  screener={criteria.screener_strategy}"
+            if criteria.rank_by == "screener" and criteria.screener_strategy
+            else ""
+        )
         + preset_line
         + (f"  activity_hours={criteria.activity_hours}" if criteria.activity_hours else ""),
         "",
-        f"  {'VOL24H':>8}  {'ASK':>4}  {'ROI%':>6}  {'TICKER':<40}  TITLE",
+        (
+            f"  {'VOL24H':>8}  {'SCORE':>5}  {'ASK':>4}  {'ROI%':>6}  "
+            f"{'TICKER':<40}  TITLE"
+            if criteria.rank_by == "screener"
+            else f"  {'VOL24H':>8}  {'ASK':>4}  {'ROI%':>6}  {'TICKER':<40}  TITLE"
+        ),
         f"  {'─' * 95}",
     ]
+    strat = criteria.screener_strategy or criteria.preset_name or "green_up"
+    if criteria.rank_by == "screener":
+        from discovery.screener import score_for_strategy
     for tk in tickers:
         m = by_ticker.get(tk)
         if not m:
@@ -229,10 +254,17 @@ def format_discovery_table(
             if m.yes_ask is not None
             else "?"
         )
-        lines.append(
-            f"  {m.volume_24h:>8,}  {m.yes_ask or '?':>4}  {roi:>6}  "
-            f"{m.ticker:<40}  {m.title[:42]}"
-        )
+        if criteria.rank_by == "screener":
+            sc = score_for_strategy(m, strat)
+            lines.append(
+                f"  {m.volume_24h:>8,}  {sc:>5.2f}  {m.yes_ask or '?':>4}  {roi:>6}  "
+                f"{m.ticker:<40}  {m.title[:42]}"
+            )
+        else:
+            lines.append(
+                f"  {m.volume_24h:>8,}  {m.yes_ask or '?':>4}  {roi:>6}  "
+                f"{m.ticker:<40}  {m.title[:42]}"
+            )
     return "\n".join(lines)
 
 

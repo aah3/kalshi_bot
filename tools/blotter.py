@@ -26,6 +26,15 @@ COMMANDS
   python tools/blotter.py trades --days 7
   python tools/blotter.py trades --from 2024-11-01 --to 2024-11-30
 
+  # Filter by market resolution (settled trades)
+  python tools/blotter.py trades --resolution yes --days 30
+
+  # Unified search (same filters as trades; add --legs for fill-level rows)
+  python tools/blotter.py search --category Sports --strategy green_up --days 7
+  python tools/blotter.py search --ticker PRES-2024-DEM --status closed
+  python tools/blotter.py search --legs --trade-type hedge --days 14
+  python tools/blotter.py search --trade-id T-0042
+
   # Show trade legs (individual fills) for a specific parent trade
   python tools/blotter.py legs --trade-id T-0042
 
@@ -234,32 +243,92 @@ def _print_open(rows: list[dict]) -> None:
 
 # ── Subcommand handlers ───────────────────────────────────────────────────────
 
-def cmd_trades(args, blotter: Blotter) -> None:
-    records = blotter.query_trades(
+def _active_filters(args) -> list[str]:
+    """Human-readable list of filters the user passed."""
+    parts: list[str] = []
+    if getattr(args, "trade_id", None):
+        parts.append(f"trade_id={args.trade_id}")
+    if args.status:
+        parts.append(f"status={args.status}")
+    if args.category:
+        parts.append(f"category={args.category}")
+    if args.strategy:
+        parts.append(f"strategy={args.strategy}")
+    if args.ticker:
+        parts.append(f"ticker={args.ticker}")
+    if getattr(args, "resolution", None):
+        parts.append(f"resolution={args.resolution}")
+    if getattr(args, "trade_type", None):
+        parts.append(f"trade_type={args.trade_type}")
+    if args.from_date:
+        parts.append(f"from={args.from_date}")
+    if args.to_date:
+        parts.append(f"to={args.to_date}")
+    if args.days is not None:
+        parts.append(f"days={args.days}")
+    return parts
+
+
+def _query_trades_from_args(blotter: Blotter, args) -> list[ParentRecord]:
+    return blotter.query_trades(
         status=args.status,
         category=args.category,
         strategy=args.strategy,
         ticker=args.ticker,
+        trade_id=getattr(args, "trade_id", None),
+        from_date=args.from_date,
+        to_date=args.to_date,
+        days=args.days,
+        resolution=getattr(args, "resolution", None),
+        limit=args.limit,
+    )
+
+
+def _query_legs_from_args(blotter: Blotter, args) -> list[LegRecord]:
+    return blotter.query_legs(
+        parent_trade_id=getattr(args, "trade_id", None),
+        ticker=args.ticker,
+        trade_type=getattr(args, "trade_type", None),
+        status=args.status,
+        resolution=getattr(args, "resolution", None),
         from_date=args.from_date,
         to_date=args.to_date,
         days=args.days,
         limit=args.limit,
     )
+
+
+def cmd_trades(args, blotter: Blotter) -> None:
+    records = _query_trades_from_args(blotter, args)
     _print_trades(records)
     if args.csv:
         path = blotter.export_csv(records, filepath=args.csv)
         print(f"  Exported {len(records)} rows → {path}\n")
 
 
+def cmd_search(args, blotter: Blotter) -> None:
+    """Search parent trades or legs with any combination of filters."""
+    mode = "legs" if args.legs else "trades"
+    filters = _active_filters(args)
+    if filters:
+        print(f"\n  search ({mode}): {', '.join(filters)}  [limit {args.limit}]")
+    else:
+        print(f"\n  search ({mode}): no filters (latest {args.limit} rows)")
+
+    if args.legs:
+        records = _query_legs_from_args(blotter, args)
+        _print_legs(records)
+    else:
+        records = _query_trades_from_args(blotter, args)
+        _print_trades(records)
+
+    if args.csv:
+        path = blotter.export_csv(records, filepath=args.csv)
+        print(f"  Exported {len(records)} rows → {path}\n")
+
+
 def cmd_legs(args, blotter: Blotter) -> None:
-    records = blotter.query_legs(
-        parent_trade_id=args.trade_id,
-        ticker=args.ticker,
-        trade_type=args.trade_type,
-        status=args.status,
-        days=args.days,
-        limit=args.limit,
-    )
+    records = _query_legs_from_args(blotter, args)
     _print_legs(records)
     if args.csv:
         path = blotter.export_csv(records, filepath=args.csv)
@@ -377,16 +446,29 @@ def cmd_detail(args, blotter: Blotter) -> None:
 
 # ── CLI wiring ────────────────────────────────────────────────────────────────
 
-def _add_filter_args(p):
-    p.add_argument("--status",    default=None)
+def _add_filter_args(p, *, default_limit: int = 200):
+    p.add_argument("--status",    default=None,
+                   help="open | closed | settled | stopped | …")
     p.add_argument("--category",  default=None)
-    p.add_argument("--strategy",  default=None)
+    p.add_argument("--strategy",  default=None,
+                   help="Substring match on strategy name")
     p.add_argument("--ticker",    default=None)
+    p.add_argument("--trade-id",  default=None, metavar="T-NNNN",
+                   help="Exact parent trade id")
+    p.add_argument("--resolution", default=None, choices=["yes", "no", "void"],
+                   help="Market resolution (settled trades)")
     p.add_argument("--from",      dest="from_date", default=None, metavar="YYYY-MM-DD")
     p.add_argument("--to",        dest="to_date",   default=None, metavar="YYYY-MM-DD")
-    p.add_argument("--days",      type=int, default=None)
-    p.add_argument("--limit",     type=int, default=200)
+    p.add_argument("--days",      type=int, default=None,
+                   help="Last N days (alternative to --from/--to)")
+    p.add_argument("--limit",     type=int, default=default_limit)
     p.add_argument("--csv",       default=None, metavar="FILE.csv")
+
+
+def _add_leg_filter_args(p):
+    """Extra filters for legs / search --legs."""
+    p.add_argument("--trade-type", default=None,
+                   help="entry | hedge | stop_loss | leg_1 | leg_2 | manual")
 
 
 parser = argparse.ArgumentParser(
@@ -400,15 +482,22 @@ sub = parser.add_subparsers(dest="cmd", required=True)
 p_t = sub.add_parser("trades", help="Query trade history")
 _add_filter_args(p_t)
 
+# search — unified filter interface for trades or legs
+p_search = sub.add_parser(
+    "search",
+    help="Search trades or legs using any combination of filters",
+)
+p_search.add_argument(
+    "--legs", action="store_true",
+    help="Search leg (fill) rows instead of parent trades",
+)
+_add_filter_args(p_search)
+_add_leg_filter_args(p_search)
+
 # legs
 p_l = sub.add_parser("legs", help="Query individual fill legs")
-p_l.add_argument("--trade-id",   default=None)
-p_l.add_argument("--ticker",     default=None)
-p_l.add_argument("--trade-type", default=None)
-p_l.add_argument("--status",     default=None)
-p_l.add_argument("--days",       type=int, default=None)
-p_l.add_argument("--limit",      type=int, default=500)
-p_l.add_argument("--csv",        default=None)
+_add_filter_args(p_l, default_limit=500)
+_add_leg_filter_args(p_l)
 
 # pnl-by-strategy
 p_s = sub.add_parser("pnl-by-strategy", help="P&L breakdown by strategy")
@@ -461,6 +550,7 @@ if __name__ == "__main__":
     print(f"[blotter] ENV={config.ENV}  DB={config.DB_PATH}")
 
     if args.cmd == "trades":           cmd_trades(args, blotter)
+    elif args.cmd == "search":         cmd_search(args, blotter)
     elif args.cmd == "legs":           cmd_legs(args, blotter)
     elif args.cmd == "pnl-by-strategy": cmd_pnl_by_strategy(args, blotter)
     elif args.cmd == "pnl-by-category": cmd_pnl_by_category(args, blotter)

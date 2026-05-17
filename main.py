@@ -96,6 +96,7 @@ _shutdown_event = asyncio.Event()
 # Maps each market to its currently open logical trade so every fill
 # is linked to the correct blotter parent row.
 _active_trades: dict[str, str] = {}
+_max_concurrent_positions: int = 0
 
 
 # ── Tick callback ─────────────────────────────────────────────────────────────
@@ -112,11 +113,31 @@ async def on_tick(tick: dict[str, Any]) -> None:
              → alert_manager.register_order()
     """
     global _strategy, _circuit_breaker, _execution, _store, _blotter
-    global _active_trades, _alert_manager
+    global _active_trades, _alert_manager, _max_concurrent_positions
 
     signal_obj = _strategy.evaluate(tick)
     if signal_obj is None:
         return
+
+    meta = signal_obj.meta or {}
+    phase = meta.get("phase", "entry")
+    if (
+        _max_concurrent_positions > 0
+        and phase in ("entry", "leg_1")
+    ):
+        from strategy.position_limits import count_open_positions
+
+        open_count = count_open_positions(
+            _strategy, exclude_ticker=signal_obj.ticker
+        )
+        if open_count >= _max_concurrent_positions:
+            logger.info(
+                "Skipping entry — max concurrent positions reached",
+                ticker=signal_obj.ticker,
+                open_count=open_count,
+                max_concurrent=_max_concurrent_positions,
+            )
+            return
 
     # Record signal intent (for fill-rate tracking)
     _store.record_signal({
@@ -141,7 +162,6 @@ async def on_tick(tick: dict[str, Any]) -> None:
         return
 
     # Determine trade_type from signal metadata
-    meta       = signal_obj.meta or {}
     phase      = meta.get("phase", "entry")      # "entry"|"hedge"|"stop_loss"
     arb_leg    = meta.get("leg_number")          # 1|2|None
     trade_type = f"leg_{arb_leg}" if arb_leg else phase
@@ -209,6 +229,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
 # ── Fill confirmed (WebSocket) ────────────────────────────────────────────────
 
 def on_fill_received(fill: dict[str, Any]) -> None:
+    global _active_trades
     """
     Called when a confirmed fill arrives via the WebSocket ``fill`` channel.
 
@@ -220,6 +241,16 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
     if _strategy:
         _strategy.on_fill(fill)
+
+    if _strategy and _blotter and ticker:
+        from strategy.green_up_strategy import GreenUpStrategy, PositionState
+
+        if isinstance(_strategy, GreenUpStrategy):
+            pos = _strategy.get_position(ticker)
+            if pos and pos.state in (PositionState.HEDGED, PositionState.STOPPED):
+                trade_id = _active_trades.pop(ticker, None)
+                if trade_id:
+                    _blotter.close_trade(trade_id, notes=pos.state.value)
 
     if _execution:
         _execution.record_fill(fill)
@@ -319,6 +350,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Green-up: stop if YES bid falls this fraction below entry (default 0.40)",
     )
     parser.add_argument(
+        "--max-concurrent-positions",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Max simultaneous open/pending positions per strategy "
+            "(0=unlimited; env KALSHI_MAX_CONCURRENT_POSITIONS)"
+        ),
+    )
+    parser.add_argument(
+        "--gu-entry-mode",
+        default=None,
+        choices=[
+            "passive", "cross_spread", "market",
+            "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+        ],
+        help=(
+            "Green-up: entry order pricing — market (IOC) or limit at bid/ask "
+            "(env KALSHI_GREEN_UP_ENTRY_MODE)"
+        ),
+    )
+    parser.add_argument(
+        "--gu-exit-mode",
+        default=None,
+        choices=[
+            "passive", "cross_spread", "market",
+            "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+        ],
+        help=(
+            "Green-up: hedge/stop order pricing on buy-NO legs "
+            "(env KALSHI_GREEN_UP_EXIT_MODE)"
+        ),
+    )
+    parser.add_argument(
         "--comp-pairs",
         nargs="*",
         metavar="T1:T2",
@@ -340,10 +405,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hp-entry-mode",
         default=None,
         choices=[
-            "market", "limit_at_ask", "limit_at_bid",
-            "limit_at_mid", "limit_offset",
+            "passive", "cross_spread", "market",
+            "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
         ],
-        help="High-prob: how to price entries",
+        help="High-prob: how to price entries (default passive)",
+    )
+    parser.add_argument(
+        "--hp-exit-mode",
+        default=None,
+        choices=[
+            "passive", "cross_spread", "market",
+            "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+        ],
+        help="High-prob: how to price exits (default passive)",
     )
     parser.add_argument(
         "--hp-post-fill",
@@ -453,8 +527,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--discover-rank-by",
         default=None,
-        choices=["volume", "fee_adjusted_roi"],
-        help="Rank discovered markets by volume or fee-adjusted ROI",
+        choices=["volume", "fee_adjusted_roi", "screener"],
+        help=(
+            "Rank discovered markets by volume, fee-adjusted ROI, or "
+            "strategy screener score (uses --strategy fit)"
+        ),
     )
     parser.add_argument(
         "--discover-min-fee-roi",
@@ -526,6 +603,8 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
     if activity is not None and not args.discover_full_scan:
         full_scan = True
 
+    rank_by = args.discover_rank_by or "volume"
+
     criteria = TickerCriteria(
         category=category,
         top_n=_pick(args.discover_top, env.top_n if env else None, 10),
@@ -539,7 +618,8 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
         max_spread=args.discover_max_spread if args.discover_max_spread is not None
         else (env.max_spread if env else None),
         min_fee_adjusted_roi_pct=args.discover_min_fee_roi,
-        rank_by=args.discover_rank_by or "volume",
+        rank_by=rank_by,
+        screener_strategy=args.strategy,
         activity_hours=activity,
         full_scan=full_scan,
         tradeable_only=not args.discover_no_tradeable_filter
@@ -616,9 +696,16 @@ async def main(args: argparse.Namespace | None = None) -> None:
     global _ingestor, _execution, _strategy, _circuit_breaker
     global _store, _blotter, _settlement_watcher
     global _portfolio_monitor, _alert_manager, _session_monitor
+    global _max_concurrent_positions
 
     if args is None:
         args = parse_args()
+
+    _max_concurrent_positions = (
+        args.max_concurrent_positions
+        if args.max_concurrent_positions is not None
+        else config.MAX_CONCURRENT_POSITIONS
+    )
 
     tickers = await _resolve_tickers(args)
     if not tickers:
@@ -651,12 +738,15 @@ async def main(args: argparse.Namespace | None = None) -> None:
             hedge_trigger=args.hedge_trigger,
             hedge_mode=args.hedge_mode,
             stop_loss=args.stop_loss,
+            gu_entry_mode=args.gu_entry_mode,
+            gu_exit_mode=args.gu_exit_mode,
             comp_pairs=comp_pairs,
             hp_min_yes_ask=args.hp_min_yes_ask,
             hp_max_yes_ask=args.hp_max_yes_ask,
             hp_entry_mode=args.hp_entry_mode,
             hp_post_fill=args.hp_post_fill,
             hp_stake_cents=args.hp_stake_cents,
+            hp_exit_mode=args.hp_exit_mode,
         )
     except ValueError as exc:
         logger.error(str(exc))
@@ -764,6 +854,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
         fee_per_contract_cents=config.FEE_PER_CONTRACT_CENTS,
         alert_interval_seconds=ALERT_INTERVAL_SECONDS,
         monitor_interval_seconds=monitor_interval,
+        max_concurrent_positions=_max_concurrent_positions,
     )
     if args.strategy == "green_up":
         from strategy.green_up_strategy import GreenUpStrategy
@@ -774,6 +865,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
                 hedge_trigger_cents=_strategy._hedge_trigger_price,
                 hedge_mode=_strategy._hedge_mode.value,
                 stop_loss_threshold=_strategy._stop_loss_threshold,
+                entry_price_mode=_strategy._entry_price_mode.value,
+                exit_price_mode=_strategy._exit_price_mode.value,
             )
     logger.info("Kalshi trading bot started", **startup_kw)
 

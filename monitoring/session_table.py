@@ -35,7 +35,7 @@ def _pnl_str(usd: float) -> str:
 
 
 def _action_hint(state: str, bid: int | None, hedge_at: int, stop_at: int, entry_max: int) -> str:
-    if state == "watching":
+    if state in ("scanning", "watching"):
         if bid is not None and bid >= hedge_at:
             return "hedge trigger met"
         return f"watch entry (<={entry_max}c ask)"

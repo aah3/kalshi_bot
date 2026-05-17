@@ -11,11 +11,10 @@ Typical profile:
   - ROI if YES wins: (100 - ask) / ask
 
 Entry price modes (EntryPriceMode):
-  - MARKET          — market order, fill at best available ask
-  - LIMIT_AT_ASK    — aggressive limit at best ask (crosses spread)
-  - LIMIT_AT_BID    — passive limit at best bid (rests, maker-friendly)
-  - LIMIT_AT_MID    — limit at mid-price
-  - LIMIT_OFFSET    — limit at best_bid + limit_offset_cents
+  - passive         — buy at bid, sell at ask (default, maker-friendly)
+  - cross_spread    — buy at ask, sell at bid (aggressive limit)
+  - market          — IOC market order
+  - limit_at_ask / limit_at_bid / limit_at_mid / limit_offset — explicit overrides
 
 Post-fill behaviour (PostFillMode):
   - HOLD_TO_SETTLEMENT     — keep position until market resolves
@@ -45,6 +44,15 @@ from discovery.market_math import (
 )
 from logging_.structured_logger import logger
 from strategy.base_strategy import BaseStrategy, Side, Signal
+from strategy.execution_price import (
+    EntryPriceMode,
+    execution_meta,
+    resolve_yes_buy,
+    resolve_yes_sell,
+)
+
+# Re-export for tests and callers that imported from this module.
+__all__ = ["EntryPriceMode", "HighProbStrategy", "PostFillMode"]
 
 
 # ── Defaults (overridable via constructor or env in factory) ─────────────────
@@ -58,14 +66,6 @@ DEFAULT_TAKE_PROFIT_OFFSET: int    = 3     # sell YES at entry + N cents
 DEFAULT_TAKE_PROFIT_PRICE: int     = 99    # hard cap for resting TP
 DEFAULT_STOP_LOSS_PCT: float       = 0.12  # exit if bid falls 12% below entry
 DEFAULT_LIMIT_OFFSET: int          = 0     # for LIMIT_OFFSET mode
-
-
-class EntryPriceMode(str, Enum):
-    MARKET       = "market"
-    LIMIT_AT_ASK = "limit_at_ask"
-    LIMIT_AT_BID = "limit_at_bid"
-    LIMIT_AT_MID = "limit_at_mid"
-    LIMIT_OFFSET = "limit_offset"
 
 
 class PostFillMode(str, Enum):
@@ -99,38 +99,6 @@ class HighProbPosition:
     entered_at: float = field(default_factory=time.monotonic)
 
 
-def _resolve_entry_price(
-    mode: EntryPriceMode,
-    best_bid: int,
-    best_ask: int,
-    limit_offset: int,
-) -> tuple[int, str, str]:
-    """
-    Compute limit price and execution hints for an entry.
-
-    Returns:
-        (limit_price_cents, order_type, time_in_force)
-    """
-    mid = (best_bid + best_ask) // 2
-
-    if mode == EntryPriceMode.MARKET:
-        return best_ask, "market", "ioc"
-
-    if mode == EntryPriceMode.LIMIT_AT_ASK:
-        return best_ask, "limit", "ioc"
-
-    if mode == EntryPriceMode.LIMIT_AT_BID:
-        return best_bid, "limit", "gtc"
-
-    if mode == EntryPriceMode.LIMIT_AT_MID:
-        return mid, "limit", "gtc"
-
-    # LIMIT_OFFSET
-    price = max(1, min(99, best_bid + limit_offset))
-    tif = "gtc" if price <= best_bid else "ioc"
-    return price, "limit", tif
-
-
 class HighProbStrategy(BaseStrategy):
     """
     Buy YES on contracts where implied probability is high and payout is modest.
@@ -146,7 +114,8 @@ class HighProbStrategy(BaseStrategy):
         min_roi_pct: float = DEFAULT_MIN_ROI_PCT,
         max_spread_cents: int = DEFAULT_MAX_SPREAD_CENTS,
         stake_cents: int = DEFAULT_STAKE_CENTS,
-        entry_price_mode: EntryPriceMode = EntryPriceMode.LIMIT_AT_ASK,
+        entry_price_mode: EntryPriceMode = EntryPriceMode.PASSIVE,
+        exit_price_mode: EntryPriceMode = EntryPriceMode.PASSIVE,
         limit_offset_cents: int = DEFAULT_LIMIT_OFFSET,
         post_fill_mode: PostFillMode = PostFillMode.HOLD_TO_SETTLEMENT,
         take_profit_offset_cents: int = DEFAULT_TAKE_PROFIT_OFFSET,
@@ -160,15 +129,17 @@ class HighProbStrategy(BaseStrategy):
         self._max_spread = max_spread_cents
         self._stake_cents = stake_cents
         self._entry_mode = entry_price_mode
+        self._exit_mode = exit_price_mode
         self._limit_offset = limit_offset_cents
         self._post_fill_mode = post_fill_mode
         self._tp_offset = take_profit_offset_cents
         self._tp_cap = take_profit_price_cap
         self._stop_loss_pct = stop_loss_pct
         self._require_model_edge = require_model_edge
+        assume_rt = getattr(config, "HP_ASSUME_ROUND_TRIP_FEES", False)
         self._round_trip_fees = (
-            config.HP_ASSUME_ROUND_TRIP_FEES
-            if config.HP_ASSUME_ROUND_TRIP_FEES
+            assume_rt
+            if assume_rt
             else round_trip_fees_for_post_fill(post_fill_mode.value)
         )
 
@@ -309,7 +280,7 @@ class HighProbStrategy(BaseStrategy):
         else:
             edge_to_vig = edge / vig_proxy if vig_proxy > 0 else 0.0
 
-        limit_price, order_type, tif = _resolve_entry_price(
+        limit_price, order_type, tif = resolve_yes_buy(
             self._entry_mode, best_bid, best_ask, self._limit_offset,
         )
 
@@ -348,16 +319,18 @@ class HighProbStrategy(BaseStrategy):
             confidence=confidence,
             strategy=self.name,
             meta={
-                "phase":              "entry",
-                "order_type":         order_type,
-                "action":             "buy",
-                "time_in_force":      tif,
+                **execution_meta(
+                    order_type=order_type,
+                    time_in_force=tif,
+                    price_mode=self._entry_mode.value,
+                    phase="entry",
+                ),
                 "entry_price_mode":   self._entry_mode.value,
                 "post_fill_mode":     self._post_fill_mode.value,
                 "implied_prob":       round(market_prob, 4),
                 "roi_if_win_pct":     round(applied_roi, 2),
                 "gross_roi_if_win_pct": round(gross_roi, 2),
-                "fee_adjusted_roi":   config.HP_USE_FEE_ADJUSTED_ROI,
+                "fee_adjusted_roi":   getattr(config, "HP_USE_FEE_ADJUSTED_ROI", True),
                 "round_trip_fees":    self._round_trip_fees,
                 "payout_per_contract_cents": payout_cents,
                 "model_prob":         model_prob,
@@ -389,26 +362,44 @@ class HighProbStrategy(BaseStrategy):
             PostFillMode.TAKE_PROFIT_AND_STOP,
         )
 
-        # Resting take-profit: sell YES at target (passive)
+        best_ask = tick.get("best_ask")
+        if best_ask is None:
+            return None
+
+        # Resting take-profit: sell YES at target (passive by default)
         if emit_tp and not pos.tp_order_sent:
+            tp_price = pos.take_profit_price
+            _, order_type, tif = resolve_yes_sell(
+                self._exit_mode, best_bid, best_ask, self._limit_offset,
+            )
+            if self._exit_mode == EntryPriceMode.PASSIVE:
+                tp_price = max(tp_price, best_ask)
             return self._exit_signal(
                 pos,
-                limit_price=pos.take_profit_price,
-                order_type="limit",
-                time_in_force="gtc",
+                limit_price=tp_price,
+                order_type=order_type,
+                time_in_force=tif,
                 phase="exit",
                 reason="resting_take_profit",
                 spread=spread,
                 mark_tp_sent=True,
             )
 
-        # Stop: sell when bid breaches trigger (aggressive)
+        # Stop: sell when bid breaches trigger
         if emit_stop and not pos.stop_order_sent and best_bid <= pos.stop_loss_trigger:
+            stop_mode = (
+                EntryPriceMode.CROSS_SPREAD
+                if self._exit_mode == EntryPriceMode.PASSIVE
+                else self._exit_mode
+            )
+            limit_price, order_type, tif = resolve_yes_sell(
+                stop_mode, best_bid, best_ask, self._limit_offset,
+            )
             return self._exit_signal(
                 pos,
-                limit_price=best_bid,
-                order_type="limit",
-                time_in_force="ioc",
+                limit_price=limit_price,
+                order_type=order_type,
+                time_in_force=tif,
                 phase="stop_loss",
                 reason="stop_loss",
                 spread=spread,
