@@ -403,6 +403,7 @@ class AlertManager:
         return [
             {
                 "alert_type": k[0].value,
+                "ticker":     k[1] if len(k) > 1 else "",
                 "key":        k[1],
                 "fired_ago_seconds": round(now - v, 0),
             }

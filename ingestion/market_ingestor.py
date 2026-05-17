@@ -22,6 +22,11 @@ import websockets
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import config
+from discovery.orderbook_parse import (
+    _dollars_to_cents,
+    _parse_fp_levels,
+    _yes_asks_from_no_bids,
+)
 from logging_.structured_logger import logger
 
 
@@ -83,6 +88,65 @@ class OrderBook:
         else:
             book[price] = new_qty
         self.updated_at_us = int(time.time() * 1_000_000)
+
+    def load_ws_snapshot(self, data: dict[str, Any]) -> bool:
+        """
+        Populate from a Kalshi ``orderbook_snapshot`` WebSocket payload.
+
+        Supports current ``yes_dollars_fp`` / ``no_dollars_fp`` arrays and the
+        legacy nested ``yes`` / ``no`` bid-ask objects.
+        """
+        self.yes_bids.clear()
+        self.yes_asks.clear()
+
+        yes_fp = data.get("yes_dollars_fp")
+        no_fp  = data.get("no_dollars_fp")
+        if yes_fp is not None or no_fp is not None:
+            for price, qty in _parse_fp_levels(yes_fp or []):
+                self.yes_bids[price] = qty
+            for price, qty in _yes_asks_from_no_bids(_parse_fp_levels(no_fp or [])):
+                self.yes_asks[price] = qty
+        else:
+            yes = data.get("yes")
+            if isinstance(yes, dict):
+                for level in yes.get("bids", []):
+                    self.yes_bids[int(level["price"])] = int(level["quantity"])
+                for level in yes.get("asks", []):
+                    self.yes_asks[int(level["price"])] = int(level["quantity"])
+
+        self.updated_at_us = int(time.time() * 1_000_000)
+        return bool(self.yes_bids or self.yes_asks)
+
+    def apply_ws_delta(self, data: dict[str, Any]) -> bool:
+        """
+        Apply one Kalshi ``orderbook_delta`` message (single-level or legacy batch).
+        """
+        deltas = data.get("deltas")
+        if deltas:
+            for delta in deltas:
+                self.apply_delta(
+                    side=delta["side"],
+                    price=int(delta["price"]),
+                    delta=int(delta["delta"]),
+                )
+            return True
+
+        price_dollars = data.get("price_dollars")
+        delta_fp      = data.get("delta_fp")
+        side          = (data.get("side") or "").lower()
+        if price_dollars is None or delta_fp is None or not side:
+            return False
+
+        price_c = _dollars_to_cents(price_dollars)
+        qty_delta = int(round(float(delta_fp)))
+
+        if side == "yes":
+            self.apply_delta("yes_bid", price_c, qty_delta)
+        elif side == "no":
+            self.apply_delta("yes_ask", 100 - price_c, qty_delta)
+        else:
+            return False
+        return True
 
     def snapshot(self) -> dict[str, Any]:
         """Return a serialisable point-in-time snapshot of this book."""
@@ -276,15 +340,9 @@ class MarketIngestor:
         if not book:
             return
 
-        book.yes_bids.clear()
-        book.yes_asks.clear()
+        if not book.load_ws_snapshot(data):
+            return
 
-        for level in data.get("yes", {}).get("bids", []):
-            book.yes_bids[level["price"]] = level["quantity"]
-        for level in data.get("yes", {}).get("asks", []):
-            book.yes_asks[level["price"]] = level["quantity"]
-
-        book.updated_at_us = int(time.time() * 1_000_000)
         self._emit_tick(book, event_type="snapshot")
 
     def _apply_delta(self, data: dict) -> None:
@@ -293,12 +351,8 @@ class MarketIngestor:
         if not book:
             return
 
-        for delta in data.get("deltas", []):
-            book.apply_delta(
-                side=delta["side"],
-                price=delta["price"],
-                delta=delta["delta"],
-            )
+        if not book.apply_ws_delta(data):
+            return
 
         self._emit_tick(book, event_type="delta")
 
