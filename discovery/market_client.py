@@ -23,6 +23,8 @@ Kalshi REST endpoints used
   GET /markets/{ticker}/orderbook    → current order book snapshot
   GET /markets/{ticker}/history      → candlestick price history
   GET /series                        → all series (broader than events)
+  GET /search/tags_by_categories     → tags (subcategories) per category
+  GET /search/filters_by_sport       → sports, leagues, and scopes
 """
 
 import asyncio
@@ -231,6 +233,55 @@ class MarketClient:
         data = await self._get("/series")
         return data.get("series", [])
 
+    async def get_tags_by_categories(self) -> dict[str, list[str]]:
+        """
+        Return Kalshi's category → tag (subcategory) mapping.
+
+        Tags are used to filter series and events within a category, e.g.
+        Sports → Soccer, Tennis, Hockey.
+        """
+        data = await self._get("/search/tags_by_categories")
+        raw = data.get("tags_by_categories", {})
+        return {
+            cat: [t for t in (tags or []) if t]
+            for cat, tags in raw.items()
+            if tags
+        }
+
+    async def get_tags_for_category(self, category: str) -> list[str]:
+        """Sorted tags (subcategories) for one category, case-insensitive."""
+        mapping = await self.get_tags_by_categories()
+        cat_lc = category.lower()
+        for name, tags in mapping.items():
+            if name.lower() == cat_lc:
+                return sorted(tags)
+        return []
+
+    async def get_sports_filters(self) -> dict[str, Any]:
+        """
+        Sports-specific filters: sport → {competitions, scopes}.
+
+        Competitions are leagues (e.g. EPL, Champions League); scopes are
+        market types (e.g. Games, Futures).
+        """
+        data = await self._get("/search/filters_by_sport")
+        return {
+            "filters_by_sports": data.get("filters_by_sports", {}),
+            "sport_ordering": data.get("sport_ordering", []),
+        }
+
+    async def get_series_for_category(
+        self,
+        category: str,
+        tag: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Series in a category, optionally filtered by tag (subcategory)."""
+        params: dict[str, Any] = {"category": category}
+        if tag:
+            params["tags"] = tag
+        data = await self._get("/series", params=params)
+        return data.get("series", [])
+
     # ── Market listing ────────────────────────────────────────────────────────
 
     async def get_markets_by_category(
@@ -241,6 +292,10 @@ class MarketClient:
         min_volume_24h: int = 0,
         activity_hours: float | None = None,
         full_scan: bool = False,
+        tag: str | None = None,
+        sport: str | None = None,
+        competition: str | None = None,
+        scope: str | None = None,
     ) -> list[MarketSummary]:
         """
         Fetch open markets in a given category.
@@ -257,8 +312,32 @@ class MarketClient:
                 expose a native 2h volume field on list endpoints).
             full_scan: Paginate through all open events before ranking, so
                 high-volume markets are not missed due to early stopping.
+            tag: Subcategory tag (e.g. Soccer, Tennis). Filters by series tags.
+            sport: Alias for tag on Sports markets (same values as tags).
+            competition: League/competition id on event product_metadata
+                (e.g. EPL, Champions League). Use with Sports + sport/tag.
+            scope: Competition scope (e.g. Games, Futures) from product_metadata.
         """
         category_lc = category.lower()
+        tag_filter = (tag or sport or "").strip() or None
+        competition_lc = competition.strip().lower() if competition else None
+        scope_lc = self._normalize_scope(scope) if scope else None
+
+        if tag_filter or competition_lc or scope_lc:
+            full_scan = True
+
+        series_tickers: set[str] | None = None
+        if tag_filter:
+            series_list = await self.get_series_for_category(category, tag=tag_filter)
+            series_tickers = {s["ticker"] for s in series_list if s.get("ticker")}
+            if not series_tickers:
+                logger.warning(
+                    "No series found for category tag",
+                    category=category,
+                    tag=tag_filter,
+                )
+                return []
+
         collected: list[MarketSummary] = []
         cursor: str | None = None
         pages = 0
@@ -282,6 +361,13 @@ class MarketClient:
 
             for event in batch:
                 if (event.get("category") or "").lower() != category_lc:
+                    continue
+                if series_tickers is not None:
+                    if event.get("series_ticker", "") not in series_tickers:
+                        continue
+                if not self._event_matches_competition_filters(
+                    event, competition_lc, scope_lc
+                ):
                     continue
                 events_matched += 1
                 series_tk = event.get("series_ticker", "")
@@ -313,6 +399,9 @@ class MarketClient:
         logger.info(
             "Fetched markets by category",
             category=category,
+            tag=tag_filter,
+            competition=competition,
+            scope=scope,
             pages_scanned=pages,
             events_matched=events_matched,
             matched=len(collected),
@@ -511,6 +600,35 @@ class MarketClient:
         raise RuntimeError("unreachable")  # pragma: no cover
 
     # ── Parsing ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _event_matches_competition_filters(
+        event: dict[str, Any],
+        competition_lc: str | None,
+        scope_lc: str | None,
+    ) -> bool:
+        """Filter Sports events by league (competition) and scope in product_metadata."""
+        if not competition_lc and not scope_lc:
+            return True
+        meta = event.get("product_metadata") or {}
+        if competition_lc:
+            comp = (meta.get("competition") or "").lower()
+            if comp != competition_lc:
+                return False
+        if scope_lc:
+            want = MarketClient._normalize_scope(scope_lc)
+            ev_scope = MarketClient._normalize_scope(meta.get("competition_scope") or "")
+            if ev_scope != want:
+                return False
+        return True
+
+    @staticmethod
+    def _normalize_scope(scope: str) -> str:
+        """Normalize scope for comparison (Games ↔ Game, case-insensitive)."""
+        s = scope.strip().lower()
+        if s.endswith("s") and len(s) > 3:
+            return s[:-1]
+        return s
 
     @staticmethod
     def _matches_activity_hours(market: MarketSummary, activity_hours: float) -> bool:

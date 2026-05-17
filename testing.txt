@@ -1,5 +1,9 @@
 testing.txt
 
+# confirm bot usage
+cd c:\Users\alfredo\Project\kalshi_bot
+python -c "import config, main; print(main._load_tickers())"
+
 # 1. Clone / copy the project to your IDE
 
 # 2. Install dependencies
@@ -73,3 +77,127 @@ python tools/screen.py browse --category Politics --activity-hours 2 --min-volum
 
 python tools/screen.py browse --category Sports --activity-hours 2 --min-volume 50 --full-scan
 
+
+# High Probability Strategy
+# Screen for candidates
+python tools/screen.py screen --category Politics
+
+# Run bot — passive entry, resting take-profit after fill
+python main.py --strategy high_prob \
+  --tickers YOUR-TICKER \
+  --hp-min-yes-ask 88 \
+  --hp-entry-mode limit_at_bid \
+  --hp-post-fill resting_take_profit
+
+or via .env file:
+
+KALSHI_STRATEGY=high_prob
+KALSHI_HP_MIN_YES_ASK=85
+KALSHI_HP_MAX_YES_ASK=97
+KALSHI_HP_ENTRY_MODE=limit_at_ask
+KALSHI_HP_POST_FILL=resting_take_profit
+KALSHI_HP_STAKE_CENTS=5000
+
+python main.py --discover --discover-category Sports --discover-min-yes-ask 85 --discover-max-yes-ask 97 --strategy high_prob --hp-entry-mode market
+
+# Discovery
+python main.py --discover --discover-category Politics --strategy high_prob --discover-only
+python main.py --discover --discover-category Sports --strategy high_prob --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
+
+
+# Recently touched markets (788); most have 0 24h vol → tradeable: 0 in table
+python tools/screen.py browse --category Sports --activity-hours 2 --full-scan
+
+# Liquid by 24h volume (590); many show up, 192 tradeable in top 200
+python tools/screen.py browse --category Sports --min-volume 1 --full-scan
+
+# Manual tickers: run the bot demo
+# screen: 
+python tools/screen.py screen --category Sports
+
+# after finding the ticker, run the bot demo
+export KALSHI_TICKERS="KXMLB-26-LAD"
+python main.py --strategy kelly --model-prob KXMLB-26-LAD:0.29
+
+
+"""
+  STRATEGY              SCORE  TICKER                               BID  ASK   SPREAD    VOL24H  TITLE
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [green_up          ]  1.00 ★★★★★  KXMENWORLDCUP-26-BR                  bid=  9  ask= 10  spread=  1c  vol24h=3340396  Will the Brazil win the 2026 Men's World Cup?
+  [green_up          ]  0.98 ★★★★★  KXMENWORLDCUP-26-GB                  bid= 10  ask= 11  spread=  1c  vol24h=2809306  Will the England win the 2026 Men's World Cup?
+  [green_up          ]  0.98 ★★★★★  KXPGATOP20-PGC26-SLOW                bid= 10  ask= 11  spread=  1c  vol24h=496610  PGA Championship: Will Shane Lowry finish top 20?
+"""
+# export KALSHI_TICKERS="KXPGATOP20-PGC26-SLOW"
+# set up env variables in powershell
+$env:KALSHI_TICKERS="KXPGATOP20-PGC26-SLOW"
+$env:KALSHI_TICKERS = "KXPGATOP20-PGC26-PHAR"
+$env:KALSHI_STRATEGY = "green_up"   # optional; CLI --strategy overrides
+
+cd c:\Users\alfredo\Project\kalshi_bot
+$env:PYTHONIOENCODING = "utf-8"
+
+# top categories
+python tools/screen.py --categories
+
+# sub categories
+python tools/screen.py tags --category Sports
+
+# leagues and scopes
+python tools/screen.py tags --category Sports
+
+# list competitions
+python tools/screen.py browse --category Sports --tag Soccer
+# or
+python tools/screen.py browse --category Sports --sport Tennis
+
+# by league
+python tools/screen.py browse --category Sports --sport Soccer --competition EPL
+
+python tools/screen.py browse --category Sports --sport Soccer --competition EPL --min-volume 50 --activity-hours 2
+
+# screen for strategies
+python tools/screen.py screen --category Sports --sport Soccer --competition EPL --top 30
+
+# other categories tags
+python tools/screen.py tags --category Politics
+python tools/screen.py browse --category Politics --tag Trump
+
+# Score fit (optional)
+python tools/screen.py screen --category Sports --top 30
+
+# Single-ticker detail (history 404 on demo is OK if market loads)
+python tools/screen.py browse --ticker KXPGATOP20-PGC26-PHAR
+
+# browse flag
+python tools/screen.py browse --category Sports --sport Soccer --competition EPL --tradeable-only
+
+python tools/screen.py browse --category Sports --sport Soccer --competition EPL --scope Games --tradeable-only --min-volume 50
+
+# check:
+$env:KALSHI_TICKERS = "KXMENWORLDCUP-26-BR,KXPGATOP5-PGC26-RMCI,KXPGATOP10-PGC26-SSCH,KXPGATOP20-PGC26-KREI,KXPGATOP5-PGC26-ASMA,KXPGATOP10-PGC26-NTAY,KXPGATOP20-PGC26-RFOW,KXPGATOP20-PGC26-CAME,KXPGATOP5-PGC26-SBUR,KXPGATOP20-PGC26-SBUR"
+
+$env:KALSHI_TICKERS
+
+echo $env:KALSHI_TICKERS
+
+# in DOS (cmd)
+set KALSHI_TICKERS=KXPGATOP20-PGC26-SLOW
+set KALSHI_TICKERS=KXMENWORLDCUP-26-BR,KXPGATOP5-PGC26-RMCI,KXPGATOP10-PGC26-SSCH,KXPGATOP20-PGC26-KREI,KXPGATOP5-PGC26-ASMA,KXPGATOP10-PGC26-NTAY,KXPGATOP20-PGC26-RFOW,KXPGATOP20-PGC26-CAME,KXPGATOP5-PGC26-SBUR,KXPGATOP20-PGC26-SBUR
+
+# run the bot
+python main.py --tickers "KXMENWORLDCUP-26-BR,KXPGATOP5-PGC26-RMCI,..."
+
+python main.py --strategy kelly --model-prob KXPGATOP20-PGC26-SLOW:0.1
+
+python main.py --strategy green_up --entry-max 9 --hedge-trigger 15
+# underscore aliases also work: --entry_max_price / --hedge_trigger
+
+python main.py --strategy green_up --tickers KXPGATOP20-PGC26-PHAR --entry_max 9 --hedge_trigger 15 --hedge-mode partial
+
+# buy at market price N contracts
+python tools\trade.py buy --ticker KXPGATOP20-PGC26-SLOW --side yes --count 10 --market
+
+python tools\trade.py preview --ticker KXPGATOP20-PGC26-SLOW --side yes --count 1 --market
+python tools\trade.py buy --ticker KXPGATOP20-PGC26-SLOW --side yes --count 1 --market
+
+python tools\dashboard.py --interval 15 # refresh every 15 seconds

@@ -144,6 +144,10 @@ class MarketScreener:
         category: str,
         fetch_order_books: bool = True,
         limit: int = 100,
+        tag: str | None = None,
+        sport: str | None = None,
+        competition: str | None = None,
+        scope: str | None = None,
     ) -> list[ScreenerResult]:
         """
         Screen all open markets in one category.
@@ -161,6 +165,10 @@ class MarketScreener:
             status="open",
             limit=limit,
             min_volume_24h=MIN_VOLUME_24H,
+            tag=tag,
+            sport=sport,
+            competition=competition,
+            scope=scope,
         )
         return await self._score_markets(markets, fetch_order_books)
 

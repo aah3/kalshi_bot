@@ -17,11 +17,27 @@ BROWSE COMMANDS  (find tickers and understand market economics)
   # Step 1: see all available categories
   python tools/screen.py --categories
 
+  # Subcategories (tags) within a category — e.g. Soccer, Tennis under Sports
+  python tools/screen.py tags --category Sports
+
+  # Sports leagues and scopes (EPL, Champions League, Games, Futures, …)
+  python tools/screen.py sports-filters
+  python tools/screen.py sports-filters --sport Soccer
+
   # Step 2: browse all markets in a category
   python tools/screen.py browse --category Politics
 
+  # Browse Sports by sport (tag) or league (competition)
+  python tools/screen.py browse --category Sports --tag Soccer
+  python tools/screen.py browse --category Sports --sport Tennis
+  python tools/screen.py browse --category Sports --sport Soccer --competition EPL
+  python tools/screen.py browse --category Sports --sport Soccer --competition EPL --scope Games
+
   # Browse with minimum 24h volume filter
   python tools/screen.py browse --category Economics --min-volume 500
+
+  # Hide illiquid / wide-spread / expiring markets (no ⚠ rows)
+  python tools/screen.py browse --category Sports --sport Soccer --tradeable-only
 
   # Recently active markets (updated in last 2h) + full scan so nothing hot is missed
   python tools/screen.py browse --category Politics --activity-hours 2 --full-scan
@@ -267,6 +283,42 @@ def _browse_to_csv(markets: list[MarketSummary], filepath: str) -> None:
     print(f"  Exported {len(rows)} markets → {filepath}\n")
 
 
+# ── Filter args shared by browse / screen ─────────────────────────────────────
+
+def _filter_kwargs(args) -> dict:
+    return {
+        "tag":         getattr(args, "tag", None),
+        "sport":       getattr(args, "sport", None),
+        "competition": getattr(args, "competition", None),
+        "scope":       getattr(args, "scope", None),
+    }
+
+
+def _apply_browse_filters(
+    markets: list[MarketSummary],
+    args,
+) -> list[MarketSummary]:
+    """Post-fetch filters for browse (volume applied at API layer)."""
+    if getattr(args, "tradeable_only", False):
+        markets = [m for m in markets if m.is_tradeable()]
+    return markets
+
+
+def _filter_title_suffix(args) -> str:
+    parts: list[str] = []
+    if getattr(args, "tag", None):
+        parts.append(f"tag={args.tag}")
+    if getattr(args, "sport", None):
+        parts.append(f"sport={args.sport}")
+    if getattr(args, "competition", None):
+        parts.append(f"competition={args.competition}")
+    if getattr(args, "scope", None):
+        parts.append(f"scope={args.scope}")
+    if getattr(args, "tradeable_only", False):
+        parts.append("tradeable only")
+    return f"  ({', '.join(parts)})" if parts else ""
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_categories(args) -> None:
@@ -280,7 +332,89 @@ async def cmd_categories(args) -> None:
     for i, c in enumerate(cats, 1):
         print(f"  {i:>3}.  {c}")
     print(f"\n  Total: {len(cats)} categories")
-    print(f"\n  Usage: python tools/screen.py browse --category <NAME>\n")
+    print(f"\n  Usage:")
+    print(f"    python tools/screen.py browse --category <NAME>")
+    print(f"    python tools/screen.py tags --category Sports")
+    print(f"    python tools/screen.py sports-filters\n")
+
+
+async def cmd_tags(args) -> None:
+    """List subcategory tags for a category (e.g. Soccer, Tennis under Sports)."""
+    if not args.category:
+        print("\n  Usage: python tools/screen.py tags --category Sports\n")
+        return
+
+    creds, limiter = CredentialManager(), RateLimiter()
+    async with MarketClient(creds, limiter) as client:
+        tags = await client.get_tags_for_category(args.category)
+
+    print(f"\n  Tags (subcategories) in {args.category}")
+    print(f"  {'─' * 40}")
+    if not tags:
+        print(f"  (none listed — category may use a different name on Kalshi)\n")
+        return
+    for i, t in enumerate(tags, 1):
+        print(f"  {i:>3}.  {t}")
+    print(f"\n  Total: {len(tags)} tags")
+    print(f"\n  Browse example:")
+    print(f"    python tools/screen.py browse --category {args.category} --tag {tags[0]}")
+    if args.category.lower() == "sports" and tags:
+        print(f"    python tools/screen.py sports-filters --sport {tags[0]}\n")
+    else:
+        print()
+
+
+async def cmd_sports_filters(args) -> None:
+    """List sports, leagues (competitions), and scopes for Sports browsing."""
+    creds, limiter = CredentialManager(), RateLimiter()
+    async with MarketClient(creds, limiter) as client:
+        data = await client.get_sports_filters()
+
+    filters = data.get("filters_by_sports", {})
+    ordering = data.get("sport_ordering") or sorted(
+        k for k in filters if k != "All sports"
+    )
+
+    if args.sport:
+        sport = args.sport
+        if sport not in filters:
+            # case-insensitive match
+            match = next((k for k in filters if k.lower() == sport.lower()), None)
+            if not match:
+                print(f"\n  Unknown sport: {args.sport}")
+                print(f"  Run without --sport to see available sports.\n")
+                return
+            sport = match
+        ordering = [sport]
+
+    print(f"\n  Sports filters (leagues & scopes)")
+    print(f"  {'═' * 60}")
+    for sport in ordering:
+        if sport == "All sports":
+            continue
+        detail = filters.get(sport, {})
+        scopes = detail.get("scopes") or []
+        comps = detail.get("competitions") or {}
+        print(f"\n  {sport}")
+        print(f"  {'─' * 40}")
+        if scopes:
+            print(f"  Scopes: {', '.join(scopes[:12])}" +
+                  (f" … (+{len(scopes) - 12} more)" if len(scopes) > 12 else ""))
+        if comps:
+            print(f"  Competitions ({len(comps)}):")
+            for name in sorted(comps.keys()):
+                comp_scopes = comps[name].get("scopes") or []
+                scope_hint = f"  [{', '.join(comp_scopes)}]" if comp_scopes else ""
+                print(f"    • {name}{scope_hint}")
+        print(f"\n  Browse:")
+        print(f"    python tools/screen.py browse --category Sports --sport {sport}")
+        if comps:
+            sample = sorted(comps.keys())[0]
+            print(
+                f"    python tools/screen.py browse --category Sports "
+                f"--sport {sport} --competition {sample}"
+            )
+    print()
 
 
 async def cmd_browse(args) -> None:
@@ -317,8 +451,9 @@ async def cmd_browse(args) -> None:
                 min_volume_24h=min_vol,
                 activity_hours=activity_hours,
                 full_scan=full_scan,
+                **_filter_kwargs(args),
             )
-            title = f"Category: {args.category}"
+            title = f"Category: {args.category}{_filter_title_suffix(args)}"
             if activity_hours:
                 title += f"  (active ≤{activity_hours}h)"
             if full_scan:
@@ -340,6 +475,8 @@ async def cmd_browse(args) -> None:
             print("    python tools/screen.py browse --ticker PRES-2028-DEM")
             print("    python tools/screen.py browse --all\n")
             return
+
+    markets = _apply_browse_filters(markets, args)
 
     if args.json:
         print(json.dumps([m.to_dict() for m in markets], indent=2, default=str))
@@ -378,6 +515,7 @@ async def cmd_screen(args) -> None:
             results = await screener.screen_category(
                 category=args.category,
                 fetch_order_books=not args.no_books,
+                **_filter_kwargs(args),
             )
         elif args.all:
             results = await screener.screen_all(fetch_order_books=not args.no_books)
@@ -440,11 +578,21 @@ p_browse = sub.add_parser(
     help="Browse markets — see tickers, probabilities, costs, and payouts",
 )
 p_browse.add_argument("--category",   type=str, help="Category to browse (e.g. Politics)")
+p_browse.add_argument("--tag",        type=str, help="Subcategory tag (e.g. Soccer, Tennis)")
+p_browse.add_argument("--sport",      type=str, help="Sport name (alias for --tag on Sports)")
+p_browse.add_argument("--competition", type=str, help="League id (e.g. EPL) from sports-filters")
+p_browse.add_argument("--scope",      type=str, help="Market scope (e.g. Games, Futures)")
 p_browse.add_argument("--event",      type=str, help="Event ticker to browse (e.g. PRES-2028)")
 p_browse.add_argument("--ticker",     type=str, help="Single market full detail")
 p_browse.add_argument("--all",        action="store_true", help="Browse all open markets")
 p_browse.add_argument("--min-volume", type=int, default=0,
                       help="Minimum 24h volume filter (default: 0)")
+p_browse.add_argument(
+    "--tradeable-only",
+    action="store_true",
+    help="Exclude markets marked ⚠ (open, bid/ask present, spread <20c, "
+         "volume_24h>0, closes in >5 min)",
+)
 p_browse.add_argument("--activity-hours", type=float, default=None, metavar="HOURS",
                       help="Only markets updated within HOURS (recent-activity proxy)")
 p_browse.add_argument("--full-scan", action="store_true",
@@ -459,12 +607,28 @@ p_screen = sub.add_parser(
     help="Score and rank markets for strategy fit (Kelly, Green Up, Arb)",
 )
 p_screen.add_argument("--category",  type=str)
+p_screen.add_argument("--tag",        type=str)
+p_screen.add_argument("--sport",      type=str)
+p_screen.add_argument("--competition", type=str)
+p_screen.add_argument("--scope",      type=str)
 p_screen.add_argument("--event",     type=str)
 p_screen.add_argument("--ticker",    type=str)
 p_screen.add_argument("--all",       action="store_true")
 p_screen.add_argument("--top",       type=int, default=20)
 p_screen.add_argument("--no-books",  action="store_true")
 p_screen.add_argument("--json",      action="store_true")
+
+# ── tags / sports-filters subcommands ─────────────────────────────────────────
+p_tags = sub.add_parser("tags", help="List subcategory tags for a category")
+p_tags.add_argument("--category", type=str, required=True,
+                    help="Category name (e.g. Sports)")
+
+p_sports = sub.add_parser(
+    "sports-filters",
+    help="List sports, leagues (competitions), and scopes",
+)
+p_sports.add_argument("--sport", type=str,
+                      help="Show filters for one sport only (e.g. Soccer)")
 
 # ── --categories flat flag (backward compatible) ──────────────────────────────
 parser.add_argument("--categories", action="store_true",
@@ -485,6 +649,10 @@ async def _dispatch(args) -> None:
         await cmd_browse(args)
     elif args.cmd == "screen":
         await cmd_screen(args)
+    elif args.cmd == "tags":
+        await cmd_tags(args)
+    elif args.cmd == "sports-filters":
+        await cmd_sports_filters(args)
     elif args.categories or (not args.cmd and getattr(args, "categories", False)):
         await cmd_categories(args)
     elif args.cmd is None:

@@ -285,14 +285,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="TICKER:PROB",
         help="Kelly: model P(YES) per ticker, e.g. PRES-2024-DEM:0.62",
     )
-    parser.add_argument("--entry-max",     type=int,   default=None)
-    parser.add_argument("--hedge-trigger", type=int,   default=None)
+    parser.add_argument(
+        "--entry-max",
+        "--entry_max",
+        "--entry-max-price",
+        "--entry_max_price",
+        type=int,
+        default=None,
+        dest="entry_max",
+        metavar="CENTS",
+        help="Green-up: max YES ask to enter (cents)",
+    )
+    parser.add_argument(
+        "--hedge-trigger",
+        "--hedge_trigger",
+        type=int,
+        default=None,
+        dest="hedge_trigger",
+        metavar="CENTS",
+        help="Green-up: YES bid to trigger hedge (cents)",
+    )
     parser.add_argument(
         "--hedge-mode",
         default=None,
         choices=["full_green", "stake_back", "partial"],
     )
-    parser.add_argument("--stop-loss", type=float, default=None)
+    parser.add_argument(
+        "--stop-loss",
+        "--stop_loss",
+        type=float,
+        default=None,
+        dest="stop_loss",
+        help="Green-up: stop if YES bid falls this fraction below entry (default 0.40)",
+    )
     parser.add_argument(
         "--comp-pairs",
         nargs="*",
@@ -730,8 +755,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             _session_monitor.run(), name="session_monitor"
         )
 
-    logger.info(
-        "Kalshi trading bot started",
+    startup_kw: dict = dict(
         env=config.ENV,
         strategy=_strategy.name,
         tickers=tickers,
@@ -741,6 +765,17 @@ async def main(args: argparse.Namespace | None = None) -> None:
         alert_interval_seconds=ALERT_INTERVAL_SECONDS,
         monitor_interval_seconds=monitor_interval,
     )
+    if args.strategy == "green_up":
+        from strategy.green_up_strategy import GreenUpStrategy
+
+        if isinstance(_strategy, GreenUpStrategy):
+            startup_kw.update(
+                entry_max_cents=_strategy._entry_max_price,
+                hedge_trigger_cents=_strategy._hedge_trigger_price,
+                hedge_mode=_strategy._hedge_mode.value,
+                stop_loss_threshold=_strategy._stop_loss_threshold,
+            )
+    logger.info("Kalshi trading bot started", **startup_kw)
 
     # Startup metrics from calculator
     metrics = calculator.all_metrics()

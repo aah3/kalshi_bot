@@ -680,8 +680,14 @@ p_rep.add_argument("--speed",    type=float, default=50.0,
                    help="Playback speed multiplier (0=max, default 50×)")
 p_rep.add_argument("--model-prob", nargs="*", metavar="TICKER:PROB",
                    help="Model probabilities for Kelly e.g. PRES-2024-DEM:0.62")
-p_rep.add_argument("--entry-max",     type=int,   default=25)
-p_rep.add_argument("--hedge-trigger", type=int,   default=68)
+p_rep.add_argument(
+    "--entry-max", "--entry_max", "--entry-max-price", "--entry_max_price",
+    type=int, default=25, dest="entry_max",
+)
+p_rep.add_argument(
+    "--hedge-trigger", "--hedge_trigger",
+    type=int, default=68, dest="hedge_trigger",
+)
 p_rep.add_argument("--hedge-mode",    default="full_green",
                    choices=["full_green","stake_back","partial"])
 p_rep.add_argument("--stop-loss",     type=float, default=0.40)
