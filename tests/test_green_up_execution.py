@@ -148,3 +148,46 @@ def test_select_tickers_by_screener_score():
     )
     tickers = select_tickers(markets, criteria)
     assert tickers == ["HIGH-SCORE"]
+
+
+def test_limit_offset_entry_below_bid():
+    price, order_type, tif = resolve_yes_buy(EntryPriceMode.LIMIT_OFFSET, 10, 12, -2)
+    assert price == 8 and order_type == "limit" and tif == "gtc"
+
+
+def test_max_cycles_allows_two_entries_then_stops():
+    strat = GreenUpStrategy(
+        entry_max_price=25,
+        hedge_trigger_price=68,
+        entry_price_mode=EntryPriceMode.MARKET,
+        max_cycles_per_ticker=2,
+    )
+    strat.add_watch_ticker("T3")
+    pos = strat.get_position("T3")
+    assert pos is not None
+
+    pos.state = PositionState.HEDGED
+    pos.cycles_completed = 1
+    assert strat.evaluate(_tick(8, 10, "T3")) is not None
+
+    pos = strat.get_position("T3")
+    pos.state = PositionState.HEDGED
+    pos.cycles_completed = 2
+    assert strat.evaluate(_tick(8, 10, "T3")) is None
+    assert pos.state == PositionState.CLOSED
+
+
+def test_unlimited_cycles_resets_after_hedged():
+    strat = GreenUpStrategy(
+        entry_max_price=25,
+        hedge_trigger_price=68,
+        entry_price_mode=EntryPriceMode.MARKET,
+        max_cycles_per_ticker=0,
+    )
+    strat.add_watch_ticker("T4")
+    pos = strat.get_position("T4")
+    pos.state = PositionState.HEDGED
+    pos.cycles_completed = 5
+    sig = strat.evaluate(_tick(8, 10, "T4"))
+    assert sig is not None
+    assert strat.get_position("T4").state == PositionState.WATCHING

@@ -52,7 +52,12 @@ from enum import Enum
 from typing import Any
 
 import config
-from discovery.market_client import MarketClient, MarketSummary, OrderBookSnapshot
+from discovery.market_client import (
+    CategoryFetchStats,
+    MarketClient,
+    MarketSummary,
+    OrderBookSnapshot,
+)
 from discovery.market_math import (
     fee_adjusted_roi_if_yes_wins_pct,
     gross_roi_if_yes_wins_pct,
@@ -130,6 +135,50 @@ class ScreenerResult:
 
 
 @dataclass
+class ScreenRunStats:
+    """Pipeline counts for screener empty-state messages."""
+    markets_fetched: int = 0
+    tradeable:       int = 0
+    scored:          int = 0
+    category:        str | None = None
+    event_ticker:    str | None = None
+    scope:           str = "category"   # category | event | all
+    min_volume_24h:  int = MIN_VOLUME_24H
+
+    def format_empty_hints(self) -> list[str]:
+        lines: list[str] = []
+        if self.scope == "event" and self.event_ticker:
+            lines.append(f"Event {self.event_ticker!r}: {self.markets_fetched} markets fetched.")
+        elif self.scope == "all":
+            lines.append(f"All categories: {self.markets_fetched} markets fetched.")
+        elif self.category:
+            lines.append(f"Category {self.category!r}: {self.markets_fetched} markets fetched.")
+
+        if self.markets_fetched == 0:
+            lines.append("Nothing to score — try a different category or lower API volume floor.")
+            return lines
+
+        if self.tradeable == 0:
+            lines.append(
+                f"  0 of {self.markets_fetched} are tradeable "
+                f"(need open status, bid/ask, spread <20c, vol24h >0, >5 min to close)."
+            )
+            lines.append("Try: python tools/screen.py browse --category ... (without --tradeable-only)")
+            return lines
+
+        lines.append(
+            f"  {self.tradeable} tradeable, but none scored >= {MIN_SCORE_THRESHOLD:.2f} "
+            f"for Kelly / Green Up / High Prob / Arb."
+        )
+        lines.append(
+            f"  (API fetch uses min vol24h {self.min_volume_24h:,}; "
+            f"scorers require >= {SCREENER_MIN_VOLUME_24H:,} and tighter spread/price windows.)"
+        )
+        lines.append("Try another category, or inspect candidates with browse first.")
+        return lines
+
+
+@dataclass
 class ArbitrageGroup:
     """A detected multi-market arbitrage opportunity."""
     arb_type:        StrategyFit
@@ -148,6 +197,8 @@ class MarketScreener:
 
     def __init__(self, client: MarketClient) -> None:
         self._client = client
+        self.last_fetch_stats: CategoryFetchStats | None = None
+        self.last_run_stats: ScreenRunStats | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -172,7 +223,7 @@ class MarketScreener:
         Returns:
             Ranked list of ScreenerResult, sorted by score descending.
         """
-        markets = await self._client.get_markets_by_category(
+        fetch = await self._client.get_markets_by_category(
             category=category,
             status="open",
             limit=limit,
@@ -182,7 +233,13 @@ class MarketScreener:
             competition=competition,
             scope=scope,
         )
-        return await self._score_markets(markets, fetch_order_books)
+        self.last_fetch_stats = fetch.stats
+        results = await self._score_markets(
+            fetch.markets,
+            fetch_order_books,
+            category=category,
+        )
+        return results
 
     async def screen_all(
         self,
@@ -198,7 +255,13 @@ class MarketScreener:
         markets = await self._client.get_all_open_markets(
             min_volume_24h=min_volume_24h,
         )
-        return await self._score_markets(markets, fetch_order_books)
+        self.last_fetch_stats = None
+        return await self._score_markets(
+            markets,
+            fetch_order_books,
+            scope="all",
+            min_volume_24h=min_volume_24h,
+        )
 
     async def screen_event(self, event_ticker: str) -> list[ScreenerResult]:
         """
@@ -208,7 +271,13 @@ class MarketScreener:
         in the event, since they share a common underlying.
         """
         markets = await self._client.get_event_markets(event_ticker)
-        results = await self._score_markets(markets, fetch_order_books=True)
+        self.last_fetch_stats = None
+        results = await self._score_markets(
+            markets,
+            fetch_order_books=True,
+            event_ticker=event_ticker,
+            scope="event",
+        )
 
         # Add exhaustive-set arb check across all markets in the event
         arb = self._detect_exhaustive_arb(markets)
@@ -227,6 +296,8 @@ class MarketScreener:
                 ))
 
         results.sort(key=lambda r: r.score, reverse=True)
+        if self.last_run_stats is not None:
+            self.last_run_stats.scored = len(results)
         return results
 
     async def get_market_detail(self, ticker: str) -> dict[str, Any]:
@@ -255,13 +326,27 @@ class MarketScreener:
             "strategy_hints":   self._strategy_hints(market, book),
         }
 
-    def print_report(self, results: list[ScreenerResult], top_n: int = 20) -> None:
+    def print_report(
+        self,
+        results: list[ScreenerResult],
+        top_n: int = 20,
+        *,
+        empty_hints: list[str] | None = None,
+    ) -> None:
         """Print a formatted screener report to stdout."""
+        if not results:
+            print("\n  No screener results.\n")
+            if empty_hints:
+                for line in empty_hints:
+                    print(f"  {line}")
+                print()
+            return
+
         header = (
-            f"\n{'─' * 130}\n"
+            f"\n{'-' * 130}\n"
             f"  KALSHI MARKET SCREENER  —  {len(results)} results  "
             f"(showing top {min(top_n, len(results))})\n"
-            f"{'─' * 130}"
+            f"{'-' * 130}"
         )
         print(header)
         print(
@@ -269,10 +354,10 @@ class MarketScreener:
             f"{'TICKER':<35}  {'BID':>3}  {'ASK':>3}  "
             f"{'SPREAD':>7}  {'VOL24H':>8}  TITLE"
         )
-        print(f"{'─' * 130}")
+        print(f"{'-' * 130}")
         for r in results[:top_n]:
             print(f"  {r.summary_line()}")
-        print(f"{'─' * 130}\n")
+        print(f"{'-' * 130}\n")
 
     # ── Scoring pipeline ──────────────────────────────────────────────────────
 
@@ -280,6 +365,11 @@ class MarketScreener:
         self,
         markets: list[MarketSummary],
         fetch_order_books: bool,
+        *,
+        category: str | None = None,
+        event_ticker: str | None = None,
+        scope: str = "category",
+        min_volume_24h: int = MIN_VOLUME_24H,
     ) -> list[ScreenerResult]:
         """
         Run all scorers over the market list, optionally enriching with books.
@@ -338,6 +428,15 @@ class MarketScreener:
                     ))
 
         results.sort(key=lambda r: r.score, reverse=True)
+        self.last_run_stats = ScreenRunStats(
+            markets_fetched=len(markets),
+            tradeable=len(tradeable),
+            scored=len(results),
+            category=category,
+            event_ticker=event_ticker,
+            scope=scope,
+            min_volume_24h=min_volume_24h,
+        )
         return results
 
     # ── Individual scorers ────────────────────────────────────────────────────

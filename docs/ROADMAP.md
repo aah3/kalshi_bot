@@ -1,0 +1,611 @@
+# Development roadmap — demo certification → production micro-pilot
+
+Goal: a **reliable demo environment for all four strategies** (`kelly`, `green_up`, `high_prob`, `arb`), then production testing at **$1 max per market** (`KALSHI_PROD_MAX_POSITION_CENTS=100`). New features ship only on top of a working, certified baseline.
+
+Switch environments by changing **one variable**: `KALSHI_ENV=demo` or `KALSHI_ENV=production`. Risk limits, database, and log files follow automatically (see [Environment profiles](#environment-profiles)).
+
+---
+
+## Environment profiles
+
+### How to switch
+
+In `.env` (copy from `.env.example`):
+
+```env
+# Demo (paper) — default
+KALSHI_ENV=demo
+
+# Production (real money) — only when checklist is complete
+# KALSHI_ENV=production
+```
+
+Restart the bot after changing `KALSHI_ENV`. On startup, `config.py` prints:
+
+- API base URL (demo vs prod)
+- Which API key pair is loaded
+- Active **risk profile** (max position, daily loss, DB path, log file)
+
+### Per-environment variables (recommended)
+
+Set **both** profiles in `.env` once; toggle with `KALSHI_ENV` only:
+
+| Variable | Demo (suggested) | Prod (suggested) |
+|----------|------------------|------------------|
+| `KALSHI_DEMO_MAX_POSITION_CENTS` | `10000` ($100) | — |
+| `KALSHI_PROD_MAX_POSITION_CENTS` | — | `100` ($1) |
+| `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS` | `50000` ($500) | — |
+| `KALSHI_PROD_DAILY_LOSS_LIMIT_CENTS` | — | `500` ($5) |
+| `KALSHI_DEMO_MAX_DRAWDOWN_PCT` | `0.10` | — |
+| `KALSHI_PROD_MAX_DRAWDOWN_PCT` | — | `0.05` |
+| `KALSHI_DEMO_MAX_CONCURRENT_POSITIONS` | `5` | — |
+| `KALSHI_PROD_MAX_CONCURRENT_POSITIONS` | — | `1` |
+| `KALSHI_DEMO_DB_PATH` | `kalshi_bot_demo.db` | — |
+| `KALSHI_PROD_DB_PATH` | — | `kalshi_bot_prod.db` |
+| `KALSHI_DEMO_LOG_FILE` | `kalshi_bot_demo.jsonl` | — |
+| `KALSHI_PROD_LOG_FILE` | — | `kalshi_bot_prod.jsonl` |
+
+Generic keys (`KALSHI_MAX_POSITION_CENTS`, `KALSHI_DB_PATH`, …) apply when no `KALSHI_DEMO_*` / `KALSHI_PROD_*` value is set for that field.
+
+### Verify before each run
+
+```bash
+python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"
+```
+
+Expect `demo` and `10000` during certification; expect `production` and `100` only for the micro-pilot.
+
+---
+
+## Definition of done (demo)
+
+Before any production run, every strategy must pass:
+
+| # | Criterion | Verification |
+|---|-----------|--------------|
+| 1 | Discover → WS tick → signal → order → fill → blotter | Session log + `blotter.py detail` |
+| 2 | Exchange matches bot | `tools/trade.py portfolio` vs blotter legs |
+| 3 | Live gates | No entries on stale books (unless `--no-live-only` test) |
+| 4 | SIGINT shutdown | Ctrl+C → resting orders cancelled, clean exit |
+| 5 | Circuit breaker | Demo test with low `KALSHI_DEMO_MAX_DRAWDOWN_PCT=0.01` |
+| 6 | Automated tests | `python -m pytest tests/ -v` all green |
+
+---
+
+## How to read this plan
+
+- **“Run bot 30 min”** means leave `main.py` connected to Kalshi demo for ~30 minutes, then stop it — not a special mode or timer flag.
+- **“30 min” in live gates** (`KALSHI_LIVE_MAX_BOOK_STALE_MINUTES`) is different: it is the max age of a WebSocket order book before the bot blocks *new entries*. Week 1 step 1.4 is about **process stability and shutdown**, not that gate.
+- **Strategy** for Week 1 can be anything lightweight; use discovery + `high_prob` or a single ticker + `green_up`. You are certifying **platform** behavior, not strategy P&L.
+- After each live step, fill the [Session template](#session-template-copy-per-run) and grep `kalshi_bot_demo.jsonl` for `ERROR`, `traceback`, `risk_breach`, `kill switch`.
+
+---
+
+## Week-by-week plan
+
+### Week 1 — Platform baseline (all strategies)
+
+**Objective:** Shared infrastructure is trustworthy; failures are config/strategy, not plumbing.
+
+| Step | Action | Expected output | If it fails |
+|------|--------|-----------------|-------------|
+| 1.1 | Copy `.env.example` → `.env`; set demo keys | Startup: `DEMO mode`, credentials loaded | Fix `KALSHI_DEMO_*` keys; see README Troubleshooting |
+| 1.2 | `python -m pytest tests/ -v` | All tests pass | Fix regressions before live runs |
+| 1.3 | `python -c "import config"` | Risk profile line shows demo DB/log/limits | Check `KALSHI_ENV` and `KALSHI_DEMO_*` vars |
+| 1.4 | Run bot ~30 min, **Ctrl+C** | Log: shutdown, orders cancelled; no traceback | See [1.4 detailed](#step-14--run-bot-30-minutes-graceful-shutdown) |
+| 1.5 | Trigger circuit breaker (demo) | Bot halts, `kill switch` in log | See [1.5 detailed](#step-15--circuit-breaker-review-and-live-test) |
+| 1.6 | Manual sell test | `tools/trade.py sell --market` fills at bid floor | See [1.6 detailed](#step-16--manual-sell--flatten-test) |
+
+**Week 1 deliverable:** Signed checklist rows 4–6 in [README Production checklist](../README.md#production-checklist) for platform only.
+
+#### Step 1.4 — Run bot ~30 minutes + graceful shutdown
+
+**What it means:** Prove the bot can stay up (WebSocket, portfolio risk sync, optional monitor table) and exit cleanly when you press **Ctrl+C** (SIGINT). You are **not** required to complete a full trade cycle in this step.
+
+**Suggested command** (demo, low activity OK):
+
+```bash
+python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"
+
+# Discover-only first (optional sanity check)
+python main.py --discover --discover-category Sports --strategy high_prob --discover-only
+
+# Then run ~30 minutes with a small ticker set (adjust tickers after discover-only)
+python main.py --discover --discover-category Sports --strategy high_prob \
+  --discover-top 2 --hp-entry-mode passive --monitor-interval 30
+```
+
+**While running (spot-check at ~5 and ~25 min):**
+
+| Check | How | Pass |
+|-------|-----|------|
+| Auth | Console shows portfolio auth OK at startup | No exit code 1 on auth |
+| WS alive | Monitor table or log shows bid/ask updating | No repeated WS disconnect errors |
+| Risk sync | Log every `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS` (default 30s) | No endless `Portfolio risk sync failed` |
+| No crash | Console still running | No Python traceback |
+
+**Stop:** Press **Ctrl+C** once. Wait until the process exits (usually <10s).
+
+**Expected shutdown sequence** (see `main.py` docstring):
+
+1. `shutdown` log with open blotter trade IDs and any resting order IDs
+2. WebSocket ingestor stops
+3. `execution_manager.stop()` → **all resting bot orders cancelled** on the exchange
+4. Final settlement check + session summary printed
+
+**Verify after exit:**
+
+```bash
+# No resting orders left from the bot session
+python tools/trade.py orders
+
+# Log should contain shutdown, not an unhandled exception
+# PowerShell example:
+Select-String -Path kalshi_bot_demo.jsonl -Pattern "shutdown|kill switch|traceback" | Select-Object -Last 20
+```
+
+**Pass criteria:** Process exits 0; log has `shutdown` / `OS signal`; `trade.py orders` is empty (or only unrelated manual orders you placed yourself). Open **positions** may remain — shutdown does **not** auto-flatten (by design).
+
+**If it fails:** Traceback on exit → note line in log. Orphan resting orders → `python tools/trade.py cancel-all` then inspect `execution/execution_manager.py` `stop()`.
+
+#### Step 1.5 — Circuit breaker: review and live test
+
+**What the circuit breaker does:** Every signal passes through `risk/circuit_breaker.py` → `approve()`. A background loop (`_portfolio_risk_sync_loop` in `main.py`) refreshes your **real demo portfolio** every `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS` (default **30s**) and calls `sync_from_portfolio()`. Any breach sets `is_tripped`, logs `risk_breach`, runs the **kill switch** (cancel all orders + shutdown), and blocks further entries until process restart.
+
+**Five independent checks** (any one can trip):
+
+| # | Check | Config (demo) | Typical trip in live test |
+|---|--------|---------------|---------------------------|
+| 1 | Peak-to-trough drawdown | `KALSHI_DEMO_MAX_DRAWDOWN_PCT` | Equity falls >1% below session peak |
+| 2 | Session loss vs start equity | `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS` | Portfolio value down more than limit since bot start |
+| 3 | Daily realized P&L | same limit field | Cumulative closed loss today |
+| 4 | Max open positions | `MAX_OPEN_POSITIONS` | Too many positions in breaker state |
+| 5 | Single order size | `MAX_POSITION_CENTS` | Clamped, rarely trips alone |
+
+**Review (read-only, ~15 min):**
+
+1. Read `risk/circuit_breaker.py` — focus on `approve()`, `sync_from_portfolio()`, `_check_drawdown()`, `_trip()`.
+2. Run unit tests: `python -m pytest tests/test_circuit_breaker.py tests/test_circuit_breaker_sync.py -v`
+3. Confirm env resolves: `python -c "import config; print(config.MAX_DRAWDOWN_PCT, config.DAILY_LOSS_LIMIT_CENTS, config.PORTFOLIO_RISK_SYNC_SECONDS)"`
+
+**Live demo test (drawdown path — matches production checklist):**
+
+1. In `.env` **temporarily** set aggressive limits (restore after test):
+
+   ```env
+   KALSHI_DEMO_MAX_DRAWDOWN_PCT=0.01
+   # Optional: shorten sync wait (default 30s is fine)
+   # KALSHI_PORTFOLIO_RISK_SYNC_SECONDS=15
+   ```
+
+2. Start bot on demo with a ticker you are willing to hold briefly:
+
+   ```bash
+   python main.py --strategy green_up --tickers YOUR-TICKER \
+     --entry-max 50 --hedge-trigger 90 --gu-entry-mode market --monitor-interval 15
+   ```
+
+3. **Trigger drawdown:** Either wait for an open position to mark down ≥1% of **total** `portfolio_value_cents`, **or** open a small losing position manually before/during the run:
+
+   ```bash
+   python tools/trade.py buy --ticker YOUR-TICKER --side yes --count 5 --market
+   # If price moves against you, next portfolio sync may trip 1% drawdown on a small account
+   ```
+
+4. **What you should see within one sync interval (~30s):**
+   - JSONL / console: `risk_breach` with reason `max drawdown exceeded` (or `session loss limit exceeded`)
+   - `kill switch activated — cancelling all orders and halting`
+   - Bot process stops (shutdown event set)
+   - No new `ORDER_SENT` after trip
+
+5. **Verify:**
+   - `python tools/trade.py orders` → empty
+   - Grep log: `kill switch`, `risk_breach`, `is_tripped` / rejecting signals
+
+6. **Restore** `.env` drawdown to `0.10` (or your normal demo value). Restart bot only after limits are sane.
+
+**“Review” deliverable:** One paragraph **per test** in your session log: which limit tripped, peak vs current equity from log fields, time from breach to kill switch, and confirmation orders were cancelled.
+
+##### Test A — Percent drawdown (`MAX_DRAWDOWN_PCT`)
+
+| Step | Action |
+|------|--------|
+| 1 | `.env`: `KALSHI_DEMO_MAX_DRAWDOWN_PCT=0.01` (restore to `0.10` after) |
+| 2 | Note starting equity: `python tools/trade.py portfolio` → `portfolio_value` |
+| 3 | Start bot briefly, or hold an open position that can mark down |
+| 4 | Need **≥1% drop from session peak** (account-level, not per contract). Example: $10,000 account → ≥$100 drop in `portfolio_value_cents` |
+| 5 | Wait ≤ `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS` (default 30s) |
+| 6 | Expect log: `max drawdown exceeded`, `kill switch`, process exit |
+
+##### Test B — Session loss limit (`DAILY_LOSS_LIMIT_CENTS`)
+
+**Dollars of session loss**, not per contract. Compares current `portfolio_value_cents` to equity at **first sync after bot start**.
+
+| Step | Action |
+|------|--------|
+| 1 | `.env`: `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS=500` ($5 cap; restore after) |
+| 2 | Start bot → first sync sets `_session_start_equity` |
+| 3 | Realize **≥$5** loss vs that start (trade, mark-down, or manual) |
+| 4 | On next sync: `session loss limit exceeded` + kill switch |
+
+Run Test A and Test B in **separate** sessions; restore normal limits between them. Per-contract fees flow into P&L via `FEE_PER_CONTRACT_CENTS`, not a separate breaker.
+
+#### Step 1.6 — Manual sell / flatten test
+
+Validates `tools/trade.py` and sell pricing independent of strategies.
+
+1. Pick a ticker with a **small** open YES position (from a prior test or `trade.py buy`).
+2. Preview sell:
+
+   ```bash
+   python tools/trade.py preview --ticker YOUR-TICKER --side yes --count 1 --market
+   ```
+
+   Expect: action **SELL**, price at or near **bid** (market sell walks the bid).
+
+3. Execute:
+
+   ```bash
+   python tools/trade.py sell --ticker YOUR-TICKER --side yes --count 1 --market --yes
+   # Or flatten entire leg:
+   python tools/trade.py close --ticker YOUR-TICKER --yes
+   ```
+
+4. `python tools/trade.py portfolio` → position reduced or flat.
+
+**Note:** Manual `trade.py` orders are **not** written to the bot blotter. Week 2+ strategy tests should use bot-driven orders for blotter reconciliation.
+
+---
+
+### Week 2 — Certify `high_prob` and `green_up`
+
+**Objective:** Two strategies with full runbooks and 3+ clean demo sessions each.
+
+#### High-probability
+
+| Step | Command (example) | Expected output | If it fails |
+|------|-------------------|-----------------|-------------|
+| 2.1 | `main.py --discover --discover-category Politics --strategy high_prob --discover-only` | 5–10 tickers, YES ask 85–97¢ | Widen discovery or check preset; `--discover-no-tradeable-filter` to debug |
+| 2.2 | Run 45–60 min, 2 tickers, `--hp-entry-mode cross_spread` | `ORDER_SENT`, fills, blotter `entry` leg | Passive may not fill → use `cross_spread` or `market` |
+| 2.3 | Post-session | `blotter.py detail`, `portfolio` match | Reconcile fees; check fill-on-blotter not submit-only |
+| 2.4 | Repeat 3 sessions | Stable logs, no orphans on exchange | See Troubleshooting: fill rate vs orders sent |
+
+#### Green-up
+
+| Step | Command (example) | Expected output | If it fails |
+|------|-------------------|-----------------|-------------|
+| 2.5 | `main.py --discover --discover-category Sports --strategy green_up --discover-top 5 --gu-entry-mode market --max-concurrent-positions 5` | Live Sports tickers, states watching→entered | Live gates block → wait for WS; check `--entry-max` |
+| 2.6 | Through hedge or stop | Blotter shows `hedge` or `stop_loss` leg | Tune `--hedge-trigger`, `--gu-exit-mode cross_spread` |
+| 2.7 | Flatten manually if needed | `trade.py close` works | Sell uses bid floor; portfolio shows side |
+
+**Week 2 deliverable:** Two sections in `testing.txt` (or this doc) with exact commands + 3 session notes each.
+
+**Week 2 testing depth:** Use the [End-to-end strategy testing](#end-to-end-automated-strategy-testing) playbook below for `green_up`; adapt the same phases for `high_prob` (entry → optional TP/stop → hold/settle).
+
+---
+
+### Week 3 — Certify `kelly` and `arb`
+
+**Objective:** Remaining strategies have runbooks; arb expectations documented for thin demo books.
+
+#### Kelly
+
+| Step | Action | Expected output | If it fails |
+|------|--------|-----------------|-------------|
+| 3.1 | Pick 2 liquid tickers from screener | Tickers with tight spread | Use `tools/screen.py screen` |
+| 3.2 | `main.py --strategy kelly --tickers T1,T2 --model-prob T1:0.62,T2:0.55` | Orders only when edge ≥ `MIN_EDGE_TO_VIG` | Raise model prob or lower spread markets |
+| 3.3 | 2 sessions + blotter | Entry legs sized ≤ `MAX_POSITION_CENTS` | Kelly size 0 → edge too small |
+
+#### Arbitrage
+
+| Step | Action | Expected output | If it fails |
+|------|--------|-----------------|-------------|
+| 3.4 | Define `--comp-pairs T1:T2` or category discover | Arb signals in log | Demo may have **no** arb — document as OK |
+| 3.5 | 2 sessions | Both legs fill or explicit skip logged | Partial leg → manual close; reduce size |
+
+**Week 3 deliverable:** Four strategy runbooks complete; demo certification sign-off.
+
+---
+
+### Week 4 — Demo soak + production prep
+
+**Objective:** Two weeks of demo confidence compressed into structured review; prod `.env` ready but off.
+
+| Step | Action | Expected output | If it fails |
+|------|--------|-----------------|-------------|
+| 4.1 | Daily: 1–2 hr bot runs (rotate strategies) | `kalshi_bot_demo.jsonl` without ERROR spam | Fix root cause before prod |
+| 4.2 | Weekly: `blotter_report.py performance --days 7` | P&L summary per strategy | Tune params, not code |
+| 4.3 | `session_report.py` end of week | Closed/settled trades documented | Settlement watcher gaps → check API |
+| 4.4 | Set prod keys in `.env`, keep `KALSHI_ENV=demo` | Prod keys present but unused | Never commit `.env` |
+| 4.5 | Dry-run: `KALSHI_ENV=production` + **Ctrl+C immediately** | `PRODUCTION MODE`, prod DB/log, then exit | Wrong key → 401 on first API call |
+
+**Week 4 deliverable:** Demo certification checklist 100% in README; prod profile validated without trading.
+
+---
+
+### Week 5+ — Production micro-pilot ($1 cap per market)
+
+**Only after Week 4 sign-off.** Certify **each strategy separately** at `KALSHI_PROD_MAX_POSITION_CENTS=100` (one contract on a 99¢ market ≈ $1).
+
+| Step | Action | Expected output | If it fails |
+|------|--------|-----------------|-------------|
+| 5.1 | `.env`: `KALSHI_ENV=production`, `KALSHI_PROD_MAX_POSITION_CENTS=100`, `KALSHI_PROD_MAX_CONCURRENT_POSITIONS=1` | Startup: `PRODUCTION`, max position $1.00 | Revert to `demo` |
+| 5.2a | **high_prob:** 1 Politics/Sports ticker, 1 session | ≤ $1 per market; blotter + UI match | See Week 2 high_prob runbook |
+| 5.2b | **green_up:** 1 in-play Sports ticker, 1 session | ≤ $1 entry leg; hedge/stop still allowed | See green_up Phase A; use `market` entry if needed |
+| 5.3 | One week **per strategy** (alternate days or weeks) | Daily loss &lt; `KALSHI_PROD_DAILY_LOSS_LIMIT_CENTS` | Revert to demo; post-mortem |
+| 5.4 | Optional: kelly / arb at same $1 cap | Same checks | Do not raise cap until both 5.2a and 5.2b are stable |
+
+**Example prod commands:**
+
+```bash
+# high_prob — one liquid high-P(YES) market
+python main.py --strategy high_prob --tickers YOUR-TICKER \
+  --hp-entry-mode cross_spread --hp-post-fill hold --max-concurrent-positions 1
+
+# green_up — one live underdog
+python main.py --strategy green_up --tickers YOUR-TICKER \
+  --entry-max 25 --hedge-trigger 68 --gu-entry-mode market \
+  --gu-exit-mode cross_spread --max-concurrent-positions 1
+```
+
+---
+
+## End-to-end automated strategy testing
+
+This section maps your mental model (“find opportunity → enter → manage → exit → P&L → repeat until event ends”) to what the bot **actually** does today, with a concrete **green_up** runbook. Other strategies follow the same **phases** with different exit rules.
+
+### Mental model vs bot behavior
+
+| Your step | Green-up implementation | Config knobs |
+|-----------|-------------------------|--------------|
+| Find opportunity | `--discover` + Sports preset, or `--tickers T` | `--discover-category`, `--entry-max` |
+| Limit at bid (or bid−n¢) | Default `--gu-entry-mode passive` → limit at **YES bid** | `passive`, `cross_spread`, `market`, `limit_offset` (+ `KALSHI_HP_LIMIT_OFFSET` for offset cents) |
+| Order fills | `on_fill` → state `ENTERED` | Use `market` or `cross_spread` if passive does not fill in demo |
+| Monitor market | WS ticks → `evaluate()` each tick | `--hedge-trigger`, `--stop-loss` |
+| Take profit (¢ target) | Default: **hedge** (buy NO) at `--hedge-trigger`. Optional: use `high_prob` with low YES-ask band for resting TP (see below) | `--hedge-mode`, `--hedge-trigger` |
+| Hedge opposite side | Buy **NO** when YES bid ≥ hedge trigger | `full_green` \| `stake_back` \| `partial` |
+| Stop / cut loss | Sell YES or buy NO on stop path | `--stop-loss`, `--gu-exit-mode` |
+| Track P&L | Blotter parent trade + legs; `blotter_report.py` | `tools/blotter.py detail` |
+| Repeat on same game | After `HEDGED`/`STOPPED`, next tick resets to `SCANNING` and may enter again (`--gu-max-cycles 0` = unlimited) | `--gu-max-cycles N` to cap round-trips |
+| Until game over | Stop when market resolves (`CLOSED`) or you end session | Settlement watcher updates blotter |
+
+**Important:** The bot does **not** currently implement a separate “liquidate at entry + X cents” take-profit mode for green_up (that pattern exists for `high_prob` via `--hp-post-fill`). Green-up “profit taking” is **hedge-driven** or holding YES to settlement.
+
+### Green-up state machine (what to watch)
+
+```text
+SCANNING → WATCHING → ENTERED → HEDGING → HEDGED
+                ↓
+            STOPPING → STOPPED → (may return to SCANNING when flat)
+```
+
+Session monitor / logs should show state transitions per ticker. One **parent trade** in the blotter typically spans `entry` + `hedge` or `stop_loss` legs.
+
+### Phase A — Single ticker, controlled entry (certification)
+
+**Goal:** One full cycle on one market you choose, with parameters tight enough to force hedge or stop in a reasonable session.
+
+1. **Pick ticker** (in-play Sports, live gates):
+
+   ```bash
+   python tools/screen.py screen --category Sports --top 10
+   python tools/screen.py browse --ticker YOUR-TICKER
+   ```
+
+   Prefer: YES ask ≤ `--entry-max`, volume ≥ preset, game closing within live window.
+
+2. **Dry run discovery** (optional):
+
+   ```bash
+   python main.py --discover --discover-category Sports --strategy green_up \
+     --discover-top 5 --discover-only
+   ```
+
+3. **Run bot — single ticker, aggressive fill for certification:**
+
+   ```bash
+   python main.py --strategy green_up --tickers YOUR-TICKER \
+     --entry-max 25 --hedge-trigger 20 --hedge-mode full_green \
+     --stop-loss 0.35 \
+     --gu-entry-mode passive \
+     --gu-exit-mode cross_spread \
+     --max-concurrent-positions 1 \
+     --monitor-interval 10
+   ```
+
+   | Parameter | Certification tip |
+   |-----------|---------------------|
+   | `--entry-max` | Set ≥ current YES ask so entry is allowed |
+   | `--hedge-trigger` | Set **slightly above** current YES bid to test hedge quickly, or near realistic in-play level |
+   | `--gu-entry-mode passive` | Resting at bid — may not fill; switch to `market` if no fill in 15 min |
+   | `--gu-exit-mode cross_spread` | Hedge/stop legs cross the book (more reliable fills) |
+
+4. **Observe until terminal state:**
+
+   | Phase | Log / monitor | Pass |
+   |-------|---------------|------|
+   | Entry signal | `ORDER_SENT` buy YES | Price matches mode (bid for passive) |
+   | Fill | Fill event / `ENTERED` | Exchange portfolio shows YES |
+   | Hedge or stop | `ORDER_SENT` buy NO or stop leg | State → `HEDGING` or `STOPPING` |
+   | Complete | `HEDGED` or `STOPPED` | Blotter has 2 legs (entry + hedge/stop) |
+
+5. **Reconcile:**
+
+   ```bash
+   python tools/trade.py portfolio
+   python tools/blotter.py trades --strategy green_up --days 1
+   python tools/blotter.py detail --trade-id T-XXXX
+   ```
+
+   Exchange fills must match blotter legs (fees within tolerance). Parent trade status should move toward `closed` / `hedged` as legs complete.
+
+### Phase B — Discovery mode, parallel tickers (production-like)
+
+```bash
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-top 5 --max-concurrent-positions 3 \
+  --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
+  --gu-entry-mode market --gu-exit-mode cross_spread \
+  --monitor-interval 30
+```
+
+**Pass:** Multiple tickers in `SCANNING`/`WATCHING`; up to 3 concurrent **entry** legs; hedges still allowed when trigger hits. No orphan exchange orders after Ctrl+C.
+
+### Phase C — Repeat cycles on the same game
+
+After `HEDGED` or `STOPPED`, the strategy resets that ticker toward **SCANNING** when flat and market still passes [live gates](../README.md#live-markets-only-default-on). For the same game:
+
+- Keep the bot running through score swings; you may see **multiple parent trades** on one ticker in the blotter.
+- Stop the session when the market resolves or `--discover-max-minutes-to-close` window ends.
+
+**Session end checklist:**
+
+```bash
+python tools/blotter.py trades --ticker YOUR-TICKER --days 1
+python tools/blotter_report.py performance --days 1
+python tools/trade.py portfolio
+```
+
+Document: number of round-trips, net P&L per trade ID, any manual `trade.py close` interventions.
+
+### Phase D — P&L and settlement
+
+| When | Command | What to verify |
+|------|---------|----------------|
+| Intraday | `blotter.py detail --trade-id …` | Leg prices, fees, unrealized |
+| End of day | `blotter_report.py performance --days 1` | Per-strategy net |
+| After event | `blotter.py trades --status settled` | Resolution matches Kalshi UI |
+
+Settlement watcher runs every 5 min while bot is up; final check also runs on shutdown.
+
+### Pricing modes (entry at bid vs bid − n¢)
+
+**Production default:** `--gu-entry-mode passive` (resting limit at best YES **bid**).
+
+**Bid − x cents:** use `limit_offset` with a **negative** offset (price = bid + offset):
+
+```bash
+python main.py --strategy green_up --tickers YOUR-TICKER \
+  --gu-entry-mode limit_offset --gu-limit-offset -2
+# or: KALSHI_GREEN_UP_LIMIT_OFFSET=-2
+```
+
+| Mode | Buy YES price | When to use |
+|------|---------------|-------------|
+| `passive` (default) | Best **bid**, GTC resting | Production |
+| `cross_spread` | Best **ask**, IOC | Certification fills |
+| `market` | IOC market at touch | Fastest fill |
+| `limit_offset` | `bid + offset` cents | `-2` → bid−2¢; `+1` → bid+1¢ (may IOC if above bid) |
+
+### Take-profit: green_up vs high_prob
+
+They are **not** the same mechanism today:
+
+| | **green_up** | **high_prob** |
+|---|-------------|---------------|
+| Entry zone | Cheap YES (e.g. ask ≤ 25¢) | High YES (85–97¢) |
+| “Take profit” | Buy **NO** when YES bid ≥ hedge trigger (formulas: full_green / stake_back / partial) | Resting **sell YES** at entry + offset or % (`--hp-post-fill resting_take_profit`) |
+| Implied “entry prob” | `hedge_trigger` as fair value for Kelly edge, not a model P(YES) | Market implied P from YES ask |
+
+**If you want high_prob-style resting TP on a cheap contract:** you can run `high_prob` with a **low** band, e.g. `--hp-min-yes-ask 10 --hp-max-yes-ask 30`, plus `--hp-post-fill resting_take_profit`. That is a different strategy path than green_up hedging. A native green_up resting-TP mode is not implemented yet (backlog).
+
+### Max cycles per ticker (round-trips)
+
+| Value | Meaning |
+|-------|---------|
+| `0` (default) | Unlimited new entries on same ticker after each `HEDGED`/`STOPPED` |
+| `N ≥ 1` | After **N** completed cycles, ticker moves to `CLOSED` (no more entries) |
+
+```bash
+--gu-max-cycles 3
+# KALSHI_GREEN_UP_MAX_CYCLES_PER_TICKER=3
+```
+
+**Note:** A new cycle only resets the **state machine**. If the exchange still holds YES+NO from a hedge, you may be stacked — flatten via `trade.py close` between cycles if you want a clean book.
+
+### What is *not* automated yet (gaps vs ideal test)
+
+- No built-in green_up “TP at +X¢” — use hedge trigger or `high_prob` for resting TP.
+- Shutdown does not flatten; open positions survive Ctrl+C.
+- Manual `trade.py` trades do not sync to blotter.
+- Demo books can be too thin for passive fills — document `market`/`cross_spread` in certification notes.
+
+### Quick matrix: strategy → exit style
+
+| Strategy | Primary exit | Repeat on same ticker? |
+|----------|--------------|-------------------------|
+| `green_up` | Hedge (NO) or stop | Yes, while market live |
+| `high_prob` | Resting TP / stop / hold | Yes, with post-fill modes |
+| `kelly` | Hold / manual | Re-enters when edge returns |
+| `arb` | Both legs immediate | Pair-dependent |
+
+---
+
+## Session template (copy per run)
+
+```text
+Date:
+KALSHI_ENV:
+Strategy:
+Command:
+Duration:
+Tickers discovered:
+Orders sent / fills (exchange):
+Blotter trade IDs:
+Open positions after (portfolio):
+Issues:
+Action items:
+```
+
+---
+
+## Post-certification feature backlog (defer until demo done)
+
+| Feature | Why wait |
+|---------|----------|
+| Fill funnel metrics (sent → exchange fill → WS confirm) | Needs stable baseline to interpret |
+| Blotter CLI `--resolution` / unified search | Analysis convenience |
+| Manual `trade.py` → blotter sync | Workaround exists |
+| Auto-flatten on shutdown (optional flag) | Policy choice after manual close workflow is proven |
+
+---
+
+## Quick reference commands
+
+```bash
+# Environment check
+python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"
+
+# Tests
+python -m pytest tests/ -v
+
+# Discover preview
+python main.py --discover --discover-category Sports --strategy green_up --discover-only
+
+# Portfolio (ground truth)
+python tools/trade.py portfolio
+
+# After session
+python tools/blotter.py trades --days 1
+python tools/blotter.py detail --trade-id T-0001
+```
+
+---
+
+## Certification decisions (locked)
+
+| Topic | Decision |
+|-------|----------|
+| Green-up take profit | Hedge-at-trigger is primary; high_prob-style resting TP = run `high_prob` on a low ask band, or add green_up TP later |
+| Entry pricing | **Passive at bid** in prod; `limit_offset` with negative cents for bid−x; `market`/`cross_spread` for certification fills |
+| Per-game repeat | **Unlimited** by default (`--gu-max-cycles 0`); set `--gu-max-cycles N` to cap round-trips per ticker |
+| Circuit breaker | Test **both** drawdown % (Test A) and session loss cents (Test B) in demo — see [Step 1.5](#step-15--circuit-breaker-review-and-live-test) |
+| Prod micro-pilot | **Each strategy separately** at `KALSHI_PROD_MAX_POSITION_CENTS=100`: `high_prob` then `green_up` (Week 5.2a / 5.2b) |
+
+---
+
+## Related docs
+
+- [README.md](../README.md) — setup, strategies, troubleshooting, production checklist
+- [testing.md](../testing.md) — command cookbook and session examples
+- [.env.example](../.env.example) — full variable template with demo/prod blocks

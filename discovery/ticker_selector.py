@@ -192,7 +192,7 @@ async def fetch_category_markets(
     Pull open markets for a category (activity / full_scan passed to API layer).
     """
     pool = fetch_limit if fetch_limit is not None else max(criteria.top_n * 20, 200)
-    return await client.get_markets_by_category(
+    result = await client.get_markets_by_category(
         category=criteria.category,
         status=criteria.status,
         limit=pool,
@@ -200,6 +200,7 @@ async def fetch_category_markets(
         activity_hours=criteria.activity_hours,
         full_scan=criteria.full_scan,
     )
+    return result.markets
 
 
 async def discover_tickers(

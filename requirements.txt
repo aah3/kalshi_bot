@@ -23,4 +23,4 @@ cryptography>=42.0.0,<44.0.0
 
 # ── Development / testing ─────────────────────────────────────────────────────
 # pytest is optional — tests also run with plain `python tests/test_*.py`
-# pytest>=8.0.0
+pytest>=8.0.0

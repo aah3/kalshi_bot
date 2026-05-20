@@ -5,13 +5,15 @@ Credentials (both environments can live in .env at once):
     KALSHI_ENV=demo | production
     KALSHI_DEMO_API_KEY_ID / KALSHI_DEMO_PRIVATE_KEY_B64
     KALSHI_PROD_API_KEY_ID / KALSHI_PROD_PRIVATE_KEY_B64
-    (optional legacy fallback: KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_B64)
 
-On Windows, you can skip `export` and put the same assignments in a `.env` file
-next to this module; values are loaded into `os.environ` on import (real env
-vars still win if already set).
+Risk / paths (per-environment overrides — switch with KALSHI_ENV only):
+    KALSHI_DEMO_MAX_POSITION_CENTS / KALSHI_PROD_MAX_POSITION_CENTS
+    KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS / KALSHI_PROD_DAILY_LOSS_LIMIT_CENTS
+    KALSHI_DEMO_DB_PATH / KALSHI_PROD_DB_PATH
+    KALSHI_DEMO_LOG_FILE / KALSHI_PROD_LOG_FILE
+    (Generic KALSHI_MAX_POSITION_CENTS etc. apply to both if set and no per-env value)
 
-Everything else defaults to safe demo values.
+On Windows, put assignments in `.env` next to this module; shell exports win if already set.
 """
 
 import os
@@ -23,15 +25,64 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ─── Environment ─────────────────────────────────────────────────────────────
 
-ENV = os.getenv("KALSHI_ENV", "demo").lower()   # "demo" | "production"
+ENV = os.getenv("KALSHI_ENV", "demo").lower().strip()   # "demo" | "production"
+IS_PRODUCTION = ENV == "production"
+_ENV_PREFIX = "PROD" if IS_PRODUCTION else "DEMO"
 
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 PROD_BASE_URL = "https://api.kalshi.co/trade-api/v2"
 DEMO_WS_URL   = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 PROD_WS_URL   = "wss://api.kalshi.co/trade-api/ws/v2"
 
-BASE_URL = DEMO_BASE_URL if ENV != "production" else PROD_BASE_URL
-WS_URL   = DEMO_WS_URL   if ENV != "production" else PROD_WS_URL
+BASE_URL = PROD_BASE_URL if IS_PRODUCTION else DEMO_BASE_URL
+WS_URL   = PROD_WS_URL   if IS_PRODUCTION else DEMO_WS_URL
+
+
+def _prefixed_env(suffix: str) -> str | None:
+    """KALSHI_DEMO_* or KALSHI_PROD_* for the active environment."""
+    val = os.getenv(f"KALSHI_{_ENV_PREFIX}_{suffix}")
+    return val.strip() if val else None
+
+
+def _resolve_env_str(
+    suffix: str,
+    generic_key: str,
+    *,
+    demo_default: str,
+    prod_default: str,
+) -> str:
+    return (
+        _prefixed_env(suffix)
+        or os.getenv(generic_key, "").strip()
+        or (prod_default if IS_PRODUCTION else demo_default)
+    )
+
+
+def _resolve_env_int(
+    suffix: str,
+    generic_key: str,
+    *,
+    demo_default: int,
+    prod_default: int,
+) -> int:
+    raw = _prefixed_env(suffix) or os.getenv(generic_key, "").strip()
+    if raw:
+        return int(raw)
+    return prod_default if IS_PRODUCTION else demo_default
+
+
+def _resolve_env_float(
+    suffix: str,
+    generic_key: str,
+    *,
+    demo_default: float,
+    prod_default: float,
+) -> float:
+    raw = _prefixed_env(suffix) or os.getenv(generic_key, "").strip()
+    if raw:
+        return float(raw)
+    return prod_default if IS_PRODUCTION else demo_default
+
 
 def _credential_status_line() -> str:
     try:
@@ -41,14 +92,6 @@ def _credential_status_line() -> str:
     except Exception as exc:
         return f"credentials not loaded: {exc}"
 
-
-if ENV == "production":
-    print("[CONFIG] *** PRODUCTION MODE ACTIVE ***")
-    print(f"[CONFIG] {BASE_URL}")
-    print(f"[CONFIG] {_credential_status_line()}")
-else:
-    print(f"[CONFIG] Running in DEMO mode -> {BASE_URL}")
-    print(f"[CONFIG] {_credential_status_line()}")
 
 # ─── Authentication (resolved for active KALSHI_ENV) ─────────────────────────
 
@@ -70,24 +113,20 @@ RATE_LIMIT_MAX_BACKOFF_SECONDS: float    = 60.0
 RATE_LIMIT_INITIAL_BACKOFF_SECONDS: float = 1.0
 
 # ─── Fees ─────────────────────────────────────────────────────────────────────
-# Kalshi charges a maker/taker fee per contract.
-# Set this to the current rate from your account tier.
-# Default: 7 cents per contract per side (0.07 per contract × 100 = 7c).
-# Fee is charged on the TAKER side only for limit orders that cross the spread,
-# and on both sides for market orders.
-# See: https://kalshi.com/docs/fees
 
-FEE_PER_CONTRACT_CENTS: float = 7.0          # cents per filled contract
-FEE_MAKER_REBATE_CENTS: float = 0.0          # maker rebate (0 unless on a pro tier)
-# Net fee for a round-trip (entry + exit or settlement):
-#   entry fill fee  + settlement (no fee on settlement — Kalshi credits gross)
-# So net fee per trade = FEE_PER_CONTRACT_CENTS × contracts (entry only)
+FEE_PER_CONTRACT_CENTS: float = float(os.getenv("KALSHI_FEE_PER_CONTRACT_CENTS", "7.0"))
+FEE_MAKER_REBATE_CENTS: float = 0.0
 
 # ─── Kelly / Position Sizing ──────────────────────────────────────────────────
 
-KELLY_DIVISOR: int     = 4          # 4 = quarter-Kelly
-MAX_POSITION_CENTS: int = 10_000    # hard cap per market ($100)
-MIN_EDGE_TO_VIG: float  = 0.02      # minimum edge over vig before trading (2%)
+KELLY_DIVISOR: int = int(os.getenv("KALSHI_KELLY_DIVISOR", "4"))
+MAX_POSITION_CENTS: int = _resolve_env_int(
+    "MAX_POSITION_CENTS",
+    "KALSHI_MAX_POSITION_CENTS",
+    demo_default=100,
+    prod_default=100,
+)
+MIN_EDGE_TO_VIG: float = float(os.getenv("KALSHI_MIN_EDGE_TO_VIG", "0.02"))
 
 # ─── High-probability strategy ─────────────────────────────────────────────────
 
@@ -101,7 +140,11 @@ HP_ASSUME_ROUND_TRIP_FEES: bool = os.getenv(
     "KALSHI_HP_ASSUME_ROUND_TRIP_FEES", ""
 ).strip().lower() in ("1", "true", "yes", "on")
 HP_MAX_SPREAD_CENTS: int  = int(os.getenv("KALSHI_HP_MAX_SPREAD", "8"))
-HP_STAKE_CENTS: int       = int(os.getenv("KALSHI_HP_STAKE_CENTS", "5000"))
+_hp_stake_default = min(5_000, MAX_POSITION_CENTS)
+HP_STAKE_CENTS: int = min(
+    int(os.getenv("KALSHI_HP_STAKE_CENTS", str(_hp_stake_default))),
+    MAX_POSITION_CENTS,
+)
 HP_LIMIT_OFFSET: int      = int(os.getenv("KALSHI_HP_LIMIT_OFFSET", "0"))
 HP_TAKE_PROFIT_OFFSET: int = int(os.getenv("KALSHI_HP_TAKE_PROFIT_OFFSET", "3"))
 _hp_tp_pct_raw = os.getenv("KALSHI_HP_TAKE_PROFIT_PCT", "").strip()
@@ -117,27 +160,35 @@ BLOCK_ENTRIES_ON_LOW_BALANCE: bool = os.getenv(
     "KALSHI_BLOCK_LOW_BALANCE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Default strategy when not set on CLI (KALSHI_STRATEGY env overrides)
 DEFAULT_STRATEGY: str = os.getenv("KALSHI_DEFAULT_STRATEGY", "high_prob")
-
-# Order submit retries after HTTP 429 (same client_order_id for idempotency)
 ORDER_SUBMIT_MAX_RETRIES: int = int(os.getenv("KALSHI_ORDER_MAX_RETRIES", "3"))
-
-# Portfolio ↔ circuit breaker sync interval (seconds)
 PORTFOLIO_RISK_SYNC_SECONDS: float = float(
     os.getenv("KALSHI_PORTFOLIO_RISK_SYNC_SECONDS", "30")
 )
 
 # ─── Risk / Circuit Breaker ───────────────────────────────────────────────────
 
-MAX_DRAWDOWN_PCT: float         = 0.10    # 10% peak-to-trough kills the bot
-MAX_SECTOR_CONCENTRATION: float = 0.30   # 30% of portfolio in one category
-MAX_OPEN_POSITIONS: int         = 20     # absolute open position count
-MAX_CONCURRENT_POSITIONS: int   = int(
-    os.getenv("KALSHI_MAX_CONCURRENT_POSITIONS", "0")
-)  # 0 = unlimited; cap simultaneous entry legs per strategy
+MAX_DRAWDOWN_PCT: float = _resolve_env_float(
+    "MAX_DRAWDOWN_PCT",
+    "KALSHI_MAX_DRAWDOWN_PCT",
+    demo_default=0.10,
+    prod_default=0.05,
+)
+MAX_SECTOR_CONCENTRATION: float = float(os.getenv("KALSHI_MAX_SECTOR_CONCENTRATION", "0.30"))
+MAX_OPEN_POSITIONS: int = int(os.getenv("KALSHI_MAX_OPEN_POSITIONS", "20"))
+MAX_CONCURRENT_POSITIONS: int = _resolve_env_int(
+    "MAX_CONCURRENT_POSITIONS",
+    "KALSHI_MAX_CONCURRENT_POSITIONS",
+    demo_default=0,
+    prod_default=1,
+)
+DAILY_LOSS_LIMIT_CENTS: int = _resolve_env_int(
+    "DAILY_LOSS_LIMIT_CENTS",
+    "KALSHI_DAILY_LOSS_LIMIT_CENTS",
+    demo_default=500,
+    prod_default=500,
+)
 
-# Live-market gates (discovery + entry) — avoid stale / far-dated contracts
 LIVE_TRADING_ONLY: bool = os.getenv("KALSHI_LIVE_ONLY", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
@@ -157,11 +208,9 @@ LIVE_MAX_TRADE_STALE_MINUTES: float | None = (
     if os.getenv("KALSHI_LIVE_MAX_TRADE_STALE_MINUTES", "").strip()
     else 120.0
 )
-DAILY_LOSS_LIMIT_CENTS: int     = 50_000 # $500 daily stop-loss
 
-# Per-position risk thresholds (used by alert_manager)
-PROFIT_TARGET_PCT: float        = 0.60   # alert when unrealised P&L >= +60%
-POSITION_STOP_LOSS_PCT: float   = 0.40   # alert when unrealised P&L <= -40%
+PROFIT_TARGET_PCT: float        = 0.60
+POSITION_STOP_LOSS_PCT: float   = 0.40
 
 # ─── Execution ────────────────────────────────────────────────────────────────
 
@@ -170,28 +219,55 @@ WS_PING_INTERVAL_SECONDS: int = 20
 
 # ─── Settlement Watcher ───────────────────────────────────────────────────────
 
-SETTLEMENT_POLL_INTERVAL_SECONDS: int = 5 * 60   # check resolved markets every 5 min
-SETTLEMENT_LOOKBACK_DAYS: int         = 3         # how far back to scan for resolutions
+SETTLEMENT_POLL_INTERVAL_SECONDS: int = 5 * 60
+SETTLEMENT_LOOKBACK_DAYS: int         = 3
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 
-# SQLite path (default). Override with a postgres:// URL for Postgres.
-DB_PATH: str = os.getenv("KALSHI_DB_PATH", "kalshi_bot.db")
-
-# If set to a postgres:// connection string, the blotter switches to Postgres.
-# Requires psycopg2-binary to be installed.
-# Example: "postgresql://user:password@localhost:5432/kalshi"
+DB_PATH: str = _resolve_env_str(
+    "DB_PATH",
+    "KALSHI_DB_PATH",
+    demo_default="kalshi_bot_demo.db",
+    prod_default="kalshi_bot_prod.db",
+)
 POSTGRES_URL: str = os.getenv("KALSHI_POSTGRES_URL", "")
-
-# Use Postgres if a URL is provided, otherwise SQLite
 USE_POSTGRES: bool = bool(POSTGRES_URL)
 
 # ─── Metrics ─────────────────────────────────────────────────────────────────
 
 SHARPE_WINDOW_DAYS: int      = 30
-RISK_FREE_RATE_ANNUAL: float = 0.05    # 5% annualised
+RISK_FREE_RATE_ANNUAL: float = 0.05
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 LOG_LEVEL: str = os.getenv("KALSHI_LOG_LEVEL", "INFO")
-LOG_FILE: str  = os.getenv("KALSHI_LOG_FILE", "kalshi_bot.jsonl")
+LOG_FILE: str = _resolve_env_str(
+    "LOG_FILE",
+    "KALSHI_LOG_FILE",
+    demo_default="kalshi_bot_demo.jsonl",
+    prod_default="kalshi_bot_prod.jsonl",
+)
+
+
+def _risk_profile_line() -> str:
+    return (
+        f"risk profile ({_ENV_PREFIX}): "
+        f"max_position=${MAX_POSITION_CENTS / 100:.2f}  "
+        f"daily_loss_limit=${DAILY_LOSS_LIMIT_CENTS / 100:.2f}  "
+        f"max_drawdown={MAX_DRAWDOWN_PCT:.0%}  "
+        f"concurrent_positions={MAX_CONCURRENT_POSITIONS or 'unlimited'}  "
+        f"db={DB_PATH}  log={LOG_FILE}"
+    )
+
+
+def _print_startup_banner() -> None:
+    if IS_PRODUCTION:
+        print("[CONFIG] *** PRODUCTION MODE ACTIVE ***")
+        print(f"[CONFIG] {BASE_URL}")
+    else:
+        print(f"[CONFIG] Running in DEMO mode -> {BASE_URL}")
+    print(f"[CONFIG] {_credential_status_line()}")
+    print(f"[CONFIG] {_risk_profile_line()}")
+
+
+_print_startup_banner()

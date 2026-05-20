@@ -106,24 +106,95 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from credentials.credential_manager import CredentialManager
-from discovery.market_client import MarketClient, MarketSummary
-from discovery.screener import MarketScreener
+from discovery.market_client import CategoryFetchStats, MarketClient, MarketSummary
+from discovery.screener import MIN_VOLUME_24H, MarketScreener
 from execution.rate_limiter import RateLimiter
+
+
+def _print_empty_result(
+    heading: str,
+    hints: list[str],
+    *,
+    subheading: str = "No markets matched your filters.",
+) -> None:
+    """Print a consistent empty-state block for browse or screen."""
+    print()
+    if heading:
+        print(f"  {heading}")
+    print(f"  {subheading}\n")
+    if hints:
+        print("  Why:")
+        for line in hints:
+            if line:
+                print(f"    {line}")
+            else:
+                print()
+        print()
+
+
+def _browse_empty_hints(
+    stats: CategoryFetchStats | None,
+    *,
+    min_volume: int,
+    activity_hours: float | None,
+    tradeable_only: bool,
+    rejected_tradeable: int,
+    event_count: int | None = None,
+) -> list[str]:
+    if stats is not None:
+        return stats.format_empty_hints(
+            min_volume_24h=min_volume,
+            activity_hours=activity_hours,
+            tradeable_only=tradeable_only,
+            rejected_tradeable=rejected_tradeable,
+            env=config.ENV,
+        )
+    if event_count is not None and min_volume > 0:
+        return [
+            f"Event has {event_count} markets; none with vol24h >= {min_volume:,}.",
+            "Try lowering --min-volume or omit it.",
+        ]
+    return ["No markets returned for this query."]
+
+
+def _screen_empty_hints(screener: MarketScreener) -> list[str]:
+    hints: list[str] = []
+    if screener.last_fetch_stats is not None and screener.last_fetch_stats.matched == 0:
+        fetch_lines = screener.last_fetch_stats.format_empty_hints(
+            min_volume_24h=MIN_VOLUME_24H,
+            env=config.ENV,
+        )
+        if fetch_lines:
+            hints.append("Fetch stage:")
+            hints.extend(fetch_lines)
+    if screener.last_run_stats is not None:
+        run_lines = screener.last_run_stats.format_empty_hints()
+        if run_lines:
+            if hints:
+                hints.append("")
+            hints.append("Score stage:")
+            hints.extend(run_lines)
+    return hints
 
 
 # ── Browse table renderer ─────────────────────────────────────────────────────
 
-def _print_browse_table(markets: list[MarketSummary], title: str = "") -> None:
+def _print_browse_table(
+    markets: list[MarketSummary],
+    title: str = "",
+    *,
+    empty_hints: list[str] | None = None,
+) -> None:
     """
     Print a trader-focused table showing probability, cost, payout, and ROI
     for every market. Sorted by 24h volume descending.
     """
     if not markets:
-        print("\n  No markets found.\n")
+        _print_empty_result(title, empty_hints or [])
         return
 
     w = 140
-    print(f"\n{'═' * w}")
+    print(f"\n{'=' * w}")
     if title:
         print(f"  {title}")
     print(f"  {len(markets)} markets  |  All payouts = $1.00 per contract\n")
@@ -190,7 +261,7 @@ def _print_browse_table(markets: list[MarketSummary], title: str = "") -> None:
     print(f"  PROB% = market's implied probability that YES resolves")
     print(f"  YES/NO COST = price to buy 1 contract  |  PAYOUT = $1.00 if you win")
     print(f"  ROI = (payout - cost) / cost × 100\n")
-    print(f"{'═' * w}\n")
+    print(f"{'=' * w}\n")
 
 
 def _print_ticker_detail(detail: dict) -> None:
@@ -423,6 +494,8 @@ async def cmd_browse(args) -> None:
     min_vol = getattr(args, "min_volume", 0) or 0
     activity_hours = getattr(args, "activity_hours", None)
     full_scan = getattr(args, "full_scan", False) or activity_hours is not None
+    fetch_stats: CategoryFetchStats | None = None
+    event_pre_count: int | None = None
 
     async with MarketClient(creds, limiter) as client:
 
@@ -439,12 +512,13 @@ async def cmd_browse(args) -> None:
         # ── Event group ───────────────────────────────────────────────────────
         if args.event:
             markets = await client.get_event_markets(args.event)
-            title   = f"Event: {args.event}  ({len(markets)} markets)"
+            event_pre_count = len(markets)
+            title   = f"Event: {args.event}  ({event_pre_count} markets)"
             markets = [m for m in markets if m.volume_24h >= min_vol]
 
         # ── Category ──────────────────────────────────────────────────────────
         elif args.category:
-            markets = await client.get_markets_by_category(
+            fetch = await client.get_markets_by_category(
                 category=args.category,
                 status="open",
                 limit=200,
@@ -453,6 +527,8 @@ async def cmd_browse(args) -> None:
                 full_scan=full_scan,
                 **_filter_kwargs(args),
             )
+            markets = fetch.markets
+            fetch_stats = fetch.stats
             title = f"Category: {args.category}{_filter_title_suffix(args)}"
             if activity_hours:
                 title += f"  (active ≤{activity_hours}h)"
@@ -476,15 +552,28 @@ async def cmd_browse(args) -> None:
             print("    python tools/screen.py browse --all\n")
             return
 
+    pre_tradeable = len(markets)
     markets = _apply_browse_filters(markets, args)
+    rejected_tradeable = pre_tradeable - len(markets) if getattr(args, "tradeable_only", False) else 0
+
+    empty_hints = None
+    if not markets:
+        empty_hints = _browse_empty_hints(
+            fetch_stats,
+            min_volume=min_vol,
+            activity_hours=activity_hours,
+            tradeable_only=getattr(args, "tradeable_only", False),
+            rejected_tradeable=rejected_tradeable,
+            event_count=event_pre_count,
+        )
 
     if args.json:
         print(json.dumps([m.to_dict() for m in markets], indent=2, default=str))
     elif args.csv:
         _browse_to_csv(markets, args.csv)
-        _print_browse_table(markets, title)
+        _print_browse_table(markets, title, empty_hints=empty_hints)
     else:
-        _print_browse_table(markets, title)
+        _print_browse_table(markets, title, empty_hints=empty_hints)
 
     # Print quick copy-paste for KALSHI_TICKERS
     tradeable = [m.ticker for m in markets if m.is_tradeable()]
@@ -537,7 +626,8 @@ async def cmd_screen(args) -> None:
         ]
         print(json.dumps(out, indent=2, default=str))
     else:
-        screener.print_report(results, top_n=args.top)
+        empty_hints = _screen_empty_hints(screener) if not results else None
+        screener.print_report(results, top_n=args.top, empty_hints=empty_hints)
         _print_score_reasons(results[:args.top])
 
         tradeable = [r.market.ticker for r in results if r.score >= 0.5]

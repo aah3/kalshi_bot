@@ -142,6 +142,7 @@ class GreenUpPosition:
 
     ticker: str
     state:  PositionState = PositionState.SCANNING
+    cycles_completed: int = 0   # finished entry→hedge/stop round-trips on this ticker
 
     # Entry leg
     entry_price_cents: int  = 0   # YES price paid (cents, 1-99)
@@ -294,6 +295,7 @@ class GreenUpStrategy(BaseStrategy):
         entry_price_mode:       EntryPriceMode = EntryPriceMode.PASSIVE,
         exit_price_mode:        EntryPriceMode = EntryPriceMode.PASSIVE,
         limit_offset_cents:     int       = 0,
+        max_cycles_per_ticker:  int       = 0,
     ) -> None:
         """
         Args:
@@ -313,6 +315,7 @@ class GreenUpStrategy(BaseStrategy):
                                     limit_at_bid, etc.
             exit_price_mode:        How to price hedge/stop (buy NO).
             limit_offset_cents:     For limit_offset mode on entry/exit legs.
+            max_cycles_per_ticker:  Max completed round-trips per ticker (0 = unlimited).
         """
         self._entry_max_price        = entry_max_price
         self._hedge_trigger_price    = hedge_trigger_price
@@ -322,6 +325,7 @@ class GreenUpStrategy(BaseStrategy):
         self._entry_price_mode       = entry_price_mode
         self._exit_price_mode        = exit_price_mode
         self._limit_offset           = limit_offset_cents
+        self._max_cycles_per_ticker  = max(0, int(max_cycles_per_ticker))
 
         # ticker -> GreenUpPosition
         self._positions: dict[str, GreenUpPosition] = {}
@@ -348,6 +352,11 @@ class GreenUpStrategy(BaseStrategy):
             return None
 
         pos = self._positions.get(ticker)
+
+        if pos and pos.state in (PositionState.HEDGED, PositionState.STOPPED):
+            if self._try_begin_new_cycle(pos):
+                return self._check_entry(ticker, tick)
+            return None
 
         if pos and pos.state in (PositionState.HEDGING, PositionState.STOPPING):
             return None
@@ -413,6 +422,7 @@ class GreenUpStrategy(BaseStrategy):
             pos.hedge_order_id    = order_id
             pos.hedged_at         = time.monotonic()
             pos.state             = PositionState.HEDGED
+            pos.cycles_completed += 1
 
             # Actual locked profit from the real fill prices
             locked = pos.potential_return_cents - pos.entry_stake_cents - size_c
@@ -441,6 +451,7 @@ class GreenUpStrategy(BaseStrategy):
             pos.hedge_stake_cents = size_c
             pos.hedge_order_id    = order_id
             pos.state             = PositionState.STOPPED
+            pos.cycles_completed += 1
 
             stop_recovery  = int(size_c * (100.0 / price)) if price > 0 else 0
             net_loss_cents = pos.entry_stake_cents - stop_recovery
@@ -458,6 +469,40 @@ class GreenUpStrategy(BaseStrategy):
                 time_in_trade_s=round(pos.time_in_trade_s, 1),
                 strategy=self.name,
             )
+
+    def _try_begin_new_cycle(self, pos: GreenUpPosition) -> bool:
+        """
+        After HEDGED/STOPPED, allow another entry on this ticker if under the cycle cap.
+        Resets position fields but keeps cycles_completed.
+        """
+        if (
+            self._max_cycles_per_ticker > 0
+            and pos.cycles_completed >= self._max_cycles_per_ticker
+        ):
+            if pos.state != PositionState.CLOSED:
+                pos.state = PositionState.CLOSED
+                logger.info(
+                    "GreenUp: max cycles reached — no further entries",
+                    ticker=pos.ticker,
+                    cycles_completed=pos.cycles_completed,
+                    max_cycles=self._max_cycles_per_ticker,
+                    strategy=self.name,
+                )
+            return False
+
+        completed = pos.cycles_completed
+        self._positions[pos.ticker] = GreenUpPosition(
+            ticker=pos.ticker,
+            cycles_completed=completed,
+        )
+        logger.info(
+            "GreenUp: starting new cycle",
+            ticker=pos.ticker,
+            cycles_completed=completed,
+            max_cycles=self._max_cycles_per_ticker or "unlimited",
+            strategy=self.name,
+        )
+        return True
 
     def add_watch_ticker(self, ticker: str) -> None:
         """Register a ticker to monitor for entry conditions."""
@@ -484,6 +529,7 @@ class GreenUpStrategy(BaseStrategy):
                 "locked_profit_usd":    round(pos.locked_profit_cents / 100, 2),
                 "stop_trigger_price":   pos.stop_loss_trigger_price,
                 "time_in_trade_s":      round(pos.time_in_trade_s, 1),
+                "cycles_completed":   pos.cycles_completed,
             }
             for ticker, pos in self._positions.items()
         ]

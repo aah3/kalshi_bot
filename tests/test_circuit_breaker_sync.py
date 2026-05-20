@@ -44,9 +44,14 @@ def test_sync_from_portfolio_sets_peak_and_positions(cb: CircuitBreaker):
     assert cb._last_portfolio_equity == 10_000
 
 
-@pytest.mark.asyncio
-async def test_sync_trips_on_session_loss(cb: CircuitBreaker, monkeypatch):
+def test_sync_trips_on_session_loss(cb: CircuitBreaker, monkeypatch):
     monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_CENTS", 5_000)
+    # _trip schedules kill_switch via create_task; no loop in plain pytest.
+    def _noop_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(asyncio, "create_task", _noop_create_task)
     cb._session_start_equity = 100_000
     snap = PortfolioSnapshot(
         positions=[],
@@ -58,5 +63,4 @@ async def test_sync_trips_on_session_loss(cb: CircuitBreaker, monkeypatch):
         session_realised_pnl_cents=0,
     )
     cb.sync_from_portfolio(snap)
-    await asyncio.sleep(0)
     assert cb.is_tripped

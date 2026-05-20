@@ -83,6 +83,8 @@ def build_strategy(
     hp_take_profit_pct: float | None = None,
     gu_entry_mode: str | None = None,
     gu_exit_mode: str | None = None,
+    gu_limit_offset: int | None = None,
+    gu_max_cycles: int | None = None,
     hp_exit_mode: str | None = None,
 ) -> BaseStrategy:
     """
@@ -183,6 +185,19 @@ def build_strategy(
         exit_key = (
             gu_exit_mode or os.getenv("KALSHI_GREEN_UP_EXIT_MODE", "passive")
         ).lower()
+        limit_off = (
+            gu_limit_offset
+            if gu_limit_offset is not None
+            else _env_int(
+                "KALSHI_GREEN_UP_LIMIT_OFFSET",
+                _env_int("KALSHI_HP_LIMIT_OFFSET", config.HP_LIMIT_OFFSET),
+            )
+        )
+        max_cycles = (
+            gu_max_cycles
+            if gu_max_cycles is not None
+            else _env_int("KALSHI_GREEN_UP_MAX_CYCLES_PER_TICKER", 0)
+        )
         strat = GreenUpStrategy(
             entry_max_price=entry_max if entry_max is not None else int(
                 os.getenv("KALSHI_GREEN_UP_ENTRY_MAX", "25")
@@ -196,6 +211,8 @@ def build_strategy(
             ),
             entry_price_mode=price_mode_map.get(entry_key, EntryPriceMode.PASSIVE),
             exit_price_mode=price_mode_map.get(exit_key, EntryPriceMode.PASSIVE),
+            limit_offset_cents=limit_off,
+            max_cycles_per_ticker=max_cycles,
         )
         for ticker in tickers:
             strat.add_watch_ticker(ticker)

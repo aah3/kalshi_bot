@@ -38,6 +38,17 @@ base64 -w 0 your_private_key.pem
 
 The bot loads `.env` on startup. Shell exports override `.env` values.
 
+**Demo vs production:** set both key pairs and risk profiles in `.env`, then switch with a single variable:
+
+```env
+KALSHI_ENV=demo          # paper — uses KALSHI_DEMO_* limits, demo DB/log
+# KALSHI_ENV=production  # real money — uses KALSHI_PROD_* (default $1 max position)
+```
+
+Verify before trading: `python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"`
+
+See [.env.example](.env.example) for `KALSHI_DEMO_*` / `KALSHI_PROD_*` blocks and [docs/ROADMAP.md](docs/ROADMAP.md) for the week-by-week certification plan.
+
 ### 3. Run tests
 
 ```bash
@@ -72,6 +83,8 @@ The bot watches **all N discovered tickers** in parallel. Each order is priced f
 | `--gu-entry-mode` | `passive` | How to price **buy YES** entries (see order pricing) |
 | `--gu-exit-mode` | `passive` | How to price **buy NO** hedge/stop legs |
 | `--max-concurrent-positions` | `0` (unlimited) | Cap simultaneous open/pending entry legs (hedges/stops still allowed) |
+| `--gu-max-cycles` | `0` (unlimited) | Max completed entry→hedge/stop round-trips per ticker |
+| `--gu-limit-offset` | `0` | With `limit_offset` mode: cents added to bid (`-2` = bid−2¢) |
 
 **Sizing:** fractional Kelly from entry vs hedge-trigger odds, capped by `MAX_POSITION_CENTS` (default $100). Contract count = `size_cents // entry_price`.
 
@@ -302,8 +315,7 @@ See [Manual trading](#manual-trading-toolstradepy) for the full command list.
 While `main.py` runs, a full-screen table shows cash, P&L, per-ticker bid/ask, strategy state (watching → entered → hedged), and alerts. Refresh interval defaults to `KALSHI_MONITOR_INTERVAL` (15s); override with `--monitor-interval` (use `0` to disable).
 
 ```bash
-python main.py --strategy green_up --tickers TICKER-A \
-  --entry-max 10 --hedge-trigger 13 --monitor-interval 5
+python main.py --strategy green_up --tickers TICKER-A --entry-max 10 --hedge-trigger 13 --monitor-interval 5
 
 python main.py --strategy high_prob --tickers TICKER-A --monitor-interval 15
 ```
@@ -561,7 +573,7 @@ kalshi_bot/
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `KELLY_DIVISOR` | 4 | Quarter-Kelly sizing |
-| `MAX_POSITION_CENTS` | 10,000 | $100 cap per market |
+| `MAX_POSITION_CENTS` | demo: 10,000 / prod: 100 | Per-market cap (`KALSHI_DEMO_*` / `KALSHI_PROD_*`) |
 | `MIN_EDGE_TO_VIG` | 0.02 | Minimum edge vs half-spread |
 | `FEE_PER_CONTRACT_CENTS` | 7.0 | Per-contract fee (set from your tier) |
 | `HP_MIN_YES_ASK` / `HP_MAX_YES_ASK` | 85 / 97 | High-prob entry window |
@@ -569,9 +581,9 @@ kalshi_bot/
 | `HP_USE_FEE_ADJUSTED_ROI` | true | Gate entries on net ROI after fees |
 | `HP_ASSUME_ROUND_TRIP_FEES` | false | Also count exit fee in ROI gate (or infer from post-fill) |
 | `MAX_DRAWDOWN_PCT` | 0.10 | Kill switch drawdown |
-| `DAILY_LOSS_LIMIT_CENTS` | 50,000 | Daily stop ($500) |
+| `DAILY_LOSS_LIMIT_CENTS` | demo: 50,000 / prod: 500 | Daily stop (`KALSHI_DEMO_*` / `KALSHI_PROD_*`) |
 | `POSITION_STOP_LOSS_PCT` | 0.40 | Alert when unrealised loss ≥ 40% of cost |
-| `KALSHI_DB_PATH` | `kalshi_bot.db` | Blotter + metrics SQLite file |
+| `KALSHI_DB_PATH` | demo/prod paths | Blotter DB (`KALSHI_DEMO_DB_PATH` / `KALSHI_PROD_DB_PATH`) |
 | `KALSHI_MONITOR_INTERVAL` | 15 | Live table refresh (seconds); `0` = off |
 | `KALSHI_MAX_CONCURRENT_POSITIONS` | `0` | Cap entry legs per strategy (`0` = unlimited) |
 | `KALSHI_LIVE_ONLY` | `true` | Live discovery + entry gates |

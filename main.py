@@ -476,6 +476,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gu-limit-offset",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help=(
+            "Green-up: cents added to bid for limit_offset entry mode "
+            "(negative = bid minus |n|). Env KALSHI_GREEN_UP_LIMIT_OFFSET"
+        ),
+    )
+    parser.add_argument(
+        "--gu-max-cycles",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Green-up: max completed round-trips per ticker (0=unlimited). "
+            "Env KALSHI_GREEN_UP_MAX_CYCLES_PER_TICKER"
+        ),
+    )
+    parser.add_argument(
         "--comp-pairs",
         nargs="*",
         metavar="T1:T2",
@@ -883,6 +903,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
             stop_loss=args.stop_loss,
             gu_entry_mode=args.gu_entry_mode,
             gu_exit_mode=args.gu_exit_mode,
+            gu_limit_offset=args.gu_limit_offset,
+            gu_max_cycles=args.gu_max_cycles,
             comp_pairs=comp_pairs,
             hp_min_yes_ask=args.hp_min_yes_ask,
             hp_max_yes_ask=args.hp_max_yes_ask,
@@ -1025,6 +1047,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
                 stop_loss_threshold=_strategy._stop_loss_threshold,
                 entry_price_mode=_strategy._entry_price_mode.value,
                 exit_price_mode=_strategy._exit_price_mode.value,
+                max_cycles_per_ticker=_strategy._max_cycles_per_ticker,
+                limit_offset_cents=_strategy._limit_offset,
             )
     logger.info("Kalshi trading bot started", **startup_kw)
 

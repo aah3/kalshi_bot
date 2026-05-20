@@ -167,7 +167,126 @@ class MarketSummary:
 from discovery.orderbook_parse import OrderBookSnapshot, parse_orderbook_response
 
 # Re-export for callers that import from market_client
-__all__ = ["MarketClient", "MarketSummary", "OrderBookSnapshot"]
+__all__ = [
+    "CategoryFetchResult",
+    "CategoryFetchStats",
+    "MarketClient",
+    "MarketSummary",
+    "OrderBookSnapshot",
+]
+
+
+@dataclass
+class CategoryFetchStats:
+    """Counts from a category browse/discovery fetch (for empty-state hints)."""
+    category:             str
+    events_matched:       int = 0
+    pages_scanned:        int = 0
+    markets_seen:         int = 0   # open markets in matched events
+    matched:              int = 0   # passed all API-layer filters
+    pass_volume_only:     int = 0   # vol ok, failed activity (when activity set)
+    pass_activity_only:   int = 0   # activity ok, failed volume (when volume set)
+    max_vol_activity_only: int = 0  # peak vol24h among pass_activity_only
+    rejected_no_update:   int = 0   # failed activity because updated_at missing
+    full_scan:            bool = False
+
+    def format_empty_hints(
+        self,
+        *,
+        min_volume_24h: int = 0,
+        activity_hours: float | None = None,
+        tradeable_only: bool = False,
+        rejected_tradeable: int = 0,
+        env: str = "",
+    ) -> list[str]:
+        """Human-readable lines explaining why a browse/screen fetch returned nothing."""
+        lines: list[str] = []
+        scan = f"{self.events_matched:,} events"
+        if self.pages_scanned:
+            scan += f", {self.pages_scanned} pages"
+        if self.full_scan:
+            scan += ", full scan"
+        if self.markets_seen:
+            scan += f", {self.markets_seen:,} open markets"
+
+        if self.events_matched == 0:
+            lines.append(f"No open events found for {self.category!r}.")
+            lines.append("Check the category name with: python tools/screen.py --categories")
+            return lines
+
+        lines.append(f"Scan covered {scan}.")
+
+        vol_on = min_volume_24h > 0
+        act_on = activity_hours is not None
+
+        if vol_on and act_on:
+            if self.pass_activity_only:
+                peak = f" (peak vol24h: {self.max_vol_activity_only:,})"
+                lines.append(
+                    f"  {self.pass_activity_only:,} updated within {activity_hours:g}h"
+                    f" but below min volume ({min_volume_24h:,}){peak}."
+                )
+            if self.pass_volume_only:
+                lines.append(
+                    f"  {self.pass_volume_only:,} meet volume (>={min_volume_24h:,})"
+                    f" but were not updated within {activity_hours:g}h."
+                )
+            if self.rejected_no_update:
+                lines.append(
+                    f"  {self.rejected_no_update:,} lack updated_time"
+                    f" (cannot satisfy --activity-hours)."
+                )
+        elif vol_on:
+            lines.append(
+                f"  All {self.markets_seen:,} open markets are below"
+                f" min volume ({min_volume_24h:,})."
+            )
+        elif act_on:
+            if self.rejected_no_update:
+                lines.append(
+                    f"  {self.rejected_no_update:,} markets lack updated_time."
+                )
+            stale = self.markets_seen - self.pass_activity_only - self.matched
+            if stale > 0 and self.pass_activity_only == 0:
+                lines.append(
+                    f"  None updated within {activity_hours:g}h"
+                    f" ({stale:,} open markets are older)."
+                )
+            elif self.pass_activity_only == 0:
+                lines.append(f"  None updated within {activity_hours:g}h.")
+
+        if tradeable_only and rejected_tradeable:
+            lines.append(
+                f"  {rejected_tradeable:,} matched API filters but failed"
+                f" --tradeable-only (spread, bid/ask, or expiring soon)."
+            )
+
+        tips: list[str] = []
+        if vol_on and act_on and self.pass_activity_only and not self.matched:
+            tips.append(
+                f"drop --min-volume {min_volume_24h} to see recently updated markets"
+            )
+        if vol_on and act_on and self.pass_volume_only and not self.matched:
+            tips.append(
+                f"drop --activity-hours {activity_hours:g} to see high-volume markets"
+            )
+        if vol_on and not act_on and not self.matched:
+            tips.append("lower --min-volume or omit it")
+        if act_on and not vol_on and not self.matched:
+            tips.append("raise --activity-hours or omit it")
+        if env == "demo" and act_on and (self.pass_volume_only or vol_on and act_on):
+            tips.append(
+                "demo API often has stale updated_time on high-volume markets"
+            )
+        if tips:
+            lines.append("Try: " + "; ".join(tips) + ".")
+        return lines
+
+
+@dataclass
+class CategoryFetchResult:
+    markets: list[MarketSummary]
+    stats:   CategoryFetchStats
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -179,7 +298,8 @@ class MarketClient:
     Usage:
         async with MarketClient(credentials, rate_limiter) as client:
             categories = await client.get_categories()
-            markets    = await client.get_markets_by_category("Politics", limit=50)
+            result     = await client.get_markets_by_category("Politics", limit=50)
+            markets    = result.markets
             book       = await client.get_order_book("PRES-2024-DEM")
     """
 
@@ -296,7 +416,7 @@ class MarketClient:
         sport: str | None = None,
         competition: str | None = None,
         scope: str | None = None,
-    ) -> list[MarketSummary]:
+    ) -> CategoryFetchResult:
         """
         Fetch open markets in a given category.
 
@@ -349,12 +469,19 @@ class MarketClient:
                     category=category,
                     tag=tag_filter,
                 )
-                return []
+                return CategoryFetchResult([], CategoryFetchStats(category=category))
 
         collected: list[MarketSummary] = []
         cursor: str | None = None
         pages = 0
         events_matched = 0
+        markets_seen = 0
+        pass_volume_only = 0
+        pass_activity_only = 0
+        max_vol_activity_only = 0
+        rejected_no_update = 0
+        vol_filter = min_volume_24h > 0
+        act_filter = activity_hours is not None
         target_pool = 0 if full_scan else (max(limit * 5, 400) if limit else 0)
         max_pages = 500 if full_scan else 50
 
@@ -387,26 +514,53 @@ class MarketClient:
                 for raw in event.get("markets", []):
                     if status and not self._market_matches_status(raw.get("status"), status):
                         continue
+                    markets_seen += 1
                     if not raw.get("series_ticker"):
                         raw["series_ticker"] = series_tk
                     raw["_category_override"] = (
                         event.get("category") if trending else category
                     ) or category
                     m = self._parse_market(raw)
-                    if m.volume_24h < min_volume_24h:
-                        continue
-                    if activity_hours is not None and not self._matches_activity_hours(m, activity_hours):
-                        continue
-                    collected.append(m)
+                    vol_ok = m.volume_24h >= min_volume_24h
+                    if act_filter:
+                        if m.updated_at is None:
+                            act_ok = False
+                            if not vol_ok or vol_filter:
+                                rejected_no_update += 1
+                        else:
+                            act_ok = self._matches_activity_hours(m, activity_hours)
+                    else:
+                        act_ok = True
+
+                    if vol_ok and act_ok:
+                        collected.append(m)
+                    elif vol_ok and act_filter and not act_ok:
+                        pass_volume_only += 1
+                    elif act_ok and vol_filter and not vol_ok:
+                        pass_activity_only += 1
+                        max_vol_activity_only = max(max_vol_activity_only, m.volume_24h)
 
             if target_pool and limit and len(collected) >= target_pool:
                 break
             if not cursor or not batch:
                 break
 
+        stats = CategoryFetchStats(
+            category=category,
+            events_matched=events_matched,
+            pages_scanned=pages,
+            markets_seen=markets_seen,
+            matched=len(collected),
+            pass_volume_only=pass_volume_only,
+            pass_activity_only=pass_activity_only,
+            max_vol_activity_only=max_vol_activity_only,
+            rejected_no_update=rejected_no_update,
+            full_scan=full_scan,
+        )
+
         if not collected and events_matched == 0:
             logger.warning("No events found for category", category=category)
-            return []
+            return CategoryFetchResult([], stats)
 
         collected.sort(key=lambda m: m.volume_24h, reverse=True)
         result = collected[:limit] if limit else collected
@@ -419,11 +573,15 @@ class MarketClient:
             scope=scope,
             pages_scanned=pages,
             events_matched=events_matched,
+            markets_seen=markets_seen,
             matched=len(collected),
+            pass_volume_only=pass_volume_only,
+            pass_activity_only=pass_activity_only,
             total=len(result),
             tradeable=sum(1 for m in result if m.is_tradeable()),
         )
-        return result
+        return CategoryFetchResult(result, stats)
+
     async def get_all_open_markets(
         self,
         limit: int = 200,
