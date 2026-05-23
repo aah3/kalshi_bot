@@ -98,6 +98,10 @@ Before any production run, every strategy must pass:
 
 **Week 1 deliverable:** Signed checklist rows 4–6 in [README Production checklist](../README.md#production-checklist) for platform only.
 
+# Print on screen
+```bash
+$env:PYTHONIOENCODING = 'utf-8'
+
 #### Step 1.4 — Run bot ~30 minutes + graceful shutdown
 
 **What it means:** Prove the bot can stay up (WebSocket, portfolio risk sync, optional monitor table) and exit cleanly when you press **Ctrl+C** (SIGINT). You are **not** required to complete a full trade cycle in this step.
@@ -107,12 +111,42 @@ Before any production run, every strategy must pass:
 ```bash
 python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"
 
-# Discover-only first (optional sanity check)
+# Discover-only first (required — do not start the soak until this prints tickers,
+# or fall back to explicit --tickers from screen.py below)
 python main.py --discover --discover-category Sports --strategy high_prob --discover-only
 
-# Then run ~30 minutes with a small ticker set (adjust tickers after discover-only)
-python main.py --discover --discover-category Sports --strategy high_prob \
-  --discover-top 2 --hp-entry-mode passive --monitor-interval 30
+# Demo Sports often has no high_prob band matches (YES ask 85–97¢ + fee-adjusted ROI).
+# If discover-only exits with filter_rejections, pick liquid tickers via screen:
+python tools/screen.py browse --category Sports --min-volume 10 --full-scan
+
+# Platform soak with explicit tickers (Week 1 goal: stay up + clean shutdown, not P&L):
+$env:KALSHI_TICKERS="KXMENWORLDCUP-26-EC,KXMENWORLDCUP-26-NO,KXMENWORLDCUP-26-CIV,KXMENWORLDCUP-26"
+$enf:KALSHI_TICKERS="KXMLBTOTAL-26MAY231420HOUCHC-6"
+python main.py --tickers $env:KALSHI_TICKERS --strategy high_prob --hp-entry-mode passive --monitor-interval 30
+
+# If discover-only succeeded, you can use discovery for the soak instead:
+python main.py --discover --discover-category Sports --strategy high_prob --discover-top 2 --hp-entry-mode passive --monitor-interval 30
+
+python main.py --tickers KXMLBTOTAL-26MAY231420HOUCHC-6 --strategy high_prob --hp-min-yes-ask 70 --hp-entry-mode limit_offset --monitor-interval 30
+
+python tools/trade.py buy --ticker KXMLBTOTAL-26MAY231420HOUCHC-6 --side yes --count 1 --price 69 --tif gtc --yes
+
+$env:KALSHI_HP_LIMIT_OFFSET = "-1"
+python main.py --tickers KXMLBTOTAL-26MAY231420HOUCHC-6 --strategy high_prob --hp-min-yes-ask 70 --hp-entry-mode limit_offset --monitor-interval 30
+# --hp-entry-mode cross_spread or market
+
+```
+
+```bash
+# DISCOVERY: Table + near-misses (stdout)
+python main.py --discover --discover-category Sports --strategy high_prob --discover-only
+python main.py --discover --discover-category Sports --strategy green_up --discover-only
+
+# Last discovery log lines (file)
+Get-Content kalshi_bot.jsonl -Tail 20
+
+# Filter discovery events only
+Select-String -Path kalshi_bot.jsonl -Pattern "Ticker discovery complete|filter_rejections"
 ```
 
 **While running (spot-check at ~5 and ~25 min):**
@@ -339,13 +373,37 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 
 ```bash
 # high_prob — one liquid high-P(YES) market
-python main.py --strategy high_prob --tickers YOUR-TICKER \
-  --hp-entry-mode cross_spread --hp-post-fill hold --max-concurrent-positions 1
+python main.py --strategy high_prob --tickers YOUR-TICKER --hp-entry-mode cross_spread --hp-post-fill hold --max-concurrent-positions 1
+
+# Preview first (bid 78, bid-2 = 76)
+python tools/trade.py preview --ticker KXMLBTOTAL-26MAY231420HOUCHC-6 --side yes --count 1 --price 76 --tif gtc --monitor-interval 30
+
+# Place
+python tools/trade.py buy --ticker KXMLBTOTAL-26MAY231420HOUCHC-6 --side yes --count 1 --price 76 --tif gtc --yes
+
+#  price = max(1, min(99, best_bid + limit_offset))
+#  tif = "gtc" if price <= best_bid else "ioc"
+#  return price, "limit", tif
+
+$env:KALSHI_HP_LIMIT_OFFSET = "-2"
+python main.py --tickers $env:KALSHI_TICKERS --strategy high_prob `
+  --hp-min-yes-ask 75 `
+  --hp-entry-mode limit_offset `
+  --monitor-interval 30
+
+$env:KALSHI_HP_LIMIT_OFFSET = "-2"
+python main.py --tickers KXMLBTOTAL-26MAY231420HOUCHC-6 --strategy high_prob --hp-min-yes-ask 75 --hp-entry-mode limit_offset --monitor-interval 30
+
 
 # green_up — one live underdog
 python main.py --strategy green_up --tickers YOUR-TICKER \
   --entry-max 25 --hedge-trigger 68 --gu-entry-mode market \
   --gu-exit-mode cross_spread --max-concurrent-positions 1
+
+python main.py --tickers $env:KALSHI_TICKERS --strategy green_up `
+  --entry-max 85 `
+  --gu-entry-mode limit_offset --gu-limit-offset -2 `
+  --monitor-interval 30
 ```
 
 ---
@@ -390,6 +448,7 @@ Session monitor / logs should show state transitions per ticker. One **parent tr
    ```bash
    python tools/screen.py screen --category Sports --top 10
    python tools/screen.py browse --ticker YOUR-TICKER
+   python tools/screen.py browse --ticker KXMLB-26-LAD
    ```
 
    Prefer: YES ask ≤ `--entry-max`, volume ≥ preset, game closing within live window.

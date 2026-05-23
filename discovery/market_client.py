@@ -21,13 +21,14 @@ Kalshi REST endpoints used
   GET /markets                       → paginated market list (filterable)
   GET /markets/{ticker}              → single market detail
   GET /markets/{ticker}/orderbook    → current order book snapshot
-  GET /markets/{ticker}/history      → candlestick price history
+  GET /markets/candlesticks          → candlestick price history (batch)
   GET /series                        → all series (broader than events)
   GET /search/tags_by_categories     → tags (subcategories) per category
   GET /search/filters_by_sport       → sports, leagues, and scopes
 """
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -686,22 +687,49 @@ class MarketClient:
         self,
         ticker: str,
         period_seconds: int = 3600,
+        *,
+        lookback_periods: int = 24,
     ) -> list[dict[str, Any]]:
         """
         Fetch candlestick price history for a ticker.
 
         Args:
-            ticker:         Market ticker.
-            period_seconds: Candle size in seconds (60, 300, 3600, 86400).
+            ticker:           Market ticker.
+            period_seconds:   Candle size in seconds (maps to 1m, 1h, or 1d).
+            lookback_periods: Number of candles to request.
 
         Returns:
             List of candle dicts: {ts, open, high, low, close, volume}
         """
-        data = await self._get(
-            f"/markets/{ticker}/history",
-            params={"period_seconds": period_seconds},
-        )
-        return data.get("history", [])
+        period_interval = self._period_seconds_to_interval(period_seconds)
+        end_ts = int(time.time())
+        start_ts = end_ts - period_seconds * lookback_periods
+
+        try:
+            data = await self._get(
+                "/markets/candlesticks",
+                params={
+                    "market_tickers": ticker,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "period_interval": period_interval,
+                },
+            )
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                logger.warning("Price history not found", ticker=ticker)
+                return []
+            raise
+
+        raw_candles: list[dict[str, Any]] = []
+        for entry in data.get("markets", []):
+            if entry.get("market_ticker") == ticker:
+                raw_candles = entry.get("candlesticks", [])
+                break
+        if not raw_candles and data.get("markets"):
+            raw_candles = data["markets"][0].get("candlesticks", [])
+
+        return [self._parse_candlestick(c) for c in raw_candles]
 
     # ── Bulk order book fetch ─────────────────────────────────────────────────
 
@@ -815,6 +843,43 @@ class MarketClient:
             return False
         age_hours = (datetime.now(timezone.utc) - market.updated_at).total_seconds() / 3600.0
         return age_hours <= activity_hours
+
+    @staticmethod
+    def _period_seconds_to_interval(period_seconds: int) -> int:
+        """Map candle size in seconds to Kalshi period_interval (minutes)."""
+        if period_seconds >= 86400:
+            return 1440
+        if period_seconds >= 3600:
+            return 60
+        return 1
+
+    @staticmethod
+    def _parse_candlestick(raw: dict[str, Any]) -> dict[str, Any]:
+        """Normalise a Kalshi candlestick into {ts, open, high, low, close, volume}."""
+
+        def _dollars_to_cents(val: Any) -> int | None:
+            if val is None or val == "":
+                return None
+            try:
+                return int(round(float(val) * 100))
+            except (TypeError, ValueError):
+                return None
+
+        price = raw.get("price", {})
+        volume = raw.get("volume_fp", raw.get("volume", 0))
+        try:
+            volume_int = int(float(volume))
+        except (TypeError, ValueError):
+            volume_int = 0
+
+        return {
+            "ts": raw.get("end_period_ts"),
+            "open": _dollars_to_cents(price.get("open_dollars")),
+            "high": _dollars_to_cents(price.get("high_dollars")),
+            "low": _dollars_to_cents(price.get("low_dollars")),
+            "close": _dollars_to_cents(price.get("close_dollars")),
+            "volume": volume_int,
+        }
 
     @staticmethod
     def _market_matches_status(market_status: str | None, requested: str) -> bool:

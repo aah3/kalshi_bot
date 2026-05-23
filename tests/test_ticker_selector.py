@@ -5,8 +5,12 @@ from discovery.ticker_selector import (
     DEFAULT_DISCOVER_CATEGORY,
     TickerCriteria,
     filter_markets,
+    format_discovery_table,
+    market_filter_rejection,
+    near_miss_markets,
     resolve_discover_category,
     select_tickers,
+    summarize_filter_rejections,
 )
 
 
@@ -74,3 +78,66 @@ def test_min_volume_filter():
     ]
     criteria = TickerCriteria(category="Sports", top_n=10, min_volume_24h=100)
     assert select_tickers(markets, criteria) == ["B"]
+
+
+def test_summarize_filter_rejections():
+    markets = [
+        _market("LOW-ASK", volume_24h=500, yes_ask=80),
+        _market("HIGH-ASK", volume_24h=500, yes_ask=97),
+        _market("OK", volume_24h=500, yes_ask=88),
+    ]
+    criteria = TickerCriteria(
+        category="Sports",
+        top_n=5,
+        min_yes_ask=85,
+        max_yes_ask=97,
+        min_fee_adjusted_roi_pct=2.0,
+        tradeable_only=False,
+        live_only=False,
+    )
+    summary = summarize_filter_rejections(markets, criteria)
+    assert summary["passed"] == 1
+    assert summary["min_yes_ask"] == 1
+    assert summary["fee_adjusted_roi"] == 1
+    assert market_filter_rejection(markets[2], criteria) is None
+
+
+def test_near_miss_markets_when_none_selected():
+    markets = [
+        _market("LOW-ASK", volume_24h=500, yes_ask=80),
+        _market("HIGH-ASK", volume_24h=900, yes_ask=97),
+        _market("OK", volume_24h=500, yes_ask=88),
+    ]
+    criteria = TickerCriteria(
+        category="Sports",
+        top_n=2,
+        min_yes_ask=85,
+        max_yes_ask=97,
+        min_fee_adjusted_roi_pct=2.0,
+        tradeable_only=False,
+        live_only=False,
+    )
+    misses = near_miss_markets(markets, criteria, limit=5)
+    assert len(misses) == 2
+    assert misses[0][0].ticker == "HIGH-ASK"
+    assert misses[0][1] == "fee_adjusted_roi"
+
+
+def test_format_discovery_table_shows_near_misses():
+    markets = [
+        _market("LOW-ASK", volume_24h=500, yes_ask=80),
+        _market("HIGH-ASK", volume_24h=900, yes_ask=97),
+    ]
+    criteria = TickerCriteria(
+        category="Sports",
+        top_n=2,
+        min_yes_ask=85,
+        max_yes_ask=97,
+        min_fee_adjusted_roi_pct=2.0,
+        tradeable_only=False,
+        live_only=False,
+    )
+    text = format_discovery_table(markets, [], criteria)
+    assert "Near misses" in text
+    assert "HIGH-ASK" in text
+    assert "fee ROI too low" in text

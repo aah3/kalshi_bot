@@ -56,6 +56,7 @@ from discovery.ticker_selector import (
     discover_tickers,
     discover_with_details,
     format_discovery_table,
+    summarize_filter_rejections,
 )
 from strategy.base_strategy import BaseStrategy
 from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_probs, build_strategy
@@ -105,6 +106,56 @@ _live_rules = None
 _portfolio_snapshot = None  # latest exchange-backed snapshot (risk sync)
 
 
+def _rollback_pending_entry(ticker: str) -> None:
+    """
+    If an entry signal was generated but never submitted, allow retry.
+
+    Green-up sets WATCHING inside evaluate() before gates/circuit breaker run.
+    """
+    if not _strategy:
+        return
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState
+
+    if isinstance(_strategy, GreenUpStrategy):
+        pos = _strategy.get_position(ticker)
+        if pos and pos.state == PositionState.WATCHING:
+            pos.state = PositionState.SCANNING
+
+
+async def _register_markets_for_tickers(
+    tickers: list[str],
+    credentials: CredentialManager,
+    rate_limiter: RateLimiter,
+) -> None:
+    """Load market metadata so sector/category gates work with --tickers."""
+    if not tickers:
+        return
+    from discovery.market_client import MarketClient
+    from discovery.market_registry import register_markets
+
+    client = MarketClient(credentials, rate_limiter)
+    markets = []
+    for ticker in dict.fromkeys(tickers):
+        try:
+            summary = await client.get_market(ticker)
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch market metadata",
+                ticker=ticker,
+                error=str(exc),
+            )
+            continue
+        if summary:
+            markets.append(summary)
+    if markets:
+        register_markets(markets)
+        logger.info(
+            "Market registry updated",
+            tickers=[m.ticker for m in markets],
+            categories=sorted({m.category for m in markets if m.category}),
+        )
+
+
 # ── Tick callback ─────────────────────────────────────────────────────────────
 
 async def on_tick(tick: dict[str, Any]) -> None:
@@ -147,12 +198,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
                 ticker=ticker,
                 reason=reason,
             )
-            from strategy.green_up_strategy import GreenUpStrategy, PositionState
-
-            if isinstance(_strategy, GreenUpStrategy):
-                pos = _strategy.get_position(ticker)
-                if pos and pos.state == PositionState.WATCHING:
-                    pos.state = PositionState.SCANNING
+            _rollback_pending_entry(ticker)
             return
 
     if phase in ("entry", "leg_1"):
@@ -175,6 +221,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
                 ticker=signal_obj.ticker,
                 reason=reason,
             )
+            _rollback_pending_entry(signal_obj.ticker)
             return
 
     if (
@@ -193,6 +240,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
                 open_count=open_count,
                 max_concurrent=_max_concurrent_positions,
             )
+            _rollback_pending_entry(signal_obj.ticker)
             return
 
     # Record signal intent (for fill-rate tracking)
@@ -215,6 +263,8 @@ async def on_tick(tick: dict[str, Any]) -> None:
     )
 
     if not _circuit_breaker.approve(signal_obj):
+        if phase in ("entry", "leg_1"):
+            _rollback_pending_entry(signal_obj.ticker)
         return
 
     # Determine trade_type from signal metadata
@@ -226,6 +276,8 @@ async def on_tick(tick: dict[str, Any]) -> None:
     # Submit order to exchange (blotter records on confirmed WS fill only)
     order = await _execution.submit_order(signal_obj)
     if not order:
+        if phase in ("entry", "leg_1"):
+            _rollback_pending_entry(ticker)
         return
 
     order_id = order.get("order_id", "")
@@ -791,6 +843,48 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
     return criteria
 
 
+def _log_discovery_empty(
+    criteria: TickerCriteria,
+    markets: list,
+    *,
+    discover_only: bool,
+) -> None:
+    """Explain why discovery selected zero tickers."""
+    rejections = summarize_filter_rejections(markets, criteria)
+    passed = rejections.pop("passed", 0)
+    msg = (
+        "Discovery matched no tickers — relax filters, add --discover-full-scan, "
+        "or pass --tickers explicitly"
+        if not discover_only
+        else "Discovery matched no tickers — relax filters or use --discover-full-scan"
+    )
+    log_kwargs: dict[str, object] = {
+        "category": criteria.category,
+        "api_pool": len(markets),
+        "passed_filters": passed,
+        "preset": criteria.preset_name,
+        "min_yes_ask": criteria.min_yes_ask,
+        "max_yes_ask": criteria.max_yes_ask,
+    }
+    if rejections:
+        log_kwargs["filter_rejections"] = rejections
+    if markets and rejections:
+        top_reason = max(rejections, key=rejections.get)
+        log_kwargs["top_rejection"] = top_reason
+    if not markets:
+        log_kwargs["hint"] = (
+            "API returned zero markets — lower --discover-min-volume, "
+            "increase --discover-activity-hours, or add --discover-full-scan"
+        )
+    elif rejections:
+        log_kwargs["hint"] = (
+            "Markets were fetched but post-filters removed all of them — "
+            "run with --discover-only to inspect filter_rejections, "
+            "use tools/screen.py browse, or pass --tickers explicitly"
+        )
+    logger.error(msg, **log_kwargs)
+
+
 async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
     """
     Explicit --tickers wins; else --discover / KALSHI_DISCOVER; else env list.
@@ -818,10 +912,7 @@ async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
         )
         print(format_discovery_table(markets, tickers, criteria))
         if not tickers:
-            logger.error(
-                "Discovery matched no tickers — relax filters or use --discover-full-scan",
-                category=criteria.category,
-            )
+            _log_discovery_empty(criteria, markets, discover_only=True)
             sys.exit(1)
         print(f"\n  KALSHI_TICKERS=\"{','.join(tickers)}\"\n")
         sys.exit(0)
@@ -833,11 +924,7 @@ async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
 
     set_markets(markets)
     if not tickers:
-        logger.error(
-            "Discovery matched no tickers — relax filters, add --discover-full-scan, "
-            "or pass --tickers explicitly",
-            category=criteria.category,
-        )
+        _log_discovery_empty(criteria, markets, discover_only=False)
         sys.exit(1)
     return tickers
 
@@ -976,9 +1063,18 @@ async def main(args: argparse.Namespace | None = None) -> None:
     global _portfolio_snapshot
     try:
         _portfolio_snapshot = await _portfolio_monitor.refresh()
+        registry_tickers = list(
+            dict.fromkeys(
+                tickers + [p.ticker for p in _portfolio_snapshot.positions]
+            )
+        )
+        await _register_markets_for_tickers(
+            registry_tickers, credentials, rate_limiter
+        )
         _circuit_breaker.sync_from_portfolio(_portfolio_snapshot)
     except Exception as exc:
         logger.warning(f"Initial portfolio risk sync failed: {exc}")
+        await _register_markets_for_tickers(tickers, credentials, rate_limiter)
 
     # Background tasks
     settlement_task = asyncio.create_task(

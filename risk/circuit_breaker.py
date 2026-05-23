@@ -107,21 +107,24 @@ class CircuitBreaker:
             logger.warning("MAX_OPEN_POSITIONS reached — rejecting signal", ticker=signal.ticker)
             return False
 
-        # Check 3: sector concentration
-        sector = signal.meta.get("sector", "unknown") if signal.meta else "unknown"
-        portfolio_total = self._total_exposure()
-        if portfolio_total > 0:
-            new_sector_exp = self._sector_exposure.get(sector, 0) + signal.size_cents
-            concentration  = new_sector_exp / portfolio_total
-            if concentration > config.MAX_SECTOR_CONCENTRATION:
-                logger.warning(
-                    "Sector concentration limit breached — rejecting signal",
-                    ticker=signal.ticker,
-                    sector=sector,
-                    concentration=round(concentration, 3),
-                    limit=config.MAX_SECTOR_CONCENTRATION,
-                )
-                return False
+        # Check 3: sector concentration (entries only; hedges/stops always pass)
+        phase = (signal.meta or {}).get("phase", "entry")
+        if phase in ("entry", "leg_1"):
+            sector = self._resolve_signal_sector(signal)
+            portfolio_total = self._total_exposure()
+            if portfolio_total > 0:
+                new_sector_exp = self._sector_exposure.get(sector, 0) + signal.size_cents
+                new_total = portfolio_total + signal.size_cents
+                concentration = new_sector_exp / new_total
+                if concentration > config.MAX_SECTOR_CONCENTRATION:
+                    logger.warning(
+                        "Sector concentration limit breached — rejecting signal",
+                        ticker=signal.ticker,
+                        sector=sector,
+                        concentration=round(concentration, 3),
+                        limit=config.MAX_SECTOR_CONCENTRATION,
+                    )
+                    return False
 
         # Check 4: drawdown (evaluated separately, always)
         self._check_drawdown()
@@ -232,6 +235,23 @@ class CircuitBreaker:
         self.is_tripped = False
 
     # ── Private ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_signal_sector(signal: Signal) -> str:
+        """
+        Resolve sector/category for concentration checks.
+
+        Prefer market registry (same source as sync_from_portfolio), then
+        signal meta — avoids labelling every new entry as ``unknown`` when
+        ``--tickers`` is used without ``--discover``.
+        """
+        from discovery.market_registry import get_market
+
+        market = get_market(signal.ticker)
+        if market and market.category:
+            return market.category
+        meta = signal.meta or {}
+        return meta.get("sector") or meta.get("category") or "unknown"
 
     def _total_exposure(self) -> int:
         return sum(p.size_cents for p in self._positions.values())

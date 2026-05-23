@@ -12,6 +12,13 @@ def set_markets(markets: list[MarketSummary]) -> None:
     _by_ticker = {m.ticker: m for m in markets}
 
 
+def register_markets(markets: list[MarketSummary]) -> None:
+    """Merge market metadata into the registry without clearing existing entries."""
+    for m in markets:
+        if m.ticker:
+            _by_ticker[m.ticker] = m
+
+
 def get_market(ticker: str) -> MarketSummary | None:
     return _by_ticker.get(ticker)
 

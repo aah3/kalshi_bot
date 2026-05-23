@@ -12,6 +12,9 @@ cfg.LOG_FILE = "test.jsonl"
 cfg.FEE_PER_CONTRACT_CENTS = 7.0
 cfg.HP_USE_FEE_ADJUSTED_ROI = True
 cfg.HP_MIN_ROI_PCT = 2.0
+cfg.HP_MIN_YES_ASK = 85
+cfg.HP_MAX_YES_ASK = 97
+cfg.HP_MAX_SPREAD_CENTS = 8
 sys.modules["config"] = cfg
 
 log_mod = types.ModuleType("logging_.structured_logger")
@@ -61,7 +64,7 @@ def test_apply_high_prob_preset():
     assert merged.min_yes_ask == 85
     assert merged.max_yes_ask == 97
     assert merged.rank_by == "fee_adjusted_roi"
-    assert merged.min_fee_adjusted_roi_pct == 1.5
+    assert merged.min_fee_adjusted_roi_pct == 2.0
     assert merged.preset_name == "high_prob"
 
 

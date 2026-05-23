@@ -205,6 +205,24 @@ class TestSectorConcentration:
         sig = _signal(ticker="FIRST", size_cents=1_000, sector="Economics")
         assert cb.approve(sig) is True
 
+    def test_unknown_portfolio_allows_new_sector_from_registry(self):
+        """New entry in Sports should not inherit 100% unknown bucket."""
+        cb = _fresh()
+        _inject_position(cb, "OLD-1", size_cents=8_000, sector="unknown")
+        _inject_position(cb, "OLD-2", size_cents=2_000, sector="unknown")
+
+        sports = _signal(ticker="SPRT-1", size_cents=500, sector="Sports")
+        assert cb.approve(sports) is True
+
+    def test_same_sector_at_limit_one_allows_incremental_entry(self):
+        """Post-trade denominator: 100% sector + tiny add should pass limit=1.0."""
+        cb = _fresh()
+        cfg.MAX_SECTOR_CONCENTRATION = 1.0
+        _inject_position(cb, "ONLY-1", size_cents=10_000, sector="Sports")
+
+        add = _signal(ticker="ONLY-2", size_cents=100, sector="Sports")
+        assert cb.approve(add) is True
+
 
 class TestDrawdownKillSwitch:
     """Check 4: breaker trips when peak-to-trough drawdown exceeds MAX_DRAWDOWN_PCT."""

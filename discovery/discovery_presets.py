@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal
 
+import config
 from discovery.ticker_selector import TickerCriteria
 
 RankBy = Literal["volume", "fee_adjusted_roi", "screener"]
@@ -42,10 +43,12 @@ STRATEGY_DISCOVERY_PRESETS: dict[str, DiscoveryPreset] = {
         description="High implied P(YES), modest payout, fee-aware ROI ranking",
         top_n=10,
         min_volume_24h=200,
-        min_yes_ask=85,
-        max_yes_ask=97,
-        max_spread=8,
-        min_fee_adjusted_roi_pct=1.5,
+        min_yes_ask=config.HP_MIN_YES_ASK,
+        max_yes_ask=config.HP_MAX_YES_ASK,
+        max_spread=config.HP_MAX_SPREAD_CENTS,
+        min_fee_adjusted_roi_pct=(
+            config.HP_MIN_ROI_PCT if config.HP_USE_FEE_ADJUSTED_ROI else None
+        ),
         rank_by="fee_adjusted_roi",
         activity_hours=24.0,
         full_scan=True,

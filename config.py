@@ -23,6 +23,21 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+
+def _configure_stdio_utf8() -> None:
+    """Windows consoles default to cp1252; Kalshi CLI output uses UTF-8 symbols."""
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_configure_stdio_utf8()
+
 # ─── Environment ─────────────────────────────────────────────────────────────
 
 ENV = os.getenv("KALSHI_ENV", "demo").lower().strip()   # "demo" | "production"
@@ -30,9 +45,9 @@ IS_PRODUCTION = ENV == "production"
 _ENV_PREFIX = "PROD" if IS_PRODUCTION else "DEMO"
 
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-PROD_BASE_URL = "https://api.kalshi.co/trade-api/v2"
+PROD_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DEMO_WS_URL   = "wss://demo-api.kalshi.co/trade-api/ws/v2"
-PROD_WS_URL   = "wss://api.kalshi.co/trade-api/ws/v2"
+PROD_WS_URL   = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 
 BASE_URL = PROD_BASE_URL if IS_PRODUCTION else DEMO_BASE_URL
 WS_URL   = PROD_WS_URL   if IS_PRODUCTION else DEMO_WS_URL
@@ -123,7 +138,7 @@ KELLY_DIVISOR: int = int(os.getenv("KALSHI_KELLY_DIVISOR", "4"))
 MAX_POSITION_CENTS: int = _resolve_env_int(
     "MAX_POSITION_CENTS",
     "KALSHI_MAX_POSITION_CENTS",
-    demo_default=100,
+    demo_default=10_000,
     prod_default=100,
 )
 MIN_EDGE_TO_VIG: float = float(os.getenv("KALSHI_MIN_EDGE_TO_VIG", "0.02"))
@@ -174,7 +189,11 @@ MAX_DRAWDOWN_PCT: float = _resolve_env_float(
     demo_default=0.10,
     prod_default=0.05,
 )
-MAX_SECTOR_CONCENTRATION: float = float(os.getenv("KALSHI_MAX_SECTOR_CONCENTRATION", "0.30"))
+_sector_conc_raw = float(os.getenv("KALSHI_MAX_SECTOR_CONCENTRATION", "1.0"))
+# Fraction of portfolio in one sector (1.0 = 100%). Env values >1 treated as percent.
+MAX_SECTOR_CONCENTRATION: float = (
+    _sector_conc_raw / 100.0 if _sector_conc_raw > 1.0 else _sector_conc_raw
+)
 MAX_OPEN_POSITIONS: int = int(os.getenv("KALSHI_MAX_OPEN_POSITIONS", "20"))
 MAX_CONCURRENT_POSITIONS: int = _resolve_env_int(
     "MAX_CONCURRENT_POSITIONS",
@@ -185,7 +204,7 @@ MAX_CONCURRENT_POSITIONS: int = _resolve_env_int(
 DAILY_LOSS_LIMIT_CENTS: int = _resolve_env_int(
     "DAILY_LOSS_LIMIT_CENTS",
     "KALSHI_DAILY_LOSS_LIMIT_CENTS",
-    demo_default=500,
+    demo_default=50_000,
     prod_default=500,
 )
 

@@ -51,7 +51,7 @@ def test_prod_profile_defaults(monkeypatch):
     assert cfg.MAX_CONCURRENT_POSITIONS == 1
     assert cfg.DB_PATH == "kalshi_bot_prod.db"
     assert cfg.LOG_FILE == "kalshi_bot_prod.jsonl"
-    assert "api.kalshi.co" in cfg.BASE_URL
+    assert "external-api.kalshi.com" in cfg.BASE_URL
 
 
 def test_prefixed_overrides_generic(monkeypatch):
