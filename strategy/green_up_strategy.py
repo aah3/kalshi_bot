@@ -108,7 +108,6 @@ DEFAULT_ENTRY_MAX_PRICE: int          = 25    # cents; 25c = 4.00 decimal odds
 DEFAULT_HEDGE_TRIGGER_PRICE: int      = 68    # cents; YES bid must reach this to hedge
 DEFAULT_STOP_LOSS_THRESHOLD: float    = 0.40  # exit if price falls 40% below entry
 DEFAULT_PARTIAL_HEDGE_FRACTION: float = 0.50  # PARTIAL mode: hedge 50% of full-green size
-MIN_HEDGE_PROFIT_CENTS: int           = 50    # skip hedge if locked profit < $0.50
 
 
 # ── Supporting enums ─────────────────────────────────────────────────────────
@@ -706,17 +705,17 @@ class GreenUpStrategy(BaseStrategy):
             )
             return None
 
-        # For FULL_GREEN and PARTIAL, require minimum locked profit
-        if self._hedge_mode != HedgeMode.STAKE_BACK \
-                and locked_profit < MIN_HEDGE_PROFIT_CENTS:
+        # Hedge when YES bid >= hedge_trigger_price; do not second-guess with a
+        # minimum locked-profit floor — the user sets --hedge-trigger explicitly.
+        if locked_profit < 0:
             logger.info(
-                "GreenUp: locked profit below minimum — waiting for better price",
+                "GreenUp: hedge at trigger with negative locked profit preview",
                 ticker=pos.ticker,
                 locked_profit_cents=locked_profit,
-                minimum_cents=MIN_HEDGE_PROFIT_CENTS,
+                hedge_stake_cents=hedge_cents,
+                yes_bid_at_hedge=best_bid,
                 strategy=self.name,
             )
-            return None
 
         hedge_cents     = min(hedge_cents, config.MAX_POSITION_CENTS)
         no_decimal_odds = round(100.0 / no_price, 3)

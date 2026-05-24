@@ -260,6 +260,12 @@ RISK_FREE_RATE_ANNUAL: float = 0.05
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 LOG_LEVEL: str = os.getenv("KALSHI_LOG_LEVEL", "INFO")
+# When false, main.py suppresses INFO/DEBUG JSON on stderr (--quiet / dashboard mode).
+LOG_CONSOLE: bool = os.getenv("KALSHI_LOG_CONSOLE", "true").strip().lower() not in (
+    "false",
+    "0",
+    "no",
+)
 LOG_FILE: str = _resolve_env_str(
     "LOG_FILE",
     "KALSHI_LOG_FILE",

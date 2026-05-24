@@ -25,6 +25,7 @@ Shutdown sequence (on SIGINT / SIGTERM):
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -618,6 +619,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Append monitor tables instead of clearing the screen each refresh",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Dashboard mode: hide INFO/DEBUG JSON on stderr (still written to log file). "
+            "Same as KALSHI_LOG_CONSOLE=false"
+        ),
+    )
 
     # Auto-discovery: top N tickers in a category matching filters
     parser.add_argument(
@@ -939,6 +948,9 @@ async def main(args: argparse.Namespace | None = None) -> None:
 
     if args is None:
         args = parse_args()
+
+    if args.quiet or not config.LOG_CONSOLE:
+        logger.set_console_level(logging.WARNING)
 
     from discovery.live_market import LiveMarketRules
 

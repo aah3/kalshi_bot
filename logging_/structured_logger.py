@@ -83,14 +83,15 @@ class StructuredLogger:
     def __init__(self, name: str = "kalshi_bot") -> None:
         self._logger = logging.getLogger(name)
         self._logger.setLevel(getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
+        self._stream_handler: logging.StreamHandler | None = None
 
         if not self._logger.handlers:
             formatter = _JsonFormatter()
 
             # Always log to stderr for container / systemd compatibility
-            stream_handler = logging.StreamHandler(sys.stderr)
-            stream_handler.setFormatter(formatter)
-            self._logger.addHandler(stream_handler)
+            self._stream_handler = logging.StreamHandler(sys.stderr)
+            self._stream_handler.setFormatter(formatter)
+            self._logger.addHandler(self._stream_handler)
 
             # Also write to the configured file (JSON Lines)
             log_path = Path(config.LOG_FILE)
@@ -98,6 +99,22 @@ class StructuredLogger:
             file_handler = logging.FileHandler(log_path, encoding="utf-8")
             file_handler.setFormatter(formatter)
             self._logger.addHandler(file_handler)
+
+        if self._stream_handler is None:
+            for handler in self._logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stderr:
+                    self._stream_handler = handler
+                    break
+
+    def set_console_level(self, level: int) -> None:
+        """Raise the stderr handler threshold (e.g. WARNING) while file keeps LOG_LEVEL."""
+        if self._stream_handler is not None:
+            self._stream_handler.setLevel(level)
+
+    def disable_console(self) -> None:
+        """Stop all stderr output; file handler unchanged."""
+        if self._stream_handler is not None:
+            self._stream_handler.setLevel(logging.CRITICAL + 1)
 
     # ── Canonical event helpers ─────────────────────────────────────────────
 

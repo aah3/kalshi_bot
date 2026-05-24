@@ -17,6 +17,7 @@ cfg.HP_MAX_YES_ASK = 97
 cfg.HP_STAKE_CENTS = 5000
 cfg.HP_USE_FEE_ADJUSTED_ROI = True
 cfg.HP_ASSUME_ROUND_TRIP_FEES = False
+cfg.HP_MAX_SPREAD_CENTS = 8
 sys.modules["config"] = cfg
 
 log_mod = types.ModuleType("logging_.structured_logger")
@@ -191,3 +192,27 @@ def test_unlimited_cycles_resets_after_hedged():
     sig = strat.evaluate(_tick(8, 10, "T4"))
     assert sig is not None
     assert strat.get_position("T4").state == PositionState.WATCHING
+
+
+def test_full_green_hedges_at_trigger_on_micro_stake():
+    """Prod-sized stake must hedge when bid >= trigger (no min locked-profit gate)."""
+    from strategy.green_up_strategy import HedgeMode
+
+    cfg.MAX_POSITION_CENTS = 100
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_trigger_price=70,
+        hedge_mode=HedgeMode.FULL_GREEN,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("NYK")
+    pos = strat.get_position("NYK")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 49
+    pos.entry_stake_cents = 49
+
+    sig = strat.evaluate(_tick(92, 93, "NYK"))
+    assert sig is not None
+    assert sig.side.value == "no"
+    assert sig.meta.get("phase") == "hedge"
+    assert strat.get_position("NYK").state == PositionState.HEDGING
