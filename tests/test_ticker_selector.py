@@ -1,5 +1,29 @@
 """Unit tests for discovery/ticker_selector.py (no API calls)."""
 
+import os
+import sys
+import types
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+cfg = types.ModuleType("config")
+cfg.FEE_PER_CONTRACT_CENTS = 7.0
+cfg.HP_USE_FEE_ADJUSTED_ROI = True
+cfg.HP_ASSUME_ROUND_TRIP_FEES = False
+sys.modules["config"] = cfg
+
+from tests.conftest import sync_config_bindings
+
+
+@pytest.fixture(autouse=True)
+def _ticker_selector_test_config():
+    sys.modules["config"] = cfg
+    sync_config_bindings()
+    yield
+
+
 from discovery.market_client import MarketClient
 from discovery.ticker_selector import (
     DEFAULT_DISCOVER_CATEGORY,

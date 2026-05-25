@@ -20,6 +20,8 @@ import sys
 import os
 import types
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ── Config shim ───────────────────────────────────────────────────────────────
@@ -45,6 +47,17 @@ sys.modules["logging_.structured_logger"] = log_mod
 
 from risk.circuit_breaker import CircuitBreaker, Position
 from strategy.base_strategy import Side, Signal
+
+from tests.conftest import sync_config_bindings
+
+
+@pytest.fixture(autouse=True)
+def _circuit_breaker_test_config():
+    """Re-activate this module's config shim (other tests may replace sys.modules)."""
+    cfg.MAX_SECTOR_CONCENTRATION = 0.50
+    sys.modules["config"] = cfg
+    sync_config_bindings()
+    yield
 
 
 # ── Kill switch tracking ──────────────────────────────────────────────────────
@@ -217,11 +230,17 @@ class TestSectorConcentration:
     def test_same_sector_at_limit_one_allows_incremental_entry(self):
         """Post-trade denominator: 100% sector + tiny add should pass limit=1.0."""
         cb = _fresh()
-        cfg.MAX_SECTOR_CONCENTRATION = 1.0
-        _inject_position(cb, "ONLY-1", size_cents=10_000, sector="Sports")
+        prev_limit = cfg.MAX_SECTOR_CONCENTRATION
+        try:
+            cfg.MAX_SECTOR_CONCENTRATION = 1.0
+            sync_config_bindings()
+            _inject_position(cb, "ONLY-1", size_cents=10_000, sector="Sports")
 
-        add = _signal(ticker="ONLY-2", size_cents=100, sector="Sports")
-        assert cb.approve(add) is True
+            add = _signal(ticker="ONLY-2", size_cents=100, sector="Sports")
+            assert cb.approve(add) is True
+        finally:
+            cfg.MAX_SECTOR_CONCENTRATION = prev_limit
+            sync_config_bindings()
 
 
 class TestDrawdownKillSwitch:

@@ -4,6 +4,8 @@ import os
 import sys
 import types
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 cfg = types.ModuleType("config")
@@ -12,6 +14,16 @@ cfg.HP_USE_FEE_ADJUSTED_ROI = True
 cfg.HP_ASSUME_ROUND_TRIP_FEES = False
 cfg.HP_MIN_ROI_PCT = 2.0
 sys.modules["config"] = cfg
+
+from tests.conftest import sync_config_bindings
+
+
+@pytest.fixture(autouse=True)
+def _market_math_test_config():
+    sys.modules["config"] = cfg
+    sync_config_bindings()
+    yield
+
 
 from discovery.market_math import (
     fee_adjusted_roi_if_yes_wins_pct,

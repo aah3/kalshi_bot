@@ -8,13 +8,14 @@ import os
 import sys
 import types
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 cfg = types.ModuleType("config")
 cfg.KELLY_DIVISOR = 4
 cfg.MAX_POSITION_CENTS = 10_000
 cfg.MIN_EDGE_TO_VIG = 0.02
-cfg.FEE_PER_CONTRACT_CENTS = 0.0
 cfg.PROFIT_TARGET_PCT = 0.60
 cfg.POSITION_STOP_LOSS_PCT = 0.40
 cfg.MIN_ACCOUNT_BALANCE_CENTS = 5_000
@@ -38,6 +39,16 @@ sys.modules["logging_"] = types.ModuleType("logging_")
 sys.modules["logging_.structured_logger"] = log_mod
 
 sys.modules["config"] = cfg
+
+from tests.conftest import sync_config_bindings
+
+
+@pytest.fixture(autouse=True)
+def _high_prob_test_config():
+    sys.modules["config"] = cfg
+    sync_config_bindings()
+    yield
+
 
 from discovery.market_math import (
     gross_roi_if_yes_wins_pct,
