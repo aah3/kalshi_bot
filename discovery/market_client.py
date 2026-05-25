@@ -417,6 +417,7 @@ class MarketClient:
         sport: str | None = None,
         competition: str | None = None,
         scope: str | None = None,
+        series_ticker: str | None = None,
     ) -> CategoryFetchResult:
         """
         Fetch open markets in a given category.
@@ -438,6 +439,8 @@ class MarketClient:
             competition: League/competition id on event product_metadata
                 (e.g. EPL, Champions League). Use with Sports + sport/tag.
             scope: Competition scope (e.g. Games, Futures) from product_metadata.
+            series_ticker: Single series ticker (e.g. KXNBAFINALS-25). Skips tag
+                series lookup when set; events must match this series exactly.
 
         When category is ``Trending`` (case-insensitive), scans open events across
         all categories and ranks by 24h volume — Kalshi has no Trending category
@@ -457,11 +460,14 @@ class MarketClient:
         competition_lc = competition.strip().lower() if competition else None
         scope_lc = self._normalize_scope(scope) if scope else None
 
-        if tag_filter or competition_lc or scope_lc:
+        series_tk_filter = (series_ticker or "").strip() or None
+        if tag_filter or competition_lc or scope_lc or series_tk_filter:
             full_scan = True
 
         series_tickers: set[str] | None = None
-        if tag_filter:
+        if series_tk_filter:
+            series_tickers = {series_tk_filter}
+        elif tag_filter:
             series_list = await self.get_series_for_category(category, tag=tag_filter)
             series_tickers = {s["ticker"] for s in series_list if s.get("ticker")}
             if not series_tickers:
@@ -572,6 +578,7 @@ class MarketClient:
             tag=tag_filter,
             competition=competition,
             scope=scope,
+            series_ticker=series_tk_filter,
             pages_scanned=pages,
             events_matched=events_matched,
             markets_seen=markets_seen,

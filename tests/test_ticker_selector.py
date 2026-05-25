@@ -123,6 +123,21 @@ def test_near_miss_markets_when_none_selected():
     assert misses[0][1] == "fee_adjusted_roi"
 
 
+def test_format_discovery_table_includes_drilldown_and_metadata():
+    markets = [_market("OK", volume_24h=500, yes_ask=88)]
+    criteria = TickerCriteria(
+        category="Sports",
+        tag="Basketball",
+        top_n=1,
+        tradeable_only=False,
+        live_only=False,
+    )
+    text = format_discovery_table(markets, ["OK"], criteria)
+    assert "tag=Basketball" in text
+    assert "SPRD" in text
+    assert "SERIES" in text
+
+
 def test_format_discovery_table_shows_near_misses():
     markets = [
         _market("LOW-ASK", volume_24h=500, yes_ask=80),

@@ -675,6 +675,108 @@ python tools/blotter.py detail --trade-id T-0001
 
 ---
 
+## Implementation status (2026-05-25)
+
+Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off.
+
+### Summary
+
+| Phase | Code / tooling | Live certification |
+|-------|----------------|-------------------|
+| Environment profiles | Done | Verify each session with `python -c "import config; …"` |
+| Week 1 — platform baseline | Mostly done | **In progress** — soak, circuit breaker, manual sell not formally signed |
+| Week 2 — `high_prob` + `green_up` | Done | **Partial** — `testing.md` has commands; no 3× session sign-off per strategy |
+| Week 3 — `kelly` + `arb` | Done | **Not started** — no documented demo sessions |
+| Week 4 — demo soak + prod dry-run | Tooling done | **Not started** — no 2-week soak; prod dry-run not recorded |
+| Week 5+ — prod micro-pilot | Scripts ready | **Blocked** — waiting on Week 4 |
+
+**Automated tests:** `153/159` pass in full suite; 6 failures are test-isolation issues (duplicate `test_circuit_breaker_v0.py` + config shims leaking `FEE_PER_CONTRACT_CENTS=0`). Individual failing tests pass in isolation. Fix before treating Week 1 step 1.2 as complete.
+
+### Definition of done (demo) — status
+
+| # | Criterion | Status | Notes |
+|---|-----------|--------|-------|
+| 1 | Discover → WS → signal → order → fill → blotter | Partial | Platform path exists; not all four strategies have a documented end-to-end fill cycle |
+| 2 | Exchange matches bot | Partial | Blotter + `trade.py portfolio`; manual `trade.py` orders still excluded from blotter (known gap) |
+| 3 | Live gates | Implemented | Default on; `--no-live-only` used in many `testing.md` runs |
+| 4 | SIGINT shutdown | Implemented | `main.py` cancel-all + settlement check; needs signed live run |
+| 5 | Circuit breaker | Implemented | Unit tests + portfolio sync; live Tests A/B not recorded in checklist |
+| 6 | Automated tests | **Blocked** | 6 suite failures (isolation); 153 tests otherwise green |
+
+### Week-by-week certification progress
+
+| Week | Step | Code ready? | Certified? |
+|------|------|-------------|------------|
+| 1 | 1.1 Demo keys / startup | Yes | Assumed (active dev) |
+| 1 | 1.2 `pytest tests/` | **No** | 6 isolation failures |
+| 1 | 1.3 Config profile print | Yes | — |
+| 1 | 1.4 ~30 min soak + Ctrl+C | Yes | Not signed in README checklist |
+| 1 | 1.5 Circuit breaker live (A + B) | Yes | Not signed |
+| 1 | 1.6 Manual sell / flatten | Yes (`tools/trade.py`) | Not signed |
+| 2 | `high_prob` 3 sessions | Yes | Commands in `testing.md`; no session template sign-off |
+| 2 | `green_up` 3 sessions | Yes | Same |
+| 3 | `kelly` 2 sessions | Yes | Screener + `--model-prob`; no runbook sign-off |
+| 3 | `arb` 2 sessions | Yes | Demo may show zero arb (expected) |
+| 4 | Daily 1–2 hr soak | — | Not started |
+| 4 | Weekly blotter / session reports | Yes (`blotter_report.py`, `session_report.py`) | Not run on schedule |
+| 4 | Prod keys in `.env`, stay on demo | — | Unknown |
+| 4 | Prod dry-run (immediate Ctrl+C) | Yes | Not recorded |
+| 5 | Prod micro-pilot per strategy | Yes (`scripts/run_*_prod.ps1`) | **Do not start** until Week 4 complete |
+
+### Built since roadmap was written (beyond original scope)
+
+These ship in code but are not separate certification steps:
+
+- **Discovery drill-down** — `--discover-tag`, `--discover-sport`, `--discover-competition`, `--discover-scope`, `--discover-series`; `tools/screen.py` browse/tags/sports-filters/series
+- **Near-miss discovery table** — when zero tickers pass, shows top rejections (tune filters)
+- **REST book fallback** — polls REST when WS book stale (`KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`)
+- **Sector concentration limit** — `KALSHI_MAX_SECTOR_CONCENTRATION` in circuit breaker (prod scripts set `1.0` for micro-pilot)
+- **Trending category** — cross-category volume scan default for discovery
+
+### Post-certification backlog — unchanged
+
+Still deferred per [backlog](#post-certification-feature-backlog-defer-until-demo-done):
+
+- Fill funnel metrics (sent → exchange fill → WS confirm)
+- Blotter CLI `--resolution` / unified search
+- Manual `trade.py` → blotter sync
+- Auto-flatten on shutdown (optional flag)
+- Native green_up resting take-profit (use hedge or `high_prob` low-band workaround)
+
+### Production readiness gaps (priority order)
+
+**P0 — must fix before real money**
+
+1. Complete Week 1–4 demo certification (README checklist all checked)
+2. Fix full `pytest` suite (remove duplicate `tests/test_circuit_breaker_v0.py`; isolate config shims)
+3. Live circuit breaker Tests A + B on demo with session notes
+4. Blotter ↔ exchange reconciliation on bot-driven orders for each strategy you will run in prod
+5. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier
+
+**P1 — before unattended / 24×7 prod**
+
+6. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl`
+7. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
+8. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
+9. External alerting on `risk_breach`, `kill switch`, repeated WS disconnect — today alerts are JSONL + stderr only
+10. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
+
+**P2 — operational maturity**
+
+11. CI pipeline (`pytest` on push) — no `.github/workflows` today
+12. Secrets outside flat `.env` (vault / host env) for prod keys
+13. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter durability
+14. Runbook for orphan orders, partial arb legs, manual flatten
+15. Python 3.11+ on runtime host (README requirement; dev machine may be 3.10)
+
+**P3 — nice to have**
+
+16. Docker / container health checks
+17. Fill funnel metrics and dashboard hardening
+18. Manual trade → blotter sync for mixed manual/bot workflows
+
+---
+
 ## Related docs
 
 - [README.md](../README.md) — setup, strategies, troubleshooting, production checklist

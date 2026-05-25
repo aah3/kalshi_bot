@@ -650,6 +650,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "or KALSHI_DISCOVER_CATEGORY)"
         ),
     )
+    parser.add_argument(
+        "--discover-tag",
+        type=str,
+        default=None,
+        help=(
+            "Subcategory tag within category (e.g. Basketball, Tennis). "
+            "List tags: python tools/screen.py tags --category Sports"
+        ),
+    )
+    parser.add_argument(
+        "--discover-sport",
+        type=str,
+        default=None,
+        help="Sport name (alias for --discover-tag on Sports; env KALSHI_DISCOVER_SPORT)",
+    )
+    parser.add_argument(
+        "--discover-competition",
+        type=str,
+        default=None,
+        help=(
+            "League/competition id (e.g. NBA, EPL). "
+            "List: python tools/screen.py sports-filters --sport Basketball"
+        ),
+    )
+    parser.add_argument(
+        "--discover-scope",
+        type=str,
+        default=None,
+        help="Market scope (e.g. Games, Futures) from sports-filters",
+    )
+    parser.add_argument(
+        "--discover-series",
+        type=str,
+        default=None,
+        help=(
+            "Single series ticker — all markets in that series. "
+            "List series: python tools/screen.py series --category Sports --tag Basketball"
+        ),
+    )
     parser.add_argument("--discover-top", type=int, default=None,
                         help="Max tickers to trade (default 10; env KALSHI_DISCOVER_TOP)")
     parser.add_argument(
@@ -716,10 +755,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--discover-rank-by",
         default=None,
-        choices=["volume", "fee_adjusted_roi", "screener"],
+        choices=["volume", "fee_adjusted_roi", "screener", "activity", "spread"],
         help=(
-            "Rank discovered markets by volume, fee-adjusted ROI, or "
-            "strategy screener score (uses --strategy fit)"
+            "Rank discovered markets by volume, fee-adjusted ROI, screener score, "
+            "recent update (activity), or tightest spread"
         ),
     )
     parser.add_argument(
@@ -771,6 +810,16 @@ def _explicit_discover_fields(args: argparse.Namespace) -> frozenset[str]:
         explicit.add("min_fee_adjusted_roi_pct")
     if args.discover_max_minutes_to_close is not None:
         explicit.add("max_minutes_to_close")
+    if args.discover_tag is not None:
+        explicit.add("tag")
+    if args.discover_sport is not None:
+        explicit.add("sport")
+    if args.discover_competition is not None:
+        explicit.add("competition")
+    if args.discover_scope is not None:
+        explicit.add("scope")
+    if args.discover_series is not None:
+        explicit.add("series_ticker")
     return frozenset(explicit)
 
 
@@ -812,8 +861,31 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
     full_scan = args.discover_full_scan or (env.full_scan if env else False)
     if activity is not None and not args.discover_full_scan:
         full_scan = True
+    drilldown = any([
+        args.discover_tag,
+        args.discover_sport,
+        args.discover_competition,
+        args.discover_scope,
+        args.discover_series,
+    ]) or (
+        env is not None
+        and any([
+            env.tag,
+            env.sport,
+            env.competition,
+            env.scope,
+            env.series_ticker,
+        ])
+    )
+    if drilldown:
+        full_scan = True
 
     rank_by = args.discover_rank_by or "volume"
+
+    def _pick_str(cli_val, env_val):
+        if cli_val is not None:
+            return cli_val.strip() or None
+        return env_val
 
     criteria = TickerCriteria(
         category=category,
@@ -836,6 +908,15 @@ def _discover_criteria_from_args(args: argparse.Namespace) -> TickerCriteria | N
         and (env.tradeable_only if env else True),
         live_only=not args.no_live_only and config.LIVE_TRADING_ONLY,
         max_minutes_to_close=args.discover_max_minutes_to_close,
+        tag=_pick_str(args.discover_tag, env.tag if env else None),
+        sport=_pick_str(args.discover_sport, env.sport if env else None),
+        competition=_pick_str(
+            args.discover_competition, env.competition if env else None
+        ),
+        scope=_pick_str(args.discover_scope, env.scope if env else None),
+        series_ticker=_pick_str(
+            args.discover_series, env.series_ticker if env else None
+        ),
     )
 
     preset_name = _resolve_discover_preset(args)

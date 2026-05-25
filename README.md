@@ -86,7 +86,7 @@ flowchart LR
   E --> F[Blotter + monitor table]
 ```
 
-1. **Explore** — `python tools/screen.py categories` / `browse` / `screen` to see how markets score per strategy.
+1. **Explore** — `python tools/screen.py categories` / `tags` / `series` / `sports-filters` / `browse` / `discover` / `screen` to map categories, tags, series, and strategy fit.
 2. **Preview tickers** — `python main.py --discover ... --discover-only` (no orders).
 3. **Trade** — same command without `--discover-only`; bot subscribes to all selected tickers and runs the strategy on each book update.
 4. **Reconcile** — `tools/trade.py portfolio` for exchange truth; `tools/blotter.py` for bot-recorded cycles.
@@ -96,7 +96,7 @@ flowchart LR
 | Source | How |
 |--------|-----|
 | `--tickers A,B,C` | Explicit list (overrides everything) |
-| `--discover` / `KALSHI_DISCOVER=true` | Auto-select from `--discover-category` + filters |
+| `--discover` / `KALSHI_DISCOVER=true` | Auto-select from `--discover-category` + optional tag/sport/series filters |
 | `KALSHI_TICKERS` | Comma-separated env list |
 
 Default category when discovering: **Trending** (override with `--discover-category Sports`, etc.).
@@ -141,9 +141,58 @@ python main.py --discover --discover-preset none --discover-category Sports \
   --discover-max-yes-ask 30 --discover-rank-by volume --discover-only
 ```
 
-**Discovery CLI flags:** `--discover-top`, `--discover-min-volume`, `--discover-min-yes-ask`, `--discover-max-yes-ask`, `--discover-max-spread`, `--discover-activity-hours`, `--discover-max-minutes-to-close`, `--discover-rank-by`, `--discover-min-fee-roi`, `--discover-full-scan`, `--discover-only`, `--discover-preset`, `--discover-no-tradeable-filter`, `--no-live-only`.
+**Discovery CLI flags:** `--discover-top`, `--discover-min-volume`, `--discover-min-yes-ask`, `--discover-max-yes-ask`, `--discover-max-spread`, `--discover-activity-hours`, `--discover-max-minutes-to-close`, `--discover-rank-by` (`volume`, `fee_adjusted_roi`, `screener`, `activity`, `spread`), `--discover-min-fee-roi`, `--discover-full-scan`, `--discover-only`, `--discover-preset`, `--discover-no-tradeable-filter`, `--no-live-only`, plus drill-down: `--discover-tag`, `--discover-sport`, `--discover-competition`, `--discover-scope`, `--discover-series`.
 
-**Discovery environment variables:** `KALSHI_DISCOVER`, `KALSHI_DISCOVER_CATEGORY`, `KALSHI_DISCOVER_TOP`, `KALSHI_DISCOVER_MIN_YES_ASK`, `KALSHI_DISCOVER_MAX_YES_ASK`, `KALSHI_DISCOVER_MAX_SPREAD`, `KALSHI_DISCOVER_MIN_VOLUME`, `KALSHI_DISCOVER_ACTIVITY_HOURS`, `KALSHI_DISCOVER_RANK_BY`, `KALSHI_DISCOVER_MAX_MINUTES_TO_CLOSE`, `KALSHI_MAX_CONCURRENT_POSITIONS`.
+**Discovery environment variables:** `KALSHI_DISCOVER`, `KALSHI_DISCOVER_CATEGORY`, `KALSHI_DISCOVER_TOP`, `KALSHI_DISCOVER_MIN_YES_ASK`, `KALSHI_DISCOVER_MAX_YES_ASK`, `KALSHI_DISCOVER_MAX_SPREAD`, `KALSHI_DISCOVER_MIN_VOLUME`, `KALSHI_DISCOVER_ACTIVITY_HOURS`, `KALSHI_DISCOVER_RANK_BY`, `KALSHI_DISCOVER_MAX_MINUTES_TO_CLOSE`, `KALSHI_DISCOVER_TAG`, `KALSHI_DISCOVER_SPORT`, `KALSHI_DISCOVER_COMPETITION`, `KALSHI_DISCOVER_SCOPE`, `KALSHI_DISCOVER_SERIES`, `KALSHI_MAX_CONCURRENT_POSITIONS`.
+
+`--discover-only` prints a table with **vol24h**, **ask**, **fee ROI**, **spread**, **minutes since update**, **series**, ticker, and title. Use `--discover-rank-by activity` for live/in-play candidates (most recently updated first).
+
+---
+
+### Sports and tag drill-down
+
+Kalshi exposes category tags and sports filters via the [tags-by-categories](https://docs.kalshi.com/api-reference/search/get-tags-for-series-categories) and [filters-by-sport](https://docs.kalshi.com/api-reference/search/get-filters-for-sports) search endpoints. The bot uses these to narrow discovery from **Sports** → **Basketball** → **Games** → **series** → **tickers**.
+
+**Explore (no bot run):**
+
+```bash
+# Tags under a category (Basketball, Tennis, …)
+python tools/screen.py tags --category Sports
+
+# Leagues and scopes for one sport
+python tools/screen.py sports-filters --sport Basketball
+
+# Series titles/tickers for a tag (e.g. Pro Basketball Finals Matchup)
+python tools/screen.py series --category Sports --tag Basketball
+
+# All open markets in a drill-down (volume-sorted browse table)
+python tools/screen.py browse --category Sports --sport Basketball --scope Games --activity-hours 2 --full-scan
+
+# Markets in one series
+python tools/screen.py browse --category Sports --series YOUR-SERIES-TICKER
+
+# Strategy-aligned top N (same presets as main.py --discover)
+python tools/screen.py discover --category Sports --sport Basketball --scope Games --strategy high_prob --top 15
+```
+
+**Discover with `main.py` (preview or trade):**
+
+```bash
+# Live Basketball game markets, high_prob preset, rank by recency
+python main.py --discover --discover-category Sports --discover-tag Basketball \
+  --discover-scope Games --strategy high_prob --discover-only \
+  --discover-rank-by activity --discover-top 20
+
+# All markets in one series
+python main.py --discover --discover-category Sports --discover-series YOUR-SERIES-TICKER \
+  --strategy high_prob --discover-only
+
+# NBA competition filter (from sports-filters)
+python main.py --discover --discover-category Sports --discover-sport Basketball \
+  --discover-competition NBA --discover-scope Games --strategy green_up --discover-only
+```
+
+Setting any drill-down flag enables a **full category scan** automatically so high-volume markets are not missed. **Trending** discovery ignores tag/sport filters (cross-category volume scan only).
 
 ---
 
@@ -435,12 +484,15 @@ See [Discovering and trading by strategy](#discovering-and-trading-by-strategy) 
 
 ```bash
 python tools/screen.py categories
+python tools/screen.py tags --category Sports
+python tools/screen.py series --category Sports --tag Basketball
 python tools/screen.py browse --category Politics
+python tools/screen.py browse --category Sports --sport Basketball --scope Games
 python tools/screen.py screen --category Politics
 python tools/screen.py browse --ticker SOME-TICKER
 ```
 
-The screener scores each market for Kelly, Green Up, **high_prob**, and arbitrage fit.
+The screener scores each market for Kelly, Green Up, **high_prob**, and arbitrage fit. For Sports, use `tags` → `sports-filters` → `series` before `browse` or `discover` (see [Sports and tag drill-down](#sports-and-tag-drill-down)).
 
 ### 2. Preview discovery, then run (demo)
 
@@ -712,7 +764,7 @@ kalshi_bot/
 │   ├── high_prob_strategy.py     High P(YES), fee-aware ROI, exit modes
 │   └── arbitrage_strategy.py     Multi-leg arb
 ├── discovery/
-│   ├── market_client.py          REST: markets, books, categories, price history
+│   ├── market_client.py          REST: markets, books, tags, sports filters, series
 │   ├── screener.py               Score markets per strategy
 │   ├── ticker_selector.py        Filter, rank, select tickers
 │   ├── discovery_presets.py      Strategy-aligned discovery defaults

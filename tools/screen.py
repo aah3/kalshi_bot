@@ -17,12 +17,18 @@ BROWSE COMMANDS  (find tickers and understand market economics)
   # Step 1: see all available categories
   python tools/screen.py --categories
 
-  # Subcategories (tags) within a category — e.g. Soccer, Tennis under Sports
+  # Subcategories (tags) within a category — e.g. Basketball, Tennis under Sports
   python tools/screen.py tags --category Sports
+
+  # Series in a category/tag (e.g. Pro Basketball Finals Matchup)
+  python tools/screen.py series --category Sports --tag Basketball
 
   # Sports leagues and scopes (EPL, Champions League, Games, Futures, …)
   python tools/screen.py sports-filters
-  python tools/screen.py sports-filters --sport Soccer
+  python tools/screen.py sports-filters --sport Basketball
+
+  # Strategy-aligned discovery (same filters as main.py --discover)
+  python tools/screen.py discover --category Sports --sport Basketball --scope Games --strategy high_prob --top 15
 
   # Step 2: browse all markets in a category
   python tools/screen.py browse --category Politics
@@ -32,6 +38,7 @@ BROWSE COMMANDS  (find tickers and understand market economics)
   python tools/screen.py browse --category Sports --sport Tennis
   python tools/screen.py browse --category Sports --sport Soccer --competition EPL
   python tools/screen.py browse --category Sports --sport Soccer --competition EPL --scope Games
+  python tools/screen.py browse --category Sports --series KXNBAFINALS-25
 
   # Browse with minimum 24h volume filter
   python tools/screen.py browse --category Economics --min-volume 500
@@ -106,8 +113,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from credentials.credential_manager import CredentialManager
+from discovery.discovery_presets import apply_preset, preset_for_strategy
 from discovery.market_client import CategoryFetchStats, MarketClient, MarketSummary
 from discovery.screener import MIN_VOLUME_24H, MarketScreener
+from discovery.ticker_selector import (
+    TickerCriteria,
+    discover_with_details,
+    format_discovery_table,
+)
 from execution.rate_limiter import RateLimiter
 
 
@@ -358,10 +371,11 @@ def _browse_to_csv(markets: list[MarketSummary], filepath: str) -> None:
 
 def _filter_kwargs(args) -> dict:
     return {
-        "tag":         getattr(args, "tag", None),
-        "sport":       getattr(args, "sport", None),
-        "competition": getattr(args, "competition", None),
-        "scope":       getattr(args, "scope", None),
+        "tag":           getattr(args, "tag", None),
+        "sport":         getattr(args, "sport", None),
+        "competition":   getattr(args, "competition", None),
+        "scope":         getattr(args, "scope", None),
+        "series_ticker": getattr(args, "series", None),
     }
 
 
@@ -385,6 +399,8 @@ def _filter_title_suffix(args) -> str:
         parts.append(f"competition={args.competition}")
     if getattr(args, "scope", None):
         parts.append(f"scope={args.scope}")
+    if getattr(args, "series", None):
+        parts.append(f"series={args.series}")
     if getattr(args, "tradeable_only", False):
         parts.append("tradeable only")
     return f"  ({', '.join(parts)})" if parts else ""
@@ -406,6 +422,7 @@ async def cmd_categories(args) -> None:
     print(f"\n  Usage:")
     print(f"    python tools/screen.py browse --category <NAME>")
     print(f"    python tools/screen.py tags --category Sports")
+    print(f"    python tools/screen.py series --category Sports --tag Basketball")
     print(f"    python tools/screen.py sports-filters\n")
 
 
@@ -427,12 +444,104 @@ async def cmd_tags(args) -> None:
     for i, t in enumerate(tags, 1):
         print(f"  {i:>3}.  {t}")
     print(f"\n  Total: {len(tags)} tags")
-    print(f"\n  Browse example:")
+    print(f"\n  Next steps:")
+    print(f"    python tools/screen.py series --category {args.category} --tag {tags[0]}")
     print(f"    python tools/screen.py browse --category {args.category} --tag {tags[0]}")
     if args.category.lower() == "sports" and tags:
         print(f"    python tools/screen.py sports-filters --sport {tags[0]}\n")
     else:
         print()
+
+
+async def cmd_series(args) -> None:
+    """List series (event groups) in a category, optionally filtered by tag/sport."""
+    if not args.category:
+        print("\n  Usage: python tools/screen.py series --category Sports [--tag Basketball]\n")
+        return
+
+    tag = args.tag or args.sport
+    creds, limiter = CredentialManager(), RateLimiter()
+    async with MarketClient(creds, limiter) as client:
+        series_list = await client.get_series_for_category(args.category, tag=tag)
+
+    title = f"Series in {args.category}"
+    if tag:
+        title += f"  (tag={tag})"
+    print(f"\n  {title}")
+    print(f"  {'═' * 72}")
+    if not series_list:
+        hint = (
+            f"  No series for tag {tag!r} — run: python tools/screen.py tags "
+            f"--category {args.category}"
+            if tag
+            else "  No series returned — check category name."
+        )
+        print(f"\n{hint}\n")
+        return
+
+    print(f"\n  {'#':>3}  {'SERIES':<28}  TITLE")
+    print(f"  {'─' * 72}")
+    for i, s in enumerate(series_list, 1):
+        tk = (s.get("ticker") or "")[:28]
+        name = (s.get("title") or s.get("name") or "")[:42]
+        print(f"  {i:>3}.  {tk:<28}  {name}")
+    print(f"\n  Total: {len(series_list)} series")
+    sample = series_list[0].get("ticker", "")
+    print(f"\n  Browse markets in one series:")
+    print(
+        f"    python tools/screen.py browse --category {args.category} "
+        f"--series {sample}"
+    )
+    if tag:
+        print(
+            f"    python main.py --discover --discover-category {args.category} "
+            f"--discover-tag {tag} --discover-only --strategy high_prob"
+        )
+    print()
+
+
+async def cmd_discover(args) -> None:
+    """Run strategy-aligned discovery with tag/sport/series drill-down."""
+    if not args.category:
+        print("\n  Usage: python tools/screen.py discover --category Sports [filters]\n")
+        return
+
+    rank_by = args.rank_by or "volume"
+    criteria = TickerCriteria(
+        category=args.category,
+        top_n=args.top,
+        min_volume_24h=args.min_volume or 0,
+        max_yes_ask=args.max_yes_ask,
+        min_yes_ask=args.min_yes_ask,
+        max_spread=args.max_spread,
+        rank_by=rank_by,
+        screener_strategy=args.strategy,
+        activity_hours=args.activity_hours,
+        full_scan=args.full_scan or args.activity_hours is not None,
+        tradeable_only=not args.no_tradeable_filter,
+        live_only=not args.no_live_only,
+        tag=args.tag,
+        sport=args.sport,
+        competition=args.competition,
+        scope=args.scope,
+        series_ticker=args.series,
+    )
+    preset = args.preset
+    if preset is None and args.strategy:
+        preset = preset_for_strategy(args.strategy)
+    if preset and preset != "none":
+        criteria = apply_preset(criteria, preset)
+
+    creds, limiter = CredentialManager(), RateLimiter()
+    tickers, markets = await discover_with_details(creds, limiter, criteria)
+    print(format_discovery_table(markets, tickers, criteria))
+    if tickers:
+        print(f"\n  KALSHI_TICKERS=\"{','.join(tickers)}\"\n")
+    else:
+        print(
+            "\n  No tickers matched — try tools/screen.py browse with the same "
+            "filters, or relax --min-volume / --activity-hours.\n"
+        )
 
 
 async def cmd_sports_filters(args) -> None:
@@ -515,6 +624,24 @@ async def cmd_browse(args) -> None:
             event_pre_count = len(markets)
             title   = f"Event: {args.event}  ({event_pre_count} markets)"
             markets = [m for m in markets if m.volume_24h >= min_vol]
+
+        # ── Series (requires category for API context) ─────────────────────────
+        elif getattr(args, "series", None):
+            if not args.category:
+                print("\n  --series requires --category (e.g. Sports)\n")
+                return
+            fetch = await client.get_markets_by_category(
+                category=args.category,
+                status="open",
+                limit=200,
+                min_volume_24h=min_vol,
+                activity_hours=activity_hours,
+                full_scan=full_scan,
+                **_filter_kwargs(args),
+            )
+            markets = fetch.markets
+            fetch_stats = fetch.stats
+            title = f"Series: {args.series}  ({args.category}){_filter_title_suffix(args)}"
 
         # ── Category ──────────────────────────────────────────────────────────
         elif args.category:
@@ -672,6 +799,7 @@ p_browse.add_argument("--tag",        type=str, help="Subcategory tag (e.g. Socc
 p_browse.add_argument("--sport",      type=str, help="Sport name (alias for --tag on Sports)")
 p_browse.add_argument("--competition", type=str, help="League id (e.g. EPL) from sports-filters")
 p_browse.add_argument("--scope",      type=str, help="Market scope (e.g. Games, Futures)")
+p_browse.add_argument("--series",     type=str, help="Series ticker (from series command)")
 p_browse.add_argument("--event",      type=str, help="Event ticker to browse (e.g. PRES-2028)")
 p_browse.add_argument("--ticker",     type=str, help="Single market full detail")
 p_browse.add_argument("--all",        action="store_true", help="Browse all open markets")
@@ -701,6 +829,7 @@ p_screen.add_argument("--tag",        type=str)
 p_screen.add_argument("--sport",      type=str)
 p_screen.add_argument("--competition", type=str)
 p_screen.add_argument("--scope",      type=str)
+p_screen.add_argument("--series",     type=str)
 p_screen.add_argument("--event",     type=str)
 p_screen.add_argument("--ticker",    type=str)
 p_screen.add_argument("--all",       action="store_true")
@@ -719,6 +848,40 @@ p_sports = sub.add_parser(
 )
 p_sports.add_argument("--sport", type=str,
                       help="Show filters for one sport only (e.g. Soccer)")
+
+p_series = sub.add_parser(
+    "series",
+    help="List series (event groups) in a category, optionally by tag/sport",
+)
+p_series.add_argument("--category", type=str, required=True)
+p_series.add_argument("--tag", type=str, help="Subcategory tag (e.g. Basketball)")
+p_series.add_argument("--sport", type=str, help="Alias for --tag on Sports")
+
+p_disc = sub.add_parser(
+    "discover",
+    help="Discover top tickers with strategy presets (like main.py --discover)",
+)
+p_disc.add_argument("--category", type=str, required=True)
+p_disc.add_argument("--tag", type=str)
+p_disc.add_argument("--sport", type=str)
+p_disc.add_argument("--competition", type=str)
+p_disc.add_argument("--scope", type=str)
+p_disc.add_argument("--series", type=str)
+p_disc.add_argument("--strategy", type=str, default="high_prob",
+                    help="Strategy for preset + screener rank (default high_prob)")
+p_disc.add_argument("--preset", type=str, default=None,
+                    help="Discovery preset override (high_prob, green_up, kelly, arb, none)")
+p_disc.add_argument("--top", type=int, default=10)
+p_disc.add_argument("--min-volume", type=int, default=None, dest="min_volume")
+p_disc.add_argument("--min-yes-ask", type=int, default=None, dest="min_yes_ask")
+p_disc.add_argument("--max-yes-ask", type=int, default=None, dest="max_yes_ask")
+p_disc.add_argument("--max-spread", type=int, default=None, dest="max_spread")
+p_disc.add_argument("--activity-hours", type=float, default=None, dest="activity_hours")
+p_disc.add_argument("--full-scan", action="store_true")
+p_disc.add_argument("--rank-by", default=None,
+                    choices=["volume", "fee_adjusted_roi", "screener", "activity", "spread"])
+p_disc.add_argument("--no-tradeable-filter", action="store_true")
+p_disc.add_argument("--no-live-only", action="store_true")
 
 # ── --categories flat flag (backward compatible) ──────────────────────────────
 parser.add_argument("--categories", action="store_true",
@@ -743,6 +906,10 @@ async def _dispatch(args) -> None:
         await cmd_tags(args)
     elif args.cmd == "sports-filters":
         await cmd_sports_filters(args)
+    elif args.cmd == "series":
+        await cmd_series(args)
+    elif args.cmd == "discover":
+        await cmd_discover(args)
     elif args.categories or (not args.cmd and getattr(args, "categories", False)):
         await cmd_categories(args)
     elif args.cmd is None:

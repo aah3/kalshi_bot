@@ -21,7 +21,7 @@ from discovery.market_math import fee_adjusted_roi_if_yes_wins_pct, passes_roi_g
 from execution.rate_limiter import RateLimiter
 from logging_.structured_logger import logger
 
-RankBy = Literal["volume", "fee_adjusted_roi", "screener"]
+RankBy = Literal["volume", "fee_adjusted_roi", "screener", "activity", "spread"]
 
 # Kalshi UI "Trending" tab — not an API category; cross-category volume scan.
 DEFAULT_DISCOVER_CATEGORY = "Trending"
@@ -54,6 +54,11 @@ class TickerCriteria:
     live_only: bool = True
     max_minutes_to_close: float | None = None
     max_minutes_since_update: float | None = None
+    tag: str | None = None
+    sport: str | None = None
+    competition: str | None = None
+    scope: str | None = None
+    series_ticker: str | None = None
 
 
 def market_filter_rejection(
@@ -126,6 +131,12 @@ def filter_markets(
 def _market_sort_key(market: MarketSummary, rank_by: RankBy) -> float:
     if rank_by == "fee_adjusted_roi" and market.yes_ask is not None:
         return fee_adjusted_roi_if_yes_wins_pct(market.yes_ask, round_trip_fees=False)
+    if rank_by == "activity":
+        if market.minutes_since_update is None:
+            return -1.0
+        return -market.minutes_since_update
+    if rank_by == "spread":
+        return -float(market.spread)
     return float(market.volume_24h)
 
 
@@ -190,6 +201,10 @@ def criteria_from_env() -> TickerCriteria | None:
     )
     activity = _opt_float("KALSHI_DISCOVER_ACTIVITY_HOURS")
 
+    def _opt_str(key: str) -> str | None:
+        raw = os.getenv(key, "").strip()
+        return raw or None
+
     return TickerCriteria(
         category=category,
         top_n=int(os.getenv("KALSHI_DISCOVER_TOP", "10")),
@@ -201,7 +216,28 @@ def criteria_from_env() -> TickerCriteria | None:
         full_scan=full_scan or activity is not None,
         tradeable_only=os.getenv("KALSHI_DISCOVER_TRADEABLE", "1").strip().lower()
         not in ("0", "false", "no", "off"),
+        tag=_opt_str("KALSHI_DISCOVER_TAG"),
+        sport=_opt_str("KALSHI_DISCOVER_SPORT"),
+        competition=_opt_str("KALSHI_DISCOVER_COMPETITION"),
+        scope=_opt_str("KALSHI_DISCOVER_SCOPE"),
+        series_ticker=_opt_str("KALSHI_DISCOVER_SERIES"),
     )
+
+
+def discover_filter_label(criteria: TickerCriteria) -> str:
+    """Human-readable drill-down suffix for discovery output."""
+    parts: list[str] = []
+    if criteria.series_ticker:
+        parts.append(f"series={criteria.series_ticker}")
+    if criteria.tag:
+        parts.append(f"tag={criteria.tag}")
+    if criteria.sport and not criteria.tag:
+        parts.append(f"sport={criteria.sport}")
+    if criteria.competition:
+        parts.append(f"competition={criteria.competition}")
+    if criteria.scope:
+        parts.append(f"scope={criteria.scope}")
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 async def fetch_category_markets(
@@ -230,6 +266,11 @@ async def fetch_category_markets(
         min_volume_24h=criteria.min_volume_24h,
         activity_hours=criteria.activity_hours,
         full_scan=criteria.full_scan,
+        tag=criteria.tag,
+        sport=criteria.sport,
+        competition=criteria.competition,
+        scope=criteria.scope,
+        series_ticker=criteria.series_ticker,
     )
     return result.markets
 
@@ -254,6 +295,11 @@ def _log_discovery_result(
         "rank_by": criteria.rank_by,
         "preset": criteria.preset_name,
         "activity_hours": criteria.activity_hours,
+        "tag": criteria.tag,
+        "sport": criteria.sport,
+        "competition": criteria.competition,
+        "scope": criteria.scope,
+        "series_ticker": criteria.series_ticker,
     }
     if rejections:
         log_kwargs["filter_rejections"] = rejections
@@ -338,6 +384,14 @@ def _format_market_row(
         else "?"
     )
     reject_col = f"  {reject:<28}" if reject else ""
+    upd = (
+        f"{market.minutes_since_update:.0f}m"
+        if market.minutes_since_update is not None
+        else "?"
+    )
+    meta = (
+        f"  {market.spread:>3}c  {upd:>5}  {market.series_ticker[:18]:<18}"
+    )
     if criteria.rank_by == "screener":
         from discovery.screener import score_for_strategy
 
@@ -345,11 +399,11 @@ def _format_market_row(
         sc = score_for_strategy(market, strat)
         return (
             f"  {market.volume_24h:>8,}  {sc:>5.2f}  {market.yes_ask or '?':>4}  {roi:>6}"
-            f"{reject_col}  {market.ticker:<40}  {market.title[:42]}"
+            f"{meta}{reject_col}  {market.ticker:<40}  {market.title[:36]}"
         )
     return (
         f"  {market.volume_24h:>8,}  {market.yes_ask or '?':>4}  {roi:>6}"
-        f"{reject_col}  {market.ticker:<40}  {market.title[:42]}"
+        f"{meta}{reject_col}  {market.ticker:<40}  {market.title[:36]}"
     )
 
 
@@ -363,8 +417,9 @@ def format_discovery_table(
     preset_line = f"  preset={criteria.preset_name}  " if criteria.preset_name else ""
     use_screener = criteria.rank_by == "screener"
     reject_hdr = "  REJECT" if not tickers else ""
+    filter_suffix = discover_filter_label(criteria)
     lines = [
-        f"Discovery: {criteria.category}  ->  {len(tickers)} ticker(s)",
+        f"Discovery: {criteria.category}{filter_suffix}  ->  {len(tickers)} ticker(s)",
         f"  filters: top={criteria.top_n}  min_vol_24h={criteria.min_volume_24h}"
         + (f"  min_yes_ask={criteria.min_yes_ask}c" if criteria.min_yes_ask else "")
         + (f"  max_yes_ask={criteria.max_yes_ask}c" if criteria.max_yes_ask else "")
@@ -383,15 +438,16 @@ def format_discovery_table(
         + (f"  activity_hours={criteria.activity_hours}" if criteria.activity_hours else ""),
         "",
     ]
+    meta_hdr = "  SPRD  UPD    SERIES"
     if use_screener:
         lines.append(
             f"  {'VOL24H':>8}  {'SCORE':>5}  {'ASK':>4}  {'ROI%':>6}"
-            f"{reject_hdr:<28}  {'TICKER':<40}  TITLE"
+            f"{meta_hdr}{reject_hdr:<28}  {'TICKER':<40}  TITLE"
         )
     else:
         lines.append(
             f"  {'VOL24H':>8}  {'ASK':>4}  {'ROI%':>6}"
-            f"{reject_hdr:<28}  {'TICKER':<40}  TITLE"
+            f"{meta_hdr}{reject_hdr:<28}  {'TICKER':<40}  TITLE"
         )
     lines.append(f"  {'-' * 120}")
 
