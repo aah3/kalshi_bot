@@ -36,7 +36,12 @@ from discovery.discovery_presets import apply_preset
 from discovery.market_client import MarketClient
 from discovery.ticker_selector import TickerCriteria, select_tickers
 from strategy.execution_price import resolve_no_buy, resolve_yes_buy, resolve_yes_sell
-from strategy.green_up_strategy import GreenUpStrategy, PositionState
+from strategy.green_up_strategy import (
+    GreenUpStrategy,
+    PositionState,
+    parse_stop_loss_cents,
+    stop_loss_trigger_price,
+)
 from strategy.execution_price import EntryPriceMode
 
 
@@ -192,6 +197,61 @@ def test_unlimited_cycles_resets_after_hedged():
     sig = strat.evaluate(_tick(8, 10, "T4"))
     assert sig is not None
     assert strat.get_position("T4").state == PositionState.WATCHING
+
+
+def test_stop_loss_trigger_price_from_cents():
+    assert stop_loss_trigger_price(26, 12) == 14
+    assert stop_loss_trigger_price(25, 10) == 15
+    assert stop_loss_trigger_price(5, 10) == 1
+
+
+def test_parse_stop_loss_cents_accepts_integer_and_legacy_fraction():
+    assert parse_stop_loss_cents(12) == 12
+    assert parse_stop_loss_cents("12") == 12
+    assert parse_stop_loss_cents(0.40) == 10
+
+
+def test_stop_loss_fires_when_bid_drops_enough():
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_trigger_price=100,
+        stop_loss_cents=12,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T5")
+    pos = strat.get_position("T5")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 26
+    pos.entry_stake_cents = 26
+    pos.stop_loss_trigger_price = stop_loss_trigger_price(26, 12)
+
+    assert strat.evaluate(_tick(15, 16, "T5")) is None
+
+    sig = strat.evaluate(_tick(14, 15, "T5"))
+    assert sig is not None
+    assert sig.side.value == "no"
+    assert sig.meta.get("phase") == "stop_loss"
+    assert strat.get_position("T5").state == PositionState.STOPPING
+
+
+def test_entry_fill_sets_stop_trigger_from_cents():
+    strat = GreenUpStrategy(
+        entry_max_price=25,
+        hedge_trigger_price=68,
+        stop_loss_cents=12,
+    )
+    strat.add_watch_ticker("T6")
+    pos = strat.get_position("T6")
+    pos.state = PositionState.WATCHING
+    strat.on_fill({
+        "ticker": "T6",
+        "side": "yes",
+        "price": 26,
+        "size_cents": 26,
+        "order_id": "oid-1",
+    })
+    assert pos.state == PositionState.ENTERED
+    assert pos.stop_loss_trigger_price == 14
 
 
 def test_full_green_hedges_at_trigger_on_micro_stake():

@@ -14,6 +14,7 @@ from typing import Any
 
 import config
 from discovery.orderbook_parse import OrderBookSnapshot
+from ingestion.book_freshness import is_book_stale
 from ingestion.market_ingestor import MarketIngestor
 from logging_.structured_logger import logger
 from metrics.blotter import Blotter
@@ -58,20 +59,40 @@ def _book_quotes(
     ticker: str,
     ingestor: MarketIngestor | None,
     rest_books: dict[str, OrderBookSnapshot] | None,
+    *,
+    stale_seconds: float | None = None,
 ) -> tuple[int | None, int | None, float | None, int | None]:
-    """Best bid/ask/mid/spread from WS book or REST fallback."""
+    """Best bid/ask/mid/spread from WS book, falling back to REST when missing or stale."""
     bid = ask = mid = spread = None
+    ws_age: float | None = None
+
     if ingestor:
         ob = ingestor.get_book(ticker)
         if ob and ob.best_bid is not None:
             bid, ask = ob.best_bid, ob.best_ask
             mid, spread = ob.mid_price, ob.spread
-    if (bid is None or ask is None) and rest_books and ticker in rest_books:
+            if stale_seconds is not None and stale_seconds > 0:
+                ws_age = ingestor.book_age_seconds(ticker)
+
+    use_rest = False
+    if rest_books and ticker in rest_books:
+        if bid is None:
+            use_rest = True
+        elif (
+            stale_seconds is not None
+            and stale_seconds > 0
+            and ws_age is not None
+            and ws_age > stale_seconds
+        ):
+            use_rest = True
+
+    if use_rest:
         snap = rest_books[ticker]
-        bid    = snap.best_bid
-        ask    = snap.best_ask
-        mid    = snap.mid_price
+        bid = snap.best_bid
+        ask = snap.best_ask
+        mid = snap.mid_price
         spread = snap.spread
+
     return bid, ask, mid, spread
 
 
@@ -80,6 +101,8 @@ def build_ticker_rows(
     ingestor: MarketIngestor | None,
     strategy: BaseStrategy | None,
     rest_books: dict[str, OrderBookSnapshot] | None = None,
+    *,
+    stale_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     """Merge order book, strategy state, and green-up previews per ticker."""
     rows: list[dict[str, Any]] = []
@@ -92,7 +115,9 @@ def build_ticker_rows(
             summaries[s["ticker"]] = s
 
     for ticker in tickers:
-        bid, ask, mid, spread = _book_quotes(ticker, ingestor, rest_books)
+        bid, ask, mid, spread = _book_quotes(
+            ticker, ingestor, rest_books, stale_seconds=stale_seconds
+        )
 
         s = summaries.get(ticker, {})
         state = s.get("state", "—")
@@ -150,6 +175,7 @@ def render_session_table(
     blotter_open: int,
     metrics: dict[str, Any] | None = None,
     clear_screen: bool = True,
+    stale_seconds: float | None = None,
 ) -> None:
     """Print a full-screen monitoring table to stdout."""
     if clear_screen:
@@ -210,7 +236,9 @@ def render_session_table(
         p.ticker: p for p in (portfolio.positions if portfolio else [])
     }
 
-    for row in build_ticker_rows(tickers, ingestor, strategy, rest_books):
+    for row in build_ticker_rows(
+        tickers, ingestor, strategy, rest_books, stale_seconds=stale_seconds
+    ):
         ticker = row["ticker"]
         bid_s  = f"{row['bid']:>3}c" if row["bid"] is not None else "  — "
         ask_s  = f"{row['ask']:>3}c" if row["ask"] is not None else "  — "
@@ -335,8 +363,12 @@ class SessionMonitor:
             blotter_open = len(self._blotter.open_positions_summary())
 
             rest_books: dict[str, OrderBookSnapshot] = {}
-            need_rest = any(
-                _book_quotes(t, self._ingestor, None)[0] is None
+            stale_seconds = config.WS_BOOK_REST_FALLBACK_SECONDS
+            need_rest = stale_seconds > 0 and any(
+                is_book_stale(
+                    self._ingestor.get_book(t) if self._ingestor else None,
+                    stale_seconds,
+                )
                 for t in self._tickers
             )
             if need_rest and self._portfolio_monitor._session:
@@ -348,7 +380,10 @@ class SessionMonitor:
                     )
                     self._market_client._session = self._portfolio_monitor._session
                 for t in self._tickers:
-                    if _book_quotes(t, self._ingestor, None)[0] is not None:
+                    if not is_book_stale(
+                        self._ingestor.get_book(t) if self._ingestor else None,
+                        stale_seconds,
+                    ):
                         continue
                     try:
                         book = await self._market_client.get_order_book(t, depth=5)
@@ -370,6 +405,7 @@ class SessionMonitor:
                     blotter_open=blotter_open,
                     metrics=metrics,
                     clear_screen=self._clear_screen,
+                    stale_seconds=stale_seconds if stale_seconds > 0 else None,
                 )
             except Exception as exc:
                 logger.warning(f"Monitor render failed: {exc}")

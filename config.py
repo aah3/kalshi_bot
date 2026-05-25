@@ -180,6 +180,13 @@ ORDER_SUBMIT_MAX_RETRIES: int = int(os.getenv("KALSHI_ORDER_MAX_RETRIES", "3"))
 PORTFOLIO_RISK_SYNC_SECONDS: float = float(
     os.getenv("KALSHI_PORTFOLIO_RISK_SYNC_SECONDS", "30")
 )
+# When a WS book is older than this, refresh via REST for strategy + monitor (0 = off).
+WS_BOOK_REST_FALLBACK_SECONDS: float = float(
+    os.getenv("KALSHI_WS_BOOK_REST_FALLBACK_SECONDS", "60")
+)
+WS_BOOK_REST_FALLBACK_POLL_SECONDS: float = float(
+    os.getenv("KALSHI_WS_BOOK_REST_FALLBACK_POLL_SECONDS", "15")
+)
 
 # ─── Risk / Circuit Breaker ───────────────────────────────────────────────────
 

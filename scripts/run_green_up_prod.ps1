@@ -37,7 +37,7 @@ $MaxPositionCents    = 100          # Kelly cap = $1.00 max entry leg
 $EntryMax            = 30           # enter when YES ask <= 30c
 $HedgeTrigger        = 44           # hedge when YES bid >= 44c
 $HedgeMode           = "stake_back" # full_green | stake_back | partial
-$StopLoss            = 0.35         # fraction below entry (sell YES path)
+$StopLoss            = 10            # cents below entry before stop (max loss ≈ 10c/contract)
 $LimitOffset         = -2           # bid - 2c entry (parity with high_prob)
 $MaxCycles           = 1            # one round-trip per ticker per session
 $DiscoverCategory    = "Sports"
@@ -60,7 +60,7 @@ Write-Host "=== GREEN_UP PRODUCTION MICRO-PILOT ===" -ForegroundColor Yellow
 Write-Host "  Real money  |  max entry leg `$$( [math]::Round($MaxPositionCents / 100, 2) ) (Kelly-sized, capped)"
 Write-Host "  entry       |  ask <= ${EntryMax}c, limit_offset (bid $($LimitOffset)c)"
 Write-Host "  hedge       |  $HedgeMode @ ${HedgeTrigger}c bid"
-Write-Host "  stop        |  $($StopLoss * 100)% below entry"
+Write-Host "  stop        |  ${StopLoss}c below entry (~${StopLoss}c max loss/contract)"
 Write-Host "  db / log    |  $($env:KALSHI_PROD_DB_PATH) / $($env:KALSHI_PROD_LOG_FILE)"
 Write-Host ""
 

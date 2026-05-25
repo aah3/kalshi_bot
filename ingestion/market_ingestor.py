@@ -23,10 +23,12 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 import config
 from discovery.orderbook_parse import (
+    OrderBookSnapshot,
     _dollars_to_cents,
     _parse_fp_levels,
     _yes_asks_from_no_bids,
 )
+from ingestion.book_freshness import book_age_seconds
 from logging_.structured_logger import logger
 
 
@@ -116,6 +118,17 @@ class OrderBook:
                     self.yes_asks[int(level["price"])] = int(level["quantity"])
 
         self.updated_at_us = int(time.time() * 1_000_000)
+        return bool(self.yes_bids or self.yes_asks)
+
+    def load_rest_snapshot(self, snap: OrderBookSnapshot) -> bool:
+        """Replace book levels from a REST ``OrderBookSnapshot``."""
+        self.yes_bids.clear()
+        self.yes_asks.clear()
+        for price, qty in snap.yes_bids:
+            self.yes_bids[price] = qty
+        for price, qty in snap.yes_asks:
+            self.yes_asks[price] = qty
+        self.updated_at_us = int(snap.fetched_at.timestamp() * 1_000_000)
         return bool(self.yes_bids or self.yes_asks)
 
     def apply_ws_delta(self, data: dict[str, Any]) -> bool:
@@ -241,8 +254,28 @@ class MarketIngestor:
 
     # ── Public ───────────────────────────────────────────────────────────────
 
+    @property
+    def tickers(self) -> list[str]:
+        return list(self._tickers)
+
     def get_book(self, ticker: str) -> OrderBook | None:
         return self._books.get(ticker)
+
+    def book_age_seconds(self, ticker: str) -> float | None:
+        return book_age_seconds(self.get_book(ticker))
+
+    def apply_rest_snapshot(self, snap: OrderBookSnapshot) -> bool:
+        """Merge a REST snapshot into the in-memory book for ``snap.ticker``."""
+        book = self._books.get(snap.ticker)
+        if book is None:
+            return False
+        return book.load_rest_snapshot(snap)
+
+    def push_tick(self, ticker: str, event_type: str = "rest_refresh") -> None:
+        """Re-emit a normalised tick (e.g. after REST refresh) to the strategy."""
+        book = self._books.get(ticker)
+        if book is not None:
+            self._emit_tick(book, event_type=event_type)
 
     def get_all_snapshots(self) -> list[dict[str, Any]]:
         return [b.snapshot() for b in self._books.values()]

@@ -12,7 +12,7 @@ from typing import Any
 import config
 from strategy.arbitrage_strategy import ArbitrageStrategy
 from strategy.base_strategy import BaseStrategy
-from strategy.green_up_strategy import GreenUpStrategy, HedgeMode
+from strategy.green_up_strategy import GreenUpStrategy, HedgeMode, parse_stop_loss_cents
 from strategy.execution_price import EntryPriceMode
 from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
 from strategy.kelly_strategy import KellyStrategy
@@ -73,7 +73,7 @@ def build_strategy(
     entry_max: int | None = None,
     hedge_trigger: int | None = None,
     hedge_mode: str | None = None,
-    stop_loss: float | None = None,
+    stop_loss: int | float | None = None,
     comp_pairs: list[tuple[str, str]] | None = None,
     hp_min_yes_ask: int | None = None,
     hp_max_yes_ask: int | None = None,
@@ -97,7 +97,7 @@ def build_strategy(
         entry_max:      Green-up max YES ask for entry (cents).
         hedge_trigger:  Green-up YES bid to trigger hedge (cents).
         hedge_mode:     full_green | stake_back | partial.
-        stop_loss:      Green-up stop fraction below entry.
+        stop_loss:      Green-up stop in cents per contract (YES bid drop from entry).
         comp_pairs:     Arb only — complementary ticker pairs.
         hp_*:           High-probability strategy tunables.
     """
@@ -206,8 +206,8 @@ def build_strategy(
                 os.getenv("KALSHI_GREEN_UP_HEDGE_TRIGGER", "68")
             ),
             hedge_mode=mode_map.get(mode_key, HedgeMode.FULL_GREEN),
-            stop_loss_threshold=stop_loss if stop_loss is not None else float(
-                os.getenv("KALSHI_GREEN_UP_STOP_LOSS", "0.40")
+            stop_loss_cents=parse_stop_loss_cents(
+                stop_loss if stop_loss is not None else os.getenv("KALSHI_GREEN_UP_STOP_LOSS")
             ),
             entry_price_mode=price_mode_map.get(entry_key, EntryPriceMode.PASSIVE),
             exit_price_mode=price_mode_map.get(exit_key, EntryPriceMode.PASSIVE),

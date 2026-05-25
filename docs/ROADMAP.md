@@ -135,12 +135,24 @@ $env:KALSHI_HP_LIMIT_OFFSET = "-1"
 python main.py --tickers KXMLBTOTAL-26MAY231420HOUCHC-6 --strategy high_prob --hp-min-yes-ask 70 --hp-entry-mode limit_offset --monitor-interval 30
 # --hp-entry-mode cross_spread or market
 
-```
+$env:KALSHI_HP_LIMIT_OFFSET = "-2"   # bid − 2¢
+
+```bash
+python main.py --discover --discover-category Sports --strategy green_up --discover-only --no-live-only --discover-top 5
 
 ```bash
 # DISCOVERY: Table + near-misses (stdout)
 python main.py --discover --discover-category Sports --strategy high_prob --discover-only
 python main.py --discover --discover-category Sports --strategy green_up --discover-only
+
+# PREVIEW
+python tools/trade.py preview --ticker KXNBASPREAD-26MAY24OKCSAS-SAS9 --side yes --count 1 --price 75 --tif gtc
+
+# TRADE
+python main.py --tickers KXNBASPREAD-26MAY24OKCSAS-SAS9 --strategy green_up --gu-entry-mode passive --monitor-interval 30
+python main.py --tickers KXNBASPREAD-26MAY24OKCSAS-SAS9 --strategy green_up --gu-entry-mode passive --entry-max 30 --monitor-interval 30
+
+python main.py --tickers KXNBASPREAD-26MAY24OKCSAS-SAS9 --strategy green_up --gu-entry-mode passive --entry-max 30 --monitor-interval 30 --no-live-only
 
 # Last discovery log lines (file)
 Get-Content kalshi_bot.jsonl -Tail 20

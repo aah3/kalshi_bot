@@ -210,7 +210,7 @@ class ReplayEngine:
             return strat
 
         elif name == "green_up":
-            from strategy.green_up_strategy import GreenUpStrategy, HedgeMode
+            from strategy.green_up_strategy import GreenUpStrategy, HedgeMode, parse_stop_loss_cents
             mode_map = {
                 "full_green": HedgeMode.FULL_GREEN,
                 "stake_back": HedgeMode.STAKE_BACK,
@@ -221,7 +221,9 @@ class ReplayEngine:
                 entry_max_price=self._strat_kwargs.get("entry_max", 25),
                 hedge_trigger_price=self._strat_kwargs.get("hedge_trigger", 68),
                 hedge_mode=mode,
-                stop_loss_threshold=self._strat_kwargs.get("stop_loss", 0.40),
+                stop_loss_cents=parse_stop_loss_cents(
+                    self._strat_kwargs.get("stop_loss", 10)
+                ),
             )
             # Register tickers for watching
             for ticker in self._strat_kwargs.get("tickers", []):
@@ -628,7 +630,7 @@ async def _run_replay(args) -> None:
             "entry_max":     getattr(args, "entry_max", 25),
             "hedge_trigger": getattr(args, "hedge_trigger", 68),
             "hedge_mode":    getattr(args, "hedge_mode", "full_green"),
-            "stop_loss":     getattr(args, "stop_loss", 0.40),
+            "stop_loss":     getattr(args, "stop_loss", 10),
             "tickers":       tickers,
             "comp_pairs":    getattr(args, "comp_pairs", []) or [],
         },
@@ -690,7 +692,8 @@ p_rep.add_argument(
 )
 p_rep.add_argument("--hedge-mode",    default="full_green",
                    choices=["full_green","stake_back","partial"])
-p_rep.add_argument("--stop-loss",     type=float, default=0.40)
+p_rep.add_argument("--stop-loss",     type=float, default=10,
+                   help="Green-up stop: cents per contract below entry")
 p_rep.add_argument("--comp-pairs",    nargs="*",  metavar="T1:T2",
                    help="Complementary arb pairs e.g. PRES-DEM:PRES-REP")
 p_rep.add_argument("--json",          default=None, metavar="FILE.json")

@@ -1,6 +1,19 @@
 # Kalshi Prediction Market Trading Bot
 
-Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports multiple pluggable strategies, automatic market discovery, a live terminal monitor, manual order tools, offline replay, and a persistent trade blotter (queryable by date, category, ticker, strategy, and resolution) with performance analytics and settlement reconciliation.
+Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports four pluggable strategies (`kelly`, `green_up`, `high_prob`, `arb`), **strategy-aligned market discovery** with live in-play filters, pre-trade **entry gates**, portfolio-synced **circuit breaker**, a live terminal monitor, manual order tools (`tools/trade.py`, `tools/orderbook.py`), offline replay, production PowerShell runners, and a persistent trade blotter (queryable by date, category, ticker, strategy, and resolution) with performance analytics and settlement reconciliation.
+
+### Recent updates
+
+- **Demo / production profiles** — switch `KALSHI_ENV` only; per-env API keys, DB path, log file, and risk caps (`KALSHI_DEMO_*` / `KALSHI_PROD_*`)
+- **Live market registry** — discovery and entries default to recently updated, soon-closing markets with fresh WebSocket books and recent tape
+- **Strategy discovery presets** — `--discover` auto-applies filters/ranking matched to `--strategy` (overridable per flag)
+- **Entry gates** — block new entries on low cash or markets too close to expiry (`risk/entry_gates.py`)
+- **Concurrent position cap** — `--max-concurrent-positions` limits simultaneous entry legs (hedges/stops still run)
+- **Green-up** — multi-ticker parallel watch, hedge modes (`full_green` / `stake_back` / `partial`), configurable entry/exit pricing and max cycles per ticker
+- **High-probability** — fee-adjusted ROI gating, post-fill take-profit / stop modes, fixed or Kelly-capped stake
+- **Prod scripts** — `scripts/run_green_up_prod.ps1`, `scripts/run_high_prob_prod.ps1`, `scripts/compare_prod_sessions.ps1` (isolated DB/logs for A/B)
+- **Blotter queries** — filter trades/legs by strategy, category, date, resolution; export CSV
+- **Roadmap** — certification plan in [docs/ROADMAP.md](docs/ROADMAP.md)
 
 ## Requirements
 
@@ -30,10 +43,11 @@ Encode your private key:
 
 ```bash
 # Linux / macOS
-base64 -w 0 your_private_key.pem
+base64 -w 0 kalshi_private_key.pem
 
 # Windows PowerShell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("your_private_key.pem"))
+python -c "import base64, pathlib; print(base64.b64encode(pathlib.Path('kalshi_private_key.pem').read_bytes()).decode())"
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("kalshi_key.pem"))
 ```
 
 The bot loads `.env` on startup. Shell exports override `.env` values.
@@ -57,165 +71,307 @@ python -m pytest tests/ -v
 
 ---
 
-## Strategies
+## Discovering and trading by strategy
 
-| Strategy | CLI / env | Profile |
-|----------|-----------|---------|
-| **Kelly** | `--strategy kelly` | Fractional Kelly when model P(YES) beats the market by `MIN_EDGE_TO_VIG` |
-| **Green Up** | `--strategy green_up` | Back cheap YES, hedge when price runs (full green / stake back / partial) |
-| **Arbitrage** | `--strategy arb` | Complementary, exhaustive-set, and dominance arbs |
-| **High probability** | `--strategy high_prob` | Buy high-implied-P(YES) contracts; optional resting take-profit / stop |
+This is the main workflow: pick a **strategy**, optionally **discover** tickers in a Kalshi category, then run `main.py` with a live WebSocket feed and terminal monitor. The same `--strategy` flag drives both the trading engine and (by default) the discovery preset.
 
-### Green-up strategy
+### End-to-end workflow
 
-Back cheap **YES** (underdog), then hedge with **NO** when price runs. Hedge sizing uses full-green, stake-back, or partial formulas (see `strategy/green_up_strategy.py`).
+```mermaid
+flowchart LR
+  A[tools/screen.py] --> B["main.py --discover-only"]
+  B --> C["main.py --discover + --strategy"]
+  C --> D[WebSocket books + strategy]
+  D --> E[ExecutionManager orders]
+  E --> F[Blotter + monitor table]
+```
 
-The bot watches **all N discovered tickers** in parallel. Each order is priced from that market’s live bid/ask on every tick.
+1. **Explore** — `python tools/screen.py categories` / `browse` / `screen` to see how markets score per strategy.
+2. **Preview tickers** — `python main.py --discover ... --discover-only` (no orders).
+3. **Trade** — same command without `--discover-only`; bot subscribes to all selected tickers and runs the strategy on each book update.
+4. **Reconcile** — `tools/trade.py portfolio` for exchange truth; `tools/blotter.py` for bot-recorded cycles.
 
-**CLI parameters** (also available via env — see below):
+**Ticker sources** (first match wins):
+
+| Source | How |
+|--------|-----|
+| `--tickers A,B,C` | Explicit list (overrides everything) |
+| `--discover` / `KALSHI_DISCOVER=true` | Auto-select from `--discover-category` + filters |
+| `KALSHI_TICKERS` | Comma-separated env list |
+
+Default category when discovering: **Trending** (override with `--discover-category Sports`, etc.).
+
+### Strategy overview
+
+| Strategy | CLI | Best for | Discovery preset | Typical markets |
+|----------|-----|----------|------------------|-----------------|
+| **Kelly** | `--strategy kelly` | Model edge vs market | `kelly` — liquid, tight spread | Any category where you supply `P(YES)` |
+| **Green Up** | `--strategy green_up` | In-play underdog → hedge | `green_up` — cheap YES, active, closing soon | Live Sports / fast-moving lines |
+| **High probability** | `--strategy high_prob` | High implied win rate, fee-aware ROI | `high_prob` — YES 85–97¢, rank by net ROI | Politics, macro, “likely” outcomes |
+| **Arbitrage** | `--strategy arb` | Structural mispricing | `arb` — top volume, full category scan | Paired / related contracts |
+
+All strategies share:
+
+- **WebSocket-driven signals** — entries evaluated on `orderbook_delta` ticks (not REST monitor prices alone).
+- **Execution pricing** — `strategy/execution_price.py` maps `passive`, `cross_spread`, `market`, `limit_offset`, etc. to limit/IOC orders.
+- **Risk** — circuit breaker (drawdown, daily loss, open-position caps), optional `--max-concurrent-positions`, and [entry gates](#entry-gates-and-concurrency) before new entries.
+- **Blotter** — parent trades + legs for anything opened through `main.py`.
+
+---
+
+### Discovery presets (auto-applied with `--discover`)
+
+When `--discover` is set, `discovery/discovery_presets.py` overlays defaults for `--strategy` unless you pass the same field explicitly on the CLI (those flags are never overwritten).
+
+| Preset | Strategy | Default filters | Ranking |
+|--------|----------|-----------------|--------|
+| `high_prob` | `high_prob` | YES ask 85–97¢, spread ≤8¢, min vol 200 | **fee_adjusted_roi** |
+| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, updated ≤2h, close ≤6h | **screener** (green_up fit) |
+| `kelly` | `kelly` | Spread ≤10¢, min vol 100 | **volume** |
+| `arb` | `arb` | Top 25, min vol 50, full category scan | **volume** |
+
+**Screener floor:** markets below **200** contracts 24h volume are dropped in `discovery/screener.py` regardless of preset. Presets can require more (e.g. green_up min 500).
+
+```bash
+# Force a preset different from --strategy
+python main.py --discover --discover-preset high_prob --strategy green_up --discover-only
+
+# Raw filters only (no preset overlay)
+python main.py --discover --discover-preset none --discover-category Sports \
+  --discover-max-yes-ask 30 --discover-rank-by volume --discover-only
+```
+
+**Discovery CLI flags:** `--discover-top`, `--discover-min-volume`, `--discover-min-yes-ask`, `--discover-max-yes-ask`, `--discover-max-spread`, `--discover-activity-hours`, `--discover-max-minutes-to-close`, `--discover-rank-by`, `--discover-min-fee-roi`, `--discover-full-scan`, `--discover-only`, `--discover-preset`, `--discover-no-tradeable-filter`, `--no-live-only`.
+
+**Discovery environment variables:** `KALSHI_DISCOVER`, `KALSHI_DISCOVER_CATEGORY`, `KALSHI_DISCOVER_TOP`, `KALSHI_DISCOVER_MIN_YES_ASK`, `KALSHI_DISCOVER_MAX_YES_ASK`, `KALSHI_DISCOVER_MAX_SPREAD`, `KALSHI_DISCOVER_MIN_VOLUME`, `KALSHI_DISCOVER_ACTIVITY_HOURS`, `KALSHI_DISCOVER_RANK_BY`, `KALSHI_DISCOVER_MAX_MINUTES_TO_CLOSE`, `KALSHI_MAX_CONCURRENT_POSITIONS`.
+
+---
+
+### Live market filters (default on)
+
+Discovery and entries target **in-play** markets unless you disable live mode.
+
+| Gate | Default | Applies to |
+|------|---------|------------|
+| Recently updated on Kalshi | ≤ **2 h** (`KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE`) | Discovery |
+| Closing soon | ≤ **6 h** (`KALSHI_LIVE_MAX_MINUTES_TO_CLOSE`) | Discovery + entry |
+| Fresh WebSocket book | ≤ **30 min** (`KALSHI_LIVE_MAX_BOOK_STALE_MINUTES`) | Entry |
+| Recent trade on tape | ≤ **2 h** (`KALSHI_LIVE_MAX_TRADE_STALE_MINUTES`) | Entry |
+
+Master switch: `KALSHI_LIVE_ONLY=true` (default). Disable with `--no-live-only` or `KALSHI_LIVE_ONLY=false` for debugging.
+
+```bash
+# Tighter Sports window: updated in 30m, closes within 3h
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-activity-hours 0.5 --discover-max-minutes-to-close 180 --discover-only
+```
+
+Implementation: `discovery/live_market.py`, `discovery/market_registry.py`.
+
+---
+
+### Entry gates and concurrency
+
+Before any **new entry** (`entry` / `leg_1` phase), `risk/entry_gates.py` can block the order:
+
+| Gate | Config | Effect |
+|------|--------|--------|
+| Low balance | `KALSHI_MIN_BALANCE_CENTS`, `KALSHI_BLOCK_LOW_BALANCE` | Skip entry if cash below minimum |
+| Too close to expiry | `KALSHI_MIN_MINUTES_TO_EXPIRY` | Skip if market closes sooner than N minutes |
+
+**Concurrent positions:** `--max-concurrent-positions N` (or `KALSHI_MAX_CONCURRENT_POSITIONS`) counts open/pending **entry** legs via `strategy/position_limits.py`. At the cap, new entries are skipped; **hedges, stops, and exits still run**. `0` = unlimited.
+
+---
+
+### Kelly (`--strategy kelly`)
+
+Uses **your** estimate of P(YES) vs the market-implied probability from the YES ask. Trades only when edge / half-spread ≥ `MIN_EDGE_TO_VIG` (default 2%). Position size = fractional Kelly (`KELLY_DIVISOR`, default quarter-Kelly) capped by `MAX_POSITION_CENTS`.
+
+**Required:** model probabilities per ticker.
+
+```bash
+# Manual tickers + explicit probabilities
+python main.py --strategy kelly \
+  --tickers TICKER-A,TICKER-B \
+  --model-prob TICKER-A:0.62 TICKER-B:0.55
+
+# Discover liquid markets, then trade (you still must pass --model-prob)
+python main.py --discover --discover-category Politics --strategy kelly \
+  --discover-top 10 --model-prob TICKER-A:0.58
+```
+
+Env: `KALSHI_MODEL_PROB=TICKER:0.62,TICKER2:0.55`, `KALSHI_STRATEGY=kelly`.
+
+Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Use the screener’s Kelly column in `tools/screen.py` to find candidates.
+
+---
+
+### Green Up (`--strategy green_up`)
+
+**Idea:** buy cheap **YES** on an underdog (low implied probability), then **buy NO** when the line moves in your favor to lock profit or cap loss. Designed for **multiple tickers in parallel** (e.g. several live games).
+
+**State machine per ticker:** `WATCHING` → `ENTERED` → `HEDGING` → `HEDGED`, or `ENTERED` → `STOPPING` → `STOPPED`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--entry-max` | 25¢ | Enter only when best YES ask ≤ this |
-| `--hedge-trigger` | 68¢ | Hedge when YES **bid** reaches this |
+| `--entry-max` | 25¢ | Enter only when best YES **ask** ≤ this |
+| `--hedge-trigger` | 68¢ | Hedge when YES **bid** ≥ this |
 | `--hedge-mode` | `full_green` | `full_green` \| `stake_back` \| `partial` |
-| `--stop-loss` | 0.40 | Stop if YES bid falls 40% below entry |
-| `--gu-entry-mode` | `passive` | How to price **buy YES** entries (see order pricing) |
-| `--gu-exit-mode` | `passive` | How to price **buy NO** hedge/stop legs |
-| `--max-concurrent-positions` | `0` (unlimited) | Cap simultaneous open/pending entry legs (hedges/stops still allowed) |
-| `--gu-max-cycles` | `0` (unlimited) | Max completed entry→hedge/stop round-trips per ticker |
-| `--gu-limit-offset` | `0` | With `limit_offset` mode: cents added to bid (`-2` = bid−2¢) |
+| `--stop-loss` | 10 | Stop when YES bid falls **N cents** below entry (max loss ≈ N¢/contract) |
+| `--gu-entry-mode` | `passive` | Pricing for **buy YES** entries |
+| `--gu-exit-mode` | `passive` | Pricing for **buy NO** hedge/stop legs |
+| `--gu-limit-offset` | 0 | With `limit_offset`: cents from bid (e.g. `-2`) |
+| `--gu-max-cycles` | 0 | Max completed entry→exit cycles per ticker (`0` = unlimited) |
+| `--max-concurrent-positions` | 0 | Cap simultaneous entry legs (`0` = unlimited) |
 
-**Sizing:** fractional Kelly from entry vs hedge-trigger odds, capped by `MAX_POSITION_CENTS` (default $100). Contract count = `size_cents // entry_price`.
+**Hedge modes:**
 
-**Order pricing** (`--gu-entry-mode` / `--gu-exit-mode`, same set as high-prob):
+| Mode | Outcome |
+|------|---------|
+| `full_green` | Equal profit whether YES or NO wins (classic “green up”) |
+| `stake_back` | Hedge sized to recover stake; more upside if original YES wins |
+| `partial` | Scaled hedge between full green and stake back |
+
+**Sizing:** fractional Kelly from entry vs hedge-trigger odds, capped by `MAX_POSITION_CENTS`. Contracts ≈ `size_cents // entry_price`.
+
+**Order pricing** (`--gu-entry-mode` / `--gu-exit-mode`):
 
 | Mode | Buy | Sell |
 |------|-----|------|
-| `passive` (default) | Limit at **bid** (resting) | Limit at **ask** (resting) |
-| `cross_spread` | Limit at **ask** (IOC, cross) | Limit at **bid** (IOC, cross) |
+| `passive` | Limit at **bid** (resting) | Limit at **ask** (resting) |
+| `cross_spread` | Limit at **ask** (IOC) | Limit at **bid** (IOC) |
 | `market` | IOC market | IOC market |
-| `limit_at_bid` / `limit_at_ask` | Explicit bid/ask limits | Same aliases as above |
+| `limit_at_bid` / `limit_at_ask` / `limit_at_mid` / `limit_offset` | Explicit prices | Same |
+
+**Recommended flow:**
 
 ```bash
-# Preview top 5 Sports markets (screener-ranked, min volume enforced)
+# 1) Preview — screener-ranked underdogs, no orders
 python main.py --discover --discover-category Sports --strategy green_up \
   --discover-top 5 --discover-only
 
-# Autonomous demo: 5 live Sports markets, market entries, max 5 open positions
+# 2) Demo run — 5 parallel markets, aggressive entries, cap 5 positions
 python main.py --discover --discover-category Sports --strategy green_up \
   --discover-top 5 --max-concurrent-positions 5 \
   --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
   --gu-entry-mode market --gu-exit-mode cross_spread \
   --monitor-interval 30
+
+# 3) Production micro-pilot (isolated DB/log) — see scripts/run_green_up_prod.ps1
+.\scripts\run_green_up_prod.ps1 -DiscoverOnly
 ```
 
-### High-probability strategy
+Env block: [Green-up environment variables](#green-up-environment-variables) below.
 
-Buys **YES** when the market already prices a high chance of winning (default YES ask **85–97¢**), with **fee-adjusted ROI** gating so entries still clear costs after `FEE_PER_CONTRACT_CENTS`.
+**Flattening:** green-up often holds **YES and NO** on the same ticker. `main.py` does not auto-flatten on exit — use `tools/trade.py close` / `sell` per leg.
 
-**Entry / exit modes** (`--hp-entry-mode`, `--hp-exit-mode`):
+---
+
+### High probability (`--strategy high_prob`)
+
+**Idea:** buy **YES** when the market already implies a high win probability (default ask **85–97¢**), accepting a smaller payout per contract. Entries must pass **fee-adjusted ROI** when `HP_USE_FEE_ADJUSTED_ROI=true` (default).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hp-min-yes-ask` / `--hp-max-yes-ask` | 85 / 97 | Entry window (cents) |
+| `--hp-stake-cents` | min(5000, cap) | Fixed stake per entry |
+| `--hp-entry-mode` / `--hp-exit-mode` | `passive` | Limit/market pricing |
+| `--hp-post-fill` | `hold` | After fill: hold, TP, stop, or both |
+| `--hp-take-profit-pct` | — | TP as fraction of (entry + vig), e.g. `0.30` |
+
+**Entry / exit modes:**
 
 | Mode | Buy YES | Sell YES |
 |------|---------|----------|
-| `passive` (default) | Limit at bid (GTC) | Limit at ask (GTC) |
+| `passive` | Limit at bid (GTC) | Limit at ask (GTC) |
 | `cross_spread` | Limit at ask (IOC) | Limit at bid (IOC) |
 | `market` | IOC market | IOC market |
-| `limit_at_mid` / `limit_offset` | Mid or bid+offset | Mid or ask−offset |
+| `limit_at_mid` / `limit_offset` | Mid or bid±offset | Mid or ask∓offset |
 
-Stop-loss exits use `cross_spread` when exit mode is `passive`, so stops actually cross the book.
+Stop-loss exits use `cross_spread` when exit mode is `passive`, so stops cross the book.
 
-**Post-fill** (`--hp-post-fill` / `KALSHI_HP_POST_FILL`):
+**Post-fill** (`--hp-post-fill`):
 
 | Mode | Behaviour |
 |------|-----------|
 | `hold` | Hold to settlement |
-| `resting_take_profit` | Resting sell YES at entry + offset, or entry + pct×(entry+vig) when `KALSHI_HP_TAKE_PROFIT_PCT` / `--hp-take-profit-pct` is set |
+| `resting_take_profit` | Resting sell YES at entry + offset or pct×(entry+vig) |
 | `resting_stop` | IOC sell if bid breaches stop |
 | `tp_and_stop` | Resting TP plus stop on breach |
 
----
-
-## Market discovery
-
-Automatically select tickers at startup instead of hard-coding `KALSHI_TICKERS`.
-
-### Strategy presets
-
-When you use `--discover` (or `KALSHI_DISCOVER=true`), the bot applies a **discovery preset** matching `--strategy` unless you override filters on the CLI:
-
-| Preset | Used for | Default filters |
-|--------|----------|-----------------|
-| `high_prob` | `high_prob` | YES ask 85–97¢, spread ≤8¢, min vol 200, rank by **fee-adjusted ROI** |
-| `green_up` | `green_up` | YES ask ≤35¢, min vol 500, updated ≤2h, closing ≤6h, rank by **screener score** |
-| `kelly` | `kelly` | Spread ≤10¢, min vol 100 |
-| `arb` | `arb` | Top 25 by volume, full scan |
-
-**Screener volume floor:** every strategy scorer rejects markets below **200** contracts 24h volume (`SCREENER_MIN_VOLUME_24H` in `discovery/screener.py`). Discovery presets may set a higher `KALSHI_DISCOVER_MIN_VOLUME`.
-
-Force a preset: `--discover-preset high_prob`  
-Disable presets: `--discover-preset none`
-
-### Examples
+**Examples:**
 
 ```bash
-# Preview tickers only (prints KALSHI_TICKERS=... line)
+# Preview Politics high-ROI candidates
 python main.py --discover --discover-category Politics --strategy high_prob --discover-only
 
-# Discover and trade with high-prob defaults
-python main.py --discover --discover-category Sports --strategy high_prob
+# Trade Sports with resting take-profit
+python main.py --discover --discover-category Sports --strategy high_prob \
+  --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit \
+  --hp-take-profit-pct 0.25 --max-concurrent-positions 2 --monitor-interval 30
 
-# Override preset floor but keep ranking
-python main.py --discover --discover-category Politics --strategy high_prob \
-  --discover-min-yes-ask 88 --discover-rank-by fee_adjusted_roi
-
-# Green-up: top 5 Sports markets, screener-ranked, trade all in parallel
-python main.py --discover --discover-category Sports --strategy green_up \
-  --discover-top 5 --max-concurrent-positions 5 \
-  --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
-  --gu-entry-mode passive --monitor-interval 5
+# Kelly strategy with discovery (still need model probs)
+python main.py --discover --discover-category Sports --strategy kelly \
+  --max-concurrent-positions 2 --monitor-interval 30 \
+  --model-prob SOME-TICKER:0.72
 ```
 
-### Discovery environment variables
+Production script: `scripts/run_high_prob_prod.ps1` (fixed $1 stake, isolated prod DB/log).
 
-| Variable | Description |
-|----------|-------------|
-| `KALSHI_DISCOVER` | `true` to enable discovery via env |
-| `KALSHI_DISCOVER_CATEGORY` | e.g. `Politics`, `Sports` |
-| `KALSHI_DISCOVER_TOP` | Max tickers (default 10) |
-| `KALSHI_DISCOVER_MIN_YES_ASK` | Minimum YES ask (cents) |
-| `KALSHI_DISCOVER_MAX_YES_ASK` | Maximum YES ask (cents) |
-| `KALSHI_DISCOVER_MAX_SPREAD` | Max spread (cents) |
-| `KALSHI_DISCOVER_MIN_VOLUME` | Min 24h volume |
-| `KALSHI_DISCOVER_ACTIVITY_HOURS` | Only recently updated markets |
-| `KALSHI_DISCOVER_RANK_BY` | `volume`, `fee_adjusted_roi`, or `screener` |
-| `KALSHI_DISCOVER_MAX_MINUTES_TO_CLOSE` | Only markets closing within N minutes (preset / live filter) |
-| `KALSHI_MAX_CONCURRENT_POSITIONS` | Cap open/pending positions (`0` = unlimited) |
+---
 
-**CLI discovery flags:** `--discover-top`, `--discover-min-volume`, `--discover-min-yes-ask`, `--discover-max-yes-ask`, `--discover-max-spread`, `--discover-activity-hours`, `--discover-max-minutes-to-close`, `--discover-rank-by`, `--discover-min-fee-roi`, `--discover-full-scan`, `--discover-only`, `--discover-preset`, `--no-live-only`.
+### Arbitrage (`--strategy arb`)
 
-### Live markets only (default on)
-
-By default the bot only **discovers** and **enters** markets that are:
-
-- Updated on Kalshi within the last **2 hours** (`KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE`)
-- Closing within the next **6 hours** (`KALSHI_LIVE_MAX_MINUTES_TO_CLOSE`) — in-play / soon window for Sports
-- Showing a **fresh WebSocket** book (≤30 min) and a **recent trade** on the tape (≤2 h) before each entry
-
-Disable with `--no-live-only` or `KALSHI_LIVE_ONLY=false`.
-
-| Variable | Default | Role |
-|----------|---------|------|
-| `KALSHI_LIVE_ONLY` | `true` | Master switch for live gates |
-| `KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE` | `120` | Discovery: market updated within N minutes |
-| `KALSHI_LIVE_MAX_MINUTES_TO_CLOSE` | `360` | Discovery + entry: closes within N minutes |
-| `KALSHI_LIVE_MAX_BOOK_STALE_MINUTES` | `30` | Entry: WebSocket book must be fresh |
-| `KALSHI_LIVE_MAX_TRADE_STALE_MINUTES` | `120` | Entry: recent trade on the tape |
+Scans for **complementary pairs**, exhaustive sets, and dominance relationships. Register pairs with `--comp-pairs TICKER_A:TICKER_B` or `KALSHI_ARB_PAIRS`.
 
 ```bash
-# Stricter: only markets updated in the last 30 minutes, closing within 3 hours
-python main.py --discover --discover-category Sports --strategy green_up \
-  --discover-activity-hours 0.5 --discover-max-minutes-to-close 180 ...
+python main.py --discover --discover-category Sports --strategy arb \
+  --discover-full-scan --comp-pairs MARKET-A:MARKET-B
+```
+
+Discovery preset pulls **top 25 by volume** with `--discover-full-scan` for broader coverage. Arb is the most category-scan intensive mode — watch rate limits (`429` backoff is automatic).
+
+---
+
+### Order pricing reference (green_up + high_prob)
+
+Shared modes from `strategy/execution_price.py`:
+
+| Mode | Typical use |
+|------|-------------|
+| `passive` | Maker-style limits at bid (buy) / ask (sell) |
+| `cross_spread` | Taker-style IOC limits at ask (buy) / bid (sell) |
+| `market` | IOC market orders |
+| `limit_offset` | Bid + N cents (e.g. prod script uses `-2` for bid−2¢) |
+
+---
+
+### Production run scripts (PowerShell)
+
+For **real-money micro-pilots**, use the bundled scripts so each strategy writes to its **own** DB and JSONL log (easy A/B comparison):
+
+| Script | Strategy | Notes |
+|--------|----------|-------|
+| `scripts/run_green_up_prod.ps1` | `green_up` | Tunables at top of file; prompts for prod confirmation |
+| `scripts/run_high_prob_prod.ps1` | `high_prob` | Fixed stake, Sports discovery defaults |
+| `scripts/compare_prod_sessions.ps1` | — | Compare P&L across isolated session logs |
+
+```powershell
+.\scripts\run_high_prob_prod.ps1 -DiscoverOnly
+.\scripts\run_green_up_prod.ps1 -DiscoverOnly
+.\scripts\compare_prod_sessions.ps1
+```
+
+Requires `KALSHI_ENV=production` and prod keys in `.env`. Edit stake/discovery tunables inside each script before going live.
+
+---
+
+### Inspect a market before trading
+
+```bash
+python tools/orderbook.py --ticker SOME-TICKER
+python tools/orderbook.py --ticker SOME-TICKER --depth 20 --json
+python tools/screen.py browse --ticker SOME-TICKER
 ```
 
 ---
@@ -273,6 +429,8 @@ Green-up **hedges** are separate **NO** legs. To flatten fully you may need to c
 
 ## Quick start (paper trading)
 
+See [Discovering and trading by strategy](#discovering-and-trading-by-strategy) for the full workflow. Minimal path:
+
 ### 1. Screen markets
 
 ```bash
@@ -284,18 +442,25 @@ python tools/screen.py browse --ticker SOME-TICKER
 
 The screener scores each market for Kelly, Green Up, **high_prob**, and arbitrage fit.
 
-### 2. Run the bot (demo)
+### 2. Preview discovery, then run (demo)
 
 ```bash
-# Manual tickers
-export KALSHI_TICKERS="TICKER-A,TICKER-B"
-python main.py --strategy kelly --model-prob TICKER-A:0.62
+# Preview tickers for your strategy (no orders)
+python main.py --discover --discover-category Sports --strategy green_up --discover-only
 
-# Auto-discovery + high-probability strategy
-python main.py --discover --discover-category Politics --strategy high_prob --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
+# Trade — same flags without --discover-only
+python main.py --discover --discover-category Sports --strategy green_up \
+  --discover-top 5 --max-concurrent-positions 5 --monitor-interval 30
+
+# High-probability example
+python main.py --discover --discover-category Politics --strategy high_prob \
+  --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
+
+# Kelly — requires model probabilities
+python main.py --strategy kelly --tickers TICKER-A --model-prob TICKER-A:0.62
 ```
 
-Defaults to **demo** (`KALSHI_ENV=demo`). Real money only when `KALSHI_ENV=production`.
+Defaults to **demo** (`KALSHI_ENV=demo`). Real money only when `KALSHI_ENV=production` (prefer `scripts/run_*_prod.ps1` for isolated logs).
 
 ### 3. Manual orders and portfolio
 
@@ -320,7 +485,7 @@ python main.py --strategy green_up --tickers TICKER-A --entry-max 10 --hedge-tri
 python main.py --strategy high_prob --tickers TICKER-A --monitor-interval 15
 ```
 
-The monitor can fall back to REST order books when the WebSocket book is empty; the strategy evaluates entries on **WebSocket ticks** (Kalshi `orderbook_delta` channel, including FP dollar snapshots/deltas). With live filters enabled, stale books block new entries even if REST shows prices.
+The monitor falls back to REST order books when the WebSocket book is **empty or stale** (default: no WS update for 60s, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`). A background poll also REST-refreshes stale books and re-runs `strategy.evaluate()` so hedge/stop logic is not blocked by a frozen WS feed. With live filters enabled, stale WS books still block **new entries** even if REST shows fresher prices.
 
 **Fill rate in the monitor** counts signals where the bot’s fill listener saw an exchange fill—not every resting limit or IOC that was sent. Use `tools/trade.py orders` / `portfolio` to reconcile exchange state.
 
@@ -533,22 +698,26 @@ Common issues when running the bot or `tools/trade.py`. Check structured logs in
 
 ```
 kalshi_bot/
-├── config.py                     Tunable parameters (fees, Kelly, HP, risk)
+├── config.py                     Tunable parameters (demo/prod profiles, fees, risk)
 ├── main.py                       Bot entry point + discovery CLI
+├── docs/ROADMAP.md               Certification / rollout plan
+├── scripts/                      Production PowerShell runners + session compare
 ├── strategy/
 │   ├── base_strategy.py          Signal interface
 │   ├── factory.py                build_strategy() by name
 │   ├── execution_price.py        Passive / cross_spread / market pricing
+│   ├── position_limits.py        Concurrent open-position counting
 │   ├── kelly_strategy.py         Fractional Kelly + edge-to-vig
-│   ├── green_up_strategy.py      Back high / lay low hedging
+│   ├── green_up_strategy.py      Back underdog YES / hedge NO
 │   ├── high_prob_strategy.py     High P(YES), fee-aware ROI, exit modes
 │   └── arbitrage_strategy.py     Multi-leg arb
 ├── discovery/
-│   ├── market_client.py          REST: markets, books, categories
+│   ├── market_client.py          REST: markets, books, categories, price history
 │   ├── screener.py               Score markets per strategy
 │   ├── ticker_selector.py        Filter, rank, select tickers
 │   ├── discovery_presets.py      Strategy-aligned discovery defaults
 │   ├── live_market.py            Live-only discovery + entry gates
+│   ├── market_registry.py        Cached market metadata for live checks
 │   ├── orderbook_parse.py        Book parse + market buy/sell price helpers
 │   └── market_math.py            Gross / fee-adjusted ROI helpers
 ├── execution/
@@ -557,13 +726,14 @@ kalshi_bot/
 ├── ingestion/
 │   └── market_ingestor.py        WebSocket order books (FP snapshots/deltas) + fills
 ├── risk/
-│   ├── circuit_breaker.py        Kill switch, limits
+│   ├── circuit_breaker.py        Kill switch, portfolio sync, limits
+│   ├── entry_gates.py            Balance + expiry pre-trade blocks
 │   ├── alert_manager.py          P&L / expiry / fill-timeout alerts
 │   └── kelly_calibrator.py       Brier score, divisor recommendations
 ├── metrics/                      Blotter, settlement, performance, Sharpe
-├── trading/                      Manual order entry, portfolio monitor
+├── trading/                      Order entry, portfolio monitor, auth_check
 ├── monitoring/                   Live session terminal table
-└── tools/                        screen, trade, replay, blotter, dashboard
+└── tools/                        screen, trade, orderbook, replay, blotter, dashboard
 ```
 
 ---
@@ -591,6 +761,12 @@ kalshi_bot/
 | `KALSHI_LIVE_MAX_MINUTES_TO_CLOSE` | 360 | Max time until market close |
 | `KALSHI_LIVE_MAX_BOOK_STALE_MINUTES` | 30 | Max WebSocket book age at entry |
 | `KALSHI_LIVE_MAX_TRADE_STALE_MINUTES` | 120 | Max tape age at entry |
+| `KALSHI_MIN_BALANCE_CENTS` | 5000 | Entry gate: minimum cash |
+| `KALSHI_MIN_MINUTES_TO_EXPIRY` | 10 | Entry gate: minutes before close |
+| `KALSHI_BLOCK_LOW_BALANCE` | true | Enforce balance gate |
+| `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS` | 30 | Circuit breaker portfolio refresh |
+| `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS` | 60 | REST refresh when WS book is older than this (0 = off) |
+| `KALSHI_WS_BOOK_REST_FALLBACK_POLL_SECONDS` | 15 | How often to check for stale WS books |
 
 ### Green-up environment variables
 
@@ -599,7 +775,7 @@ KALSHI_STRATEGY=green_up
 KALSHI_GREEN_UP_ENTRY_MAX=25
 KALSHI_GREEN_UP_HEDGE_TRIGGER=68
 KALSHI_GREEN_UP_HEDGE_MODE=full_green
-KALSHI_GREEN_UP_STOP_LOSS=0.40
+KALSHI_GREEN_UP_STOP_LOSS=10
 KALSHI_GREEN_UP_ENTRY_MODE=passive
 KALSHI_GREEN_UP_EXIT_MODE=passive
 KALSHI_MAX_CONCURRENT_POSITIONS=5

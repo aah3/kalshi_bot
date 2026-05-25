@@ -62,6 +62,7 @@ from discovery.ticker_selector import (
 from strategy.base_strategy import BaseStrategy
 from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_probs, build_strategy
 from monitoring.session_table import SessionMonitor
+from ingestion.rest_book_fallback import make_market_client_from_session, run_rest_book_fallback_loop
 from trading.auth_check import verify_portfolio_credentials
 from trading.portfolio_monitor import PortfolioMonitor
 
@@ -492,7 +493,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         dest="stop_loss",
-        help="Green-up: stop if YES bid falls this fraction below entry (default 0.40)",
+        help=(
+            "Green-up: stop when YES bid falls this many cents below entry "
+            "(max loss per contract ≈ N cents; default 10)"
+        ),
     )
     parser.add_argument(
         "--max-concurrent-positions",
@@ -1103,6 +1107,19 @@ async def main(args: argparse.Namespace | None = None) -> None:
         _portfolio_risk_sync_loop(config.PORTFOLIO_RISK_SYNC_SECONDS),
         name="portfolio_risk_sync",
     )
+    book_fallback_task = None
+    rest_book_client = make_market_client_from_session(
+        _portfolio_monitor, credentials, rate_limiter
+    )
+    if rest_book_client and config.WS_BOOK_REST_FALLBACK_SECONDS > 0:
+        book_fallback_task = asyncio.create_task(
+            run_rest_book_fallback_loop(
+                ingestor=_ingestor,
+                market_client=rest_book_client,
+                shutdown_event=_shutdown_event,
+            ),
+            name="rest_book_fallback",
+        )
     ingestor_task = asyncio.create_task(
         _ingestor.run(), name="market_ingestor"
     )
@@ -1139,6 +1156,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
         fee_per_contract_cents=config.FEE_PER_CONTRACT_CENTS,
         alert_interval_seconds=ALERT_INTERVAL_SECONDS,
         monitor_interval_seconds=monitor_interval,
+        ws_book_rest_fallback_seconds=config.WS_BOOK_REST_FALLBACK_SECONDS,
+        ws_book_rest_fallback_poll_seconds=config.WS_BOOK_REST_FALLBACK_POLL_SECONDS,
         max_concurrent_positions=_max_concurrent_positions,
         live_trading_only=_live_rules.enabled if _live_rules else False,
         live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
@@ -1152,7 +1171,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
                 entry_max_cents=_strategy._entry_max_price,
                 hedge_trigger_cents=_strategy._hedge_trigger_price,
                 hedge_mode=_strategy._hedge_mode.value,
-                stop_loss_threshold=_strategy._stop_loss_threshold,
+                stop_loss_cents=_strategy._stop_loss_cents,
                 entry_price_mode=_strategy._entry_price_mode.value,
                 exit_price_mode=_strategy._exit_price_mode.value,
                 max_cycles_per_ticker=_strategy._max_cycles_per_ticker,
@@ -1201,9 +1220,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
         except asyncio.CancelledError:
             pass
 
-    # Stop alert manager and portfolio risk sync
+    # Stop alert manager, portfolio risk sync, and REST book fallback
     alert_task.cancel()
     risk_sync_task.cancel()
+    if book_fallback_task:
+        book_fallback_task.cancel()
     try:
         await alert_task
     except asyncio.CancelledError:
@@ -1212,6 +1233,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
         await risk_sync_task
     except asyncio.CancelledError:
         pass
+    if book_fallback_task:
+        try:
+            await book_fallback_task
+        except asyncio.CancelledError:
+            pass
 
     # Stop settlement watcher
     await _settlement_watcher.stop()

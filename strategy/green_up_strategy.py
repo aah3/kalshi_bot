@@ -78,7 +78,7 @@ USAGE
         entry_max_price=25,         # back YES only when price <= 25c (4.00 odds)
         hedge_trigger_price=68,     # green up when YES bid reaches 68c
         hedge_mode=HedgeMode.FULL_GREEN,
-        stop_loss_threshold=0.40,   # stop out if YES falls 40% below entry
+        stop_loss_cents=10,         # stop when YES bid falls 10c below entry (~10c loss/contract)
     )
 
     strat.add_watch_ticker("PRES-2024-DEM")
@@ -106,8 +106,48 @@ from strategy.execution_price import EntryPriceMode
 
 DEFAULT_ENTRY_MAX_PRICE: int          = 25    # cents; 25c = 4.00 decimal odds
 DEFAULT_HEDGE_TRIGGER_PRICE: int      = 68    # cents; YES bid must reach this to hedge
-DEFAULT_STOP_LOSS_THRESHOLD: float    = 0.40  # exit if price falls 40% below entry
+DEFAULT_STOP_LOSS_CENTS: int           = 10    # max loss per contract before stop (cents)
 DEFAULT_PARTIAL_HEDGE_FRACTION: float = 0.50  # PARTIAL mode: hedge 50% of full-green size
+
+
+def stop_loss_trigger_price(entry_price_cents: int, stop_loss_cents: int) -> int:
+    """
+    YES bid at or below this level triggers a stop.
+
+    Loss per contract ≈ entry_price - trigger (capped at entry - 1).
+    """
+    if entry_price_cents <= 0:
+        return 0
+    return max(1, entry_price_cents - stop_loss_cents)
+
+
+def parse_stop_loss_cents(
+    value: float | int | str | None,
+    *,
+    default: int = DEFAULT_STOP_LOSS_CENTS,
+) -> int:
+    """
+    Parse --stop-loss / KALSHI_GREEN_UP_STOP_LOSS as cents per contract.
+
+    Values in (0, 1) are treated as legacy fractions (e.g. 0.40 → 10c at a
+    25c reference entry) and emit a deprecation warning.
+    """
+    if value is None:
+        return default
+    v = float(value)
+    if 0 < v < 1:
+        cents = max(1, min(98, int(round(v * 25))))
+        logger.warning(
+            "GreenUp: stop-loss fraction is deprecated; use cents per contract "
+            "(e.g. --stop-loss 10 instead of 0.40)",
+            legacy_fraction=v,
+            interpreted_cents=cents,
+        )
+        return cents
+    cents = int(round(v))
+    if cents < 1:
+        raise ValueError(f"stop-loss must be at least 1 cent, got {value!r}")
+    return min(98, cents)
 
 
 # ── Supporting enums ─────────────────────────────────────────────────────────
@@ -289,7 +329,7 @@ class GreenUpStrategy(BaseStrategy):
         entry_max_price:        int       = DEFAULT_ENTRY_MAX_PRICE,
         hedge_trigger_price:    int       = DEFAULT_HEDGE_TRIGGER_PRICE,
         hedge_mode:             HedgeMode = HedgeMode.FULL_GREEN,
-        stop_loss_threshold:    float     = DEFAULT_STOP_LOSS_THRESHOLD,
+        stop_loss_cents:        int       = DEFAULT_STOP_LOSS_CENTS,
         partial_hedge_fraction: float     = DEFAULT_PARTIAL_HEDGE_FRACTION,
         entry_price_mode:       EntryPriceMode = EntryPriceMode.PASSIVE,
         exit_price_mode:        EntryPriceMode = EntryPriceMode.PASSIVE,
@@ -306,8 +346,9 @@ class GreenUpStrategy(BaseStrategy):
                                       FULL_GREEN  equal profit both outcomes [1]
                                       STAKE_BACK  free-bet, keep YES upside  [2]
                                       PARTIAL     fraction of formula-1
-            stop_loss_threshold:    Stop out if YES falls this fraction below entry.
-                                    0.40 = stop if price drops 40% from entry.
+            stop_loss_cents:        Stop when YES bid falls this many cents below
+                                    entry (max loss per contract ≈ this value).
+                                    10 = stop if bid drops 10c below entry price.
             partial_hedge_fraction: For PARTIAL mode only — fraction of full-green
                                     stake to place (0.0 to 1.0).
             entry_price_mode:       How to price entry (buy YES): market, limit_at_ask,
@@ -319,7 +360,7 @@ class GreenUpStrategy(BaseStrategy):
         self._entry_max_price        = entry_max_price
         self._hedge_trigger_price    = hedge_trigger_price
         self._hedge_mode             = hedge_mode
-        self._stop_loss_threshold    = stop_loss_threshold
+        self._stop_loss_cents        = stop_loss_cents
         self._partial_hedge_fraction = partial_hedge_fraction
         self._entry_price_mode       = entry_price_mode
         self._exit_price_mode        = exit_price_mode
@@ -397,7 +438,9 @@ class GreenUpStrategy(BaseStrategy):
             pos.entry_price_cents        = price
             pos.entry_stake_cents        = size_c
             pos.entry_order_id           = order_id
-            pos.stop_loss_trigger_price  = int(price * (1.0 - self._stop_loss_threshold))
+            pos.stop_loss_trigger_price  = stop_loss_trigger_price(
+                price, self._stop_loss_cents
+            )
             pos.entered_at               = time.monotonic()
             pos.state                    = PositionState.ENTERED
 
@@ -409,6 +452,7 @@ class GreenUpStrategy(BaseStrategy):
                 entry_stake_cents=size_c,
                 potential_return_cents=pos.potential_return_cents,
                 potential_return_usd=round(pos.potential_return_cents / 100, 2),
+                stop_loss_cents=self._stop_loss_cents,
                 stop_loss_trigger_price=pos.stop_loss_trigger_price,
                 strategy=self.name,
             )
@@ -638,7 +682,7 @@ class GreenUpStrategy(BaseStrategy):
                 "entry_price_cents":            limit_price,
                 "entry_decimal_odds":           round(100.0 / limit_price, 3),
                 "hedge_trigger_price":          self._hedge_trigger_price,
-                "stop_loss_threshold":          self._stop_loss_threshold,
+                "stop_loss_cents":              self._stop_loss_cents,
                 "kelly_full":                   round(kelly_full, 4),
                 "kelly_divisor":                config.KELLY_DIVISOR,
                 # Preview of what the hedge will look like
@@ -800,7 +844,7 @@ class GreenUpStrategy(BaseStrategy):
         """
         Trigger a defensive NO hedge if YES bid falls to the stop level.
 
-        Stop level = entry_price x (1 - stop_loss_threshold)
+        Stop level = entry_price - stop_loss_cents (YES bid at or below fires stop).
 
         Uses formula 2 (stake-back) for the stop — we're trying to recover
         as much of the initial stake as current prices allow. This is a
@@ -843,6 +887,7 @@ class GreenUpStrategy(BaseStrategy):
             "GreenUp: stop-loss triggered",
             ticker=pos.ticker,
             entry_price_cents=pos.entry_price_cents,
+            stop_loss_cents=self._stop_loss_cents,
             stop_trigger_price=pos.stop_loss_trigger_price,
             current_bid=best_bid,
             no_price_cents=no_price,
@@ -871,13 +916,13 @@ class GreenUpStrategy(BaseStrategy):
                 ),
                 "entry_price_cents":    pos.entry_price_cents,
                 "entry_stake_cents":    pos.entry_stake_cents,
+                "stop_loss_cents":      self._stop_loss_cents,
                 "stop_trigger_price":   pos.stop_loss_trigger_price,
                 "current_bid":          best_bid,
                 "no_price_cents":       no_price,
                 "stop_hedge_cents":     stop_hedge_cents,
                 "est_net_loss_cents":   net_loss_cents,
                 "est_net_loss_usd":     round(net_loss_cents / 100, 2),
-                "stop_loss_threshold":  self._stop_loss_threshold,
                 "time_in_trade_s":      round(pos.time_in_trade_s, 1),
             },
         )
