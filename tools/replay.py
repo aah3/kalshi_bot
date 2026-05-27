@@ -210,25 +210,24 @@ class ReplayEngine:
             return strat
 
         elif name == "green_up":
-            from strategy.green_up_strategy import GreenUpStrategy, HedgeMode, parse_stop_loss_cents
-            mode_map = {
-                "full_green": HedgeMode.FULL_GREEN,
-                "stake_back": HedgeMode.STAKE_BACK,
-                "partial":    HedgeMode.PARTIAL,
-            }
-            mode = mode_map.get(self._strat_kwargs.get("hedge_mode", "full_green"), HedgeMode.FULL_GREEN)
-            strat = GreenUpStrategy(
-                entry_max_price=self._strat_kwargs.get("entry_max", 25),
-                hedge_trigger_price=self._strat_kwargs.get("hedge_trigger", 68),
-                hedge_mode=mode,
-                stop_loss_cents=parse_stop_loss_cents(
-                    self._strat_kwargs.get("stop_loss", 10)
-                ),
+            from strategy.factory import build_strategy
+
+            return build_strategy(
+                "green_up",
+                self._strat_kwargs.get("tickers", []),
+                entry_max=self._strat_kwargs.get("entry_max"),
+                hedge_trigger=self._strat_kwargs.get("hedge_trigger"),
+                hedge_offset=self._strat_kwargs.get("hedge_offset"),
+                hedge_mode=self._strat_kwargs.get("hedge_mode"),
+                stop_loss=self._strat_kwargs.get("stop_loss"),
+                gu_entry_mode=self._strat_kwargs.get("gu_entry_mode"),
+                gu_exit_mode=self._strat_kwargs.get("gu_exit_mode"),
+                gu_limit_offset=self._strat_kwargs.get("gu_limit_offset"),
+                gu_max_spread=self._strat_kwargs.get("gu_max_spread"),
+                gu_no_entry_max=self._strat_kwargs.get("gu_no_entry_max", False),
+                gu_hedge_style=self._strat_kwargs.get("gu_hedge_style"),
+                gu_max_cycles=self._strat_kwargs.get("gu_max_cycles"),
             )
-            # Register tickers for watching
-            for ticker in self._strat_kwargs.get("tickers", []):
-                strat.add_watch_ticker(ticker)
-            return strat
 
         elif name == "arb":
             from strategy.arbitrage_strategy import ArbitrageStrategy
@@ -626,13 +625,21 @@ async def _run_replay(args) -> None:
         speed=args.speed,
         strategy_name=args.strategy,
         strategy_kwargs={
-            "model_probs":   model_probs,
-            "entry_max":     getattr(args, "entry_max", 25),
-            "hedge_trigger": getattr(args, "hedge_trigger", 68),
-            "hedge_mode":    getattr(args, "hedge_mode", "full_green"),
-            "stop_loss":     getattr(args, "stop_loss", 10),
-            "tickers":       tickers,
-            "comp_pairs":    getattr(args, "comp_pairs", []) or [],
+            "model_probs":     model_probs,
+            "entry_max":       getattr(args, "entry_max", None),
+            "hedge_trigger":   getattr(args, "hedge_trigger", None),
+            "hedge_offset":    getattr(args, "hedge_offset", None),
+            "hedge_mode":      getattr(args, "hedge_mode", "full_green"),
+            "stop_loss":       getattr(args, "stop_loss", None),
+            "gu_entry_mode":   getattr(args, "gu_entry_mode", None),
+            "gu_exit_mode":    getattr(args, "gu_exit_mode", None),
+            "gu_limit_offset": getattr(args, "gu_limit_offset", None),
+            "gu_max_spread":   getattr(args, "gu_max_spread", None),
+            "gu_no_entry_max": getattr(args, "gu_no_entry_max", False),
+            "gu_hedge_style":  getattr(args, "gu_hedge_style", None),
+            "gu_max_cycles":   getattr(args, "gu_max_cycles", None),
+            "tickers":         tickers,
+            "comp_pairs":      getattr(args, "comp_pairs", []) or [],
         },
     )
     summary = await engine.run()
@@ -684,16 +691,63 @@ p_rep.add_argument("--model-prob", nargs="*", metavar="TICKER:PROB",
                    help="Model probabilities for Kelly e.g. PRES-2024-DEM:0.62")
 p_rep.add_argument(
     "--entry-max", "--entry_max", "--entry-max-price", "--entry_max_price",
-    type=int, default=25, dest="entry_max",
+    type=int, default=None, dest="entry_max",
+    help="Green-up: max YES ask to enter (cents; default 25 via factory)",
+)
+p_rep.add_argument(
+    "--gu-no-entry-max",
+    action="store_true",
+    help="Green-up: disable entry max cap",
 )
 p_rep.add_argument(
     "--hedge-trigger", "--hedge_trigger",
-    type=int, default=68, dest="hedge_trigger",
+    type=int, default=None, dest="hedge_trigger",
+    help="Green-up: absolute YES bid hedge trigger (cents; default 68)",
+)
+p_rep.add_argument(
+    "--hedge-offset", "--hedge_offset",
+    type=int, default=None, dest="hedge_offset",
+    help="Green-up: hedge when YES bid >= entry + N cents (relative mode)",
 )
 p_rep.add_argument("--hedge-mode",    default="full_green",
                    choices=["full_green","stake_back","partial"])
-p_rep.add_argument("--stop-loss",     type=float, default=10,
-                   help="Green-up stop: cents per contract below entry")
+p_rep.add_argument("--stop-loss",     type=float, default=None,
+                   help="Green-up stop: cents per contract below entry (default 10)")
+p_rep.add_argument(
+    "--gu-max-spread",
+    type=int, default=None, dest="gu_max_spread",
+    help="Green-up: skip entry when spread exceeds N cents (default 8)",
+)
+p_rep.add_argument(
+    "--gu-entry-mode",
+    default=None,
+    choices=[
+        "passive", "cross_spread", "market",
+        "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+    ],
+)
+p_rep.add_argument(
+    "--gu-exit-mode",
+    default=None,
+    choices=[
+        "passive", "cross_spread", "market",
+        "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+    ],
+)
+p_rep.add_argument(
+    "--gu-limit-offset",
+    type=int, default=None, dest="gu_limit_offset",
+)
+p_rep.add_argument(
+    "--gu-hedge-style",
+    default=None,
+    choices=["trigger", "resting"],
+    help="Green-up: trigger (default) or resting GTC hedge after entry fill",
+)
+p_rep.add_argument(
+    "--gu-max-cycles",
+    type=int, default=None, dest="gu_max_cycles",
+)
 p_rep.add_argument("--comp-pairs",    nargs="*",  metavar="T1:T2",
                    help="Complementary arb pairs e.g. PRES-DEM:PRES-REP")
 p_rep.add_argument("--json",          default=None, metavar="FILE.json")

@@ -36,6 +36,39 @@ def is_book_stale(book: Any | None, max_age_seconds: float) -> bool:
     return age > max_age_seconds
 
 
+def is_book_crossed(book: Any | None) -> bool:
+    """
+    True when best bid >= best ask.
+
+    A crossed book cannot exist on the exchange — it means the WS delta stream
+    desynced (e.g. one side stopped updating while the other kept moving).
+    """
+    if book is None:
+        return False
+    bid = getattr(book, "best_bid", None)
+    ask = getattr(book, "best_ask", None)
+    if bid is None or ask is None:
+        return False
+    return bid >= ask
+
+
+def book_needs_rest_refresh(book: Any | None, max_age_seconds: float) -> bool:
+    """
+    True when the in-memory WS book should be replaced from REST.
+
+    Triggers on missing quotes, crossed spread, or age — not age alone.
+    """
+    if book is None:
+        return True
+    bid = getattr(book, "best_bid", None)
+    ask = getattr(book, "best_ask", None)
+    if bid is None or ask is None:
+        return True
+    if is_book_crossed(book):
+        return True
+    return is_book_stale(book, max_age_seconds)
+
+
 def rest_snapshot_age_seconds(snap: OrderBookSnapshot) -> float:
     """Age of a REST order book snapshot."""
     return max(0.0, (time.time() - snap.fetched_at.timestamp()))

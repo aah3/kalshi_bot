@@ -12,7 +12,14 @@ from typing import Any
 import config
 from strategy.arbitrage_strategy import ArbitrageStrategy
 from strategy.base_strategy import BaseStrategy
-from strategy.green_up_strategy import GreenUpStrategy, HedgeMode, parse_stop_loss_cents
+from strategy.green_up_strategy import (
+    GreenUpStrategy,
+    HedgeMode,
+    parse_hedge_style,
+    parse_stop_loss_cents,
+    resolve_entry_max_price,
+)
+from strategy.price_targets import parse_hedge_offset_cents
 from strategy.execution_price import EntryPriceMode
 from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
 from strategy.kelly_strategy import KellyStrategy
@@ -72,6 +79,7 @@ def build_strategy(
     model_probs: dict[str, float] | None = None,
     entry_max: int | None = None,
     hedge_trigger: int | None = None,
+    hedge_offset: int | None = None,
     hedge_mode: str | None = None,
     stop_loss: int | float | None = None,
     comp_pairs: list[tuple[str, str]] | None = None,
@@ -85,6 +93,9 @@ def build_strategy(
     gu_exit_mode: str | None = None,
     gu_limit_offset: int | None = None,
     gu_max_cycles: int | None = None,
+    gu_max_spread: int | None = None,
+    gu_no_entry_max: bool = False,
+    gu_hedge_style: str | None = None,
     hp_exit_mode: str | None = None,
 ) -> BaseStrategy:
     """
@@ -95,7 +106,8 @@ def build_strategy(
         tickers:        Markets to watch (green_up registers each via add_watch_ticker).
         model_probs:    Kelly only — ticker -> P(YES wins).
         entry_max:      Green-up max YES ask for entry (cents).
-        hedge_trigger:  Green-up YES bid to trigger hedge (cents).
+        hedge_trigger:  Green-up YES bid to trigger hedge (absolute mode, cents).
+        hedge_offset:   Green-up hedge when YES bid >= entry + N cents (relative mode).
         hedge_mode:     full_green | stake_back | partial.
         stop_loss:      Green-up stop in cents per contract (YES bid drop from entry).
         comp_pairs:     Arb only — complementary ticker pairs.
@@ -198,17 +210,38 @@ def build_strategy(
             if gu_max_cycles is not None
             else _env_int("KALSHI_GREEN_UP_MAX_CYCLES_PER_TICKER", 0)
         )
+        hedge_offset_raw = (
+            hedge_offset
+            if hedge_offset is not None
+            else os.getenv("KALSHI_GREEN_UP_HEDGE_OFFSET")
+        )
+        resolved_entry_max = resolve_entry_max_price(
+            entry_max,
+            no_entry_max=gu_no_entry_max,
+            env_value=os.getenv("KALSHI_GREEN_UP_ENTRY_MAX"),
+        )
+        hedge_style_key = (
+            gu_hedge_style or os.getenv("KALSHI_GREEN_UP_HEDGE_STYLE", "trigger")
+        ).lower()
         strat = GreenUpStrategy(
-            entry_max_price=entry_max if entry_max is not None else int(
-                os.getenv("KALSHI_GREEN_UP_ENTRY_MAX", "25")
-            ),
+            entry_max_price=resolved_entry_max,
             hedge_trigger_price=hedge_trigger if hedge_trigger is not None else int(
                 os.getenv("KALSHI_GREEN_UP_HEDGE_TRIGGER", "68")
             ),
+            hedge_offset_cents=parse_hedge_offset_cents(hedge_offset_raw),
             hedge_mode=mode_map.get(mode_key, HedgeMode.FULL_GREEN),
             stop_loss_cents=parse_stop_loss_cents(
                 stop_loss if stop_loss is not None else os.getenv("KALSHI_GREEN_UP_STOP_LOSS")
             ),
+            max_spread_cents=(
+                gu_max_spread
+                if gu_max_spread is not None
+                else _env_int(
+                    "KALSHI_GREEN_UP_MAX_SPREAD",
+                    config.GREEN_UP_MAX_SPREAD_CENTS,
+                )
+            ),
+            hedge_style=parse_hedge_style(hedge_style_key),
             entry_price_mode=price_mode_map.get(entry_key, EntryPriceMode.PASSIVE),
             exit_price_mode=price_mode_map.get(exit_key, EntryPriceMode.PASSIVE),
             limit_offset_cents=limit_off,

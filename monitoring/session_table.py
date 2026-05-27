@@ -14,7 +14,7 @@ from typing import Any
 
 import config
 from discovery.orderbook_parse import OrderBookSnapshot
-from ingestion.book_freshness import is_book_stale
+from ingestion.book_freshness import book_needs_rest_refresh, is_book_crossed
 from ingestion.market_ingestor import MarketIngestor
 from logging_.structured_logger import logger
 from metrics.blotter import Blotter
@@ -35,18 +35,39 @@ def _pnl_str(usd: float) -> str:
     return f"${usd:.2f}"
 
 
-def _action_hint(state: str, bid: int | None, hedge_at: int, stop_at: int, entry_max: int) -> str:
+def _action_hint(
+    state: str,
+    bid: int | None,
+    hedge_at: int,
+    stop_at: int,
+    entry_max: int | None,
+    *,
+    hedge_offset: int | None = None,
+    hedge_style: str | None = None,
+) -> str:
     if state in ("scanning", "watching"):
-        if bid is not None and bid >= hedge_at:
+        if bid is not None and hedge_at and bid >= hedge_at:
             return "hedge trigger met"
-        return f"watch entry (<={entry_max}c ask)"
+        if hedge_offset is not None:
+            if entry_max is not None:
+                return f"watch entry (<={entry_max}c ask, hedge +{hedge_offset}c)"
+            return f"watch entry (hedge +{hedge_offset}c from fill)"
+        if entry_max is not None:
+            return f"watch entry (<={entry_max}c ask)"
+        return "watch entry (no cap)"
     if state == "entered":
-        if bid is not None and bid >= hedge_at:
+        if bid is not None and hedge_at and bid >= hedge_at:
             return "HEDGE NOW"
         if bid is not None and stop_at and bid <= stop_at:
             return "STOP zone"
+        if hedge_offset is not None:
+            return f"hold -> hedge @{hedge_at}c (+{hedge_offset}c)"
         return f"hold -> hedge @{hedge_at}c"
-    if state in ("hedging", "stopping"):
+    if state == "hedging":
+        if hedge_style == "resting":
+            return "resting hedge on book"
+        return "awaiting fill"
+    if state == "stopping":
         return "awaiting fill"
     if state == "hedged":
         return "profit locked"
@@ -62,21 +83,22 @@ def _book_quotes(
     *,
     stale_seconds: float | None = None,
 ) -> tuple[int | None, int | None, float | None, int | None]:
-    """Best bid/ask/mid/spread from WS book, falling back to REST when missing or stale."""
+    """Best bid/ask/mid/spread from WS book, falling back to REST when missing, crossed, or stale."""
     bid = ask = mid = spread = None
     ws_age: float | None = None
+    ob = ingestor.get_book(ticker) if ingestor else None
 
-    if ingestor:
-        ob = ingestor.get_book(ticker)
-        if ob and ob.best_bid is not None:
-            bid, ask = ob.best_bid, ob.best_ask
-            mid, spread = ob.mid_price, ob.spread
-            if stale_seconds is not None and stale_seconds > 0:
-                ws_age = ingestor.book_age_seconds(ticker)
+    if ob and ob.best_bid is not None:
+        bid, ask = ob.best_bid, ob.best_ask
+        mid, spread = ob.mid_price, ob.spread
+        if stale_seconds is not None and stale_seconds > 0:
+            ws_age = ingestor.book_age_seconds(ticker) if ingestor else None
 
     use_rest = False
     if rest_books and ticker in rest_books:
         if bid is None:
+            use_rest = True
+        elif is_book_crossed(ob):
             use_rest = True
         elif (
             stale_seconds is not None
@@ -121,9 +143,13 @@ def build_ticker_rows(
 
         s = summaries.get(ticker, {})
         state = s.get("state", "—")
-        entry_max = green._entry_max_price if green else 0
-        hedge_at  = green._hedge_trigger_price if green else 68
-        stop_at   = s.get("stop_trigger_price") or 0
+        entry_max = green._entry_max_price if green else None
+        hedge_offset = green._hedge_offset_cents if green else None
+        hedge_style = green._hedge_style.value if green else None
+        hedge_at = s.get("hedge_trigger_price") or (
+            green._hedge_trigger_price if green else 68
+        )
+        stop_at = s.get("stop_trigger_price") or 0
 
         preview_locked: float | None = None
         preview_hedge: int | None = None
@@ -156,6 +182,8 @@ def build_ticker_rows(
             "action":      _action_hint(
                 state if state != "—" else "watching",
                 bid, hedge_at, stop_at, entry_max,
+                hedge_offset=hedge_offset,
+                hedge_style=hedge_style,
             ),
         })
 
@@ -365,7 +393,7 @@ class SessionMonitor:
             rest_books: dict[str, OrderBookSnapshot] = {}
             stale_seconds = config.WS_BOOK_REST_FALLBACK_SECONDS
             need_rest = stale_seconds > 0 and any(
-                is_book_stale(
+                book_needs_rest_refresh(
                     self._ingestor.get_book(t) if self._ingestor else None,
                     stale_seconds,
                 )
@@ -380,7 +408,7 @@ class SessionMonitor:
                     )
                     self._market_client._session = self._portfolio_monitor._session
                 for t in self._tickers:
-                    if not is_book_stale(
+                    if not book_needs_rest_refresh(
                         self._ingestor.get_book(t) if self._ingestor else None,
                         stale_seconds,
                     ):

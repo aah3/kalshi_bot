@@ -65,6 +65,30 @@ def resolve_yes_sell(
     return price, "limit", tif
 
 
+def resolve_yes_sell_exit(
+    mode: EntryPriceMode,
+    best_bid: int,
+    best_ask: int,
+    limit_offset: int = 0,
+) -> tuple[int, str, str]:
+    """
+    Exit a YES long (stop-loss / take-profit sell).
+
+    Uses cross-spread pricing (sell at bid) or passive (sell at ask) but always
+    rests as GTC so the order stays on book until filled. Market exits stay IOC.
+    """
+    if mode == EntryPriceMode.MARKET:
+        return best_bid, "market", "ioc"
+    if mode in (EntryPriceMode.CROSS_SPREAD, EntryPriceMode.LIMIT_AT_BID):
+        return best_bid, "limit", "gtc"
+    if mode in (EntryPriceMode.PASSIVE, EntryPriceMode.LIMIT_AT_ASK):
+        return best_ask, "limit", "gtc"
+    if mode == EntryPriceMode.LIMIT_AT_MID:
+        return (best_bid + best_ask) // 2, "limit", "gtc"
+    price = max(1, min(99, best_ask - limit_offset))
+    return price, "limit", "gtc"
+
+
 def resolve_no_buy(
     mode: EntryPriceMode,
     best_bid: int,

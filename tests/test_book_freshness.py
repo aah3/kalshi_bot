@@ -7,7 +7,12 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from discovery.orderbook_parse import OrderBookSnapshot
-from ingestion.book_freshness import book_age_seconds, is_book_stale
+from ingestion.book_freshness import (
+    book_age_seconds,
+    book_needs_rest_refresh,
+    is_book_crossed,
+    is_book_stale,
+)
 from ingestion.market_ingestor import OrderBook, MarketIngestor
 from monitoring.session_table import _book_quotes
 
@@ -22,6 +27,29 @@ def test_book_age_and_stale():
     assert 89 <= age <= 91
     assert is_book_stale(book, 60)
     assert not is_book_stale(book, 120)
+
+
+def test_is_book_crossed():
+    book = OrderBook(ticker="T")
+    assert not is_book_crossed(book)
+
+    book.yes_bids[46] = 10
+    book.yes_asks[28] = 10
+    assert is_book_crossed(book)
+
+    book.yes_asks.clear()
+    book.yes_asks[47] = 10
+    assert not is_book_crossed(book)
+
+
+def test_book_needs_rest_refresh_crossed_even_when_fresh():
+    book = OrderBook(ticker="T")
+    book.yes_bids[46] = 10
+    book.yes_asks[28] = 10
+    book.updated_at_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+
+    assert book_needs_rest_refresh(book, 60)
+    assert not is_book_stale(book, 60)
 
 
 def test_load_rest_snapshot():
@@ -110,3 +138,31 @@ def test_monitor_prefers_rest_when_ws_stale():
     bid2, ask2, _, _ = _book_quotes("T", ingestor, {"T": rest}, stale_seconds=300)
     assert bid2 == 25
     assert ask2 == 26
+
+
+def test_monitor_prefers_rest_when_ws_crossed():
+    ingestor = MarketIngestor(tickers=["T"], on_tick=lambda t: None)
+    book = ingestor.get_book("T")
+    assert book is not None
+    book.yes_bids[46] = 1
+    book.yes_asks[28] = 1
+    book.updated_at_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+
+    rest = OrderBookSnapshot(
+        ticker="T",
+        fetched_at=datetime.now(timezone.utc),
+        yes_bids=[(27, 1)],
+        yes_asks=[(28, 1)],
+        best_bid=27,
+        best_ask=28,
+        spread=1,
+        mid_price=27.5,
+    )
+
+    bid, ask, mid, spread = _book_quotes(
+        "T", ingestor, {"T": rest}, stale_seconds=300
+    )
+    assert bid == 27
+    assert ask == 28
+    assert mid == 27.5
+    assert spread == 1

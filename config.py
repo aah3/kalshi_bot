@@ -155,6 +155,9 @@ HP_ASSUME_ROUND_TRIP_FEES: bool = os.getenv(
     "KALSHI_HP_ASSUME_ROUND_TRIP_FEES", ""
 ).strip().lower() in ("1", "true", "yes", "on")
 HP_MAX_SPREAD_CENTS: int  = int(os.getenv("KALSHI_HP_MAX_SPREAD", "8"))
+GREEN_UP_MAX_SPREAD_CENTS: int = int(
+    os.getenv("KALSHI_GREEN_UP_MAX_SPREAD", os.getenv("KALSHI_HP_MAX_SPREAD", "8"))
+)
 _hp_stake_default = min(5_000, MAX_POSITION_CENTS)
 HP_STAKE_CENTS: int = min(
     int(os.getenv("KALSHI_HP_STAKE_CENTS", str(_hp_stake_default))),
@@ -212,7 +215,7 @@ DAILY_LOSS_LIMIT_CENTS: int = _resolve_env_int(
     "DAILY_LOSS_LIMIT_CENTS",
     "KALSHI_DAILY_LOSS_LIMIT_CENTS",
     demo_default=50_000,
-    prod_default=500,
+    prod_default=1_000,
 )
 
 LIVE_TRADING_ONLY: bool = os.getenv("KALSHI_LIVE_ONLY", "true").strip().lower() in (

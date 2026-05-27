@@ -28,7 +28,7 @@ from discovery.orderbook_parse import (
     _parse_fp_levels,
     _yes_asks_from_no_bids,
 )
-from ingestion.book_freshness import book_age_seconds
+from ingestion.book_freshness import book_age_seconds, is_book_crossed
 from logging_.structured_logger import logger
 
 
@@ -431,6 +431,15 @@ class MarketIngestor:
         self._on_fill(fill)
 
     def _emit_tick(self, book: OrderBook, event_type: str) -> None:
+        if is_book_crossed(book):
+            logger.warning(
+                "WS order book crossed — bid >= ask; REST fallback should resync",
+                ticker=book.ticker,
+                best_bid=book.best_bid,
+                best_ask=book.best_ask,
+                spread=book.spread,
+            )
+
         snap = book.snapshot()
         snap["event_type"] = event_type
 

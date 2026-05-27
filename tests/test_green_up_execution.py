@@ -35,14 +35,19 @@ sys.modules["logging_.structured_logger"] = log_mod
 from discovery.discovery_presets import apply_preset
 from discovery.market_client import MarketClient
 from discovery.ticker_selector import TickerCriteria, select_tickers
-from strategy.execution_price import resolve_no_buy, resolve_yes_buy, resolve_yes_sell
+from strategy.execution_price import (
+    EntryPriceMode,
+    resolve_no_buy,
+    resolve_yes_buy,
+    resolve_yes_sell,
+    resolve_yes_sell_exit,
+)
 from strategy.green_up_strategy import (
     GreenUpStrategy,
     PositionState,
     parse_stop_loss_cents,
     stop_loss_trigger_price,
 )
-from strategy.execution_price import EntryPriceMode
 
 
 def _tick(bid: int, ask: int, ticker: str = "TEST-TICKER") -> dict:
@@ -71,6 +76,14 @@ def test_resolve_yes_sell_passive_and_cross():
 
     price, order_type, tif = resolve_yes_sell(EntryPriceMode.CROSS_SPREAD, 68, 70, 0)
     assert price == 68 and order_type == "limit" and tif == "ioc"
+
+
+def test_resolve_yes_sell_exit_resting_at_bid():
+    price, order_type, tif = resolve_yes_sell_exit(EntryPriceMode.CROSS_SPREAD, 9, 10, 0)
+    assert price == 9 and order_type == "limit" and tif == "gtc"
+
+    price, order_type, tif = resolve_yes_sell_exit(EntryPriceMode.PASSIVE, 9, 10, 0)
+    assert price == 10 and order_type == "limit" and tif == "gtc"
 
 
 def test_resolve_no_buy_uses_complement():
@@ -223,14 +236,19 @@ def test_stop_loss_fires_when_bid_drops_enough():
     pos.state = PositionState.ENTERED
     pos.entry_price_cents = 26
     pos.entry_stake_cents = 26
+    pos.entry_contracts = 1
     pos.stop_loss_trigger_price = stop_loss_trigger_price(26, 12)
 
     assert strat.evaluate(_tick(15, 16, "T5")) is None
 
     sig = strat.evaluate(_tick(14, 15, "T5"))
     assert sig is not None
-    assert sig.side.value == "no"
+    assert sig.side.value == "yes"
     assert sig.meta.get("phase") == "stop_loss"
+    assert sig.meta.get("action") == "sell"
+    assert sig.meta.get("time_in_force") == "gtc"
+    assert sig.limit_price == 14
+    assert sig.size_cents == 14
     assert strat.get_position("T5").state == PositionState.STOPPING
 
 
@@ -251,7 +269,49 @@ def test_entry_fill_sets_stop_trigger_from_cents():
         "order_id": "oid-1",
     })
     assert pos.state == PositionState.ENTERED
+    assert pos.hedge_trigger_price == 68
     assert pos.stop_loss_trigger_price == 14
+
+
+def test_stop_loss_fill_on_yes_sell():
+    strat = GreenUpStrategy(stop_loss_cents=12)
+    strat.add_watch_ticker("T7")
+    pos = strat.get_position("T7")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 24
+    pos.entry_stake_cents = 24
+    pos.entry_contracts = 1
+
+    strat.on_fill({
+        "ticker": "T7",
+        "side": "yes",
+        "action": "sell",
+        "price": 9,
+        "size_cents": 9,
+        "contracts": 1,
+        "order_id": "stop-1",
+    })
+    assert pos.state == PositionState.STOPPED
+
+
+def test_stop_reprices_when_bid_moves():
+    strat = GreenUpStrategy(
+        stop_loss_cents=12,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T8")
+    pos = strat.get_position("T8")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 24
+    pos.entry_stake_cents = 24
+    pos.entry_contracts = 1
+    pos.stop_order_id = "ord-1"
+    pos.stop_limit_price = 10
+
+    sig = strat.evaluate(_tick(8, 9, "T8"))
+    assert sig is not None
+    assert sig.limit_price == 8
+    assert sig.meta.get("cancel_order_id") == "ord-1"
 
 
 def test_full_green_hedges_at_trigger_on_micro_stake():
@@ -270,9 +330,205 @@ def test_full_green_hedges_at_trigger_on_micro_stake():
     pos.state = PositionState.ENTERED
     pos.entry_price_cents = 49
     pos.entry_stake_cents = 49
+    pos.hedge_trigger_price = 70
 
     sig = strat.evaluate(_tick(92, 93, "NYK"))
     assert sig is not None
     assert sig.side.value == "no"
     assert sig.meta.get("phase") == "hedge"
     assert strat.get_position("NYK").state == PositionState.HEDGING
+
+
+def test_entry_fill_sets_relative_hedge_trigger_from_offset():
+    strat = GreenUpStrategy(
+        entry_max_price=25,
+        hedge_offset_cents=26,
+        stop_loss_cents=12,
+    )
+    strat.add_watch_ticker("T9")
+    pos = strat.get_position("T9")
+    pos.state = PositionState.WATCHING
+    strat.on_fill({
+        "ticker": "T9",
+        "side": "yes",
+        "price": 18,
+        "size_cents": 18,
+        "order_id": "oid-9",
+    })
+    assert pos.state == PositionState.ENTERED
+    assert pos.hedge_trigger_price == 44
+    assert pos.stop_loss_trigger_price == 6
+
+
+def test_relative_hedge_fires_at_entry_plus_offset_not_absolute_trigger():
+    from strategy.green_up_strategy import HedgeMode
+
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_trigger_price=51,
+        hedge_offset_cents=26,
+        hedge_mode=HedgeMode.FULL_GREEN,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T10")
+    pos = strat.get_position("T10")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 18
+    pos.entry_stake_cents = 18
+    pos.hedge_trigger_price = strat.hedge_trigger_for_entry(18)
+
+    assert pos.hedge_trigger_price == 44
+    assert strat.evaluate(_tick(43, 44, "T10")) is None
+
+    sig = strat.evaluate(_tick(44, 45, "T10"))
+    assert sig is not None
+    assert sig.side.value == "no"
+    assert sig.meta.get("phase") == "hedge"
+
+
+def test_second_cycle_uses_new_entry_for_relative_hedge():
+    strat = GreenUpStrategy(
+        entry_max_price=25,
+        hedge_offset_cents=26,
+        entry_price_mode=EntryPriceMode.MARKET,
+        max_cycles_per_ticker=0,
+    )
+    strat.add_watch_ticker("T11")
+    pos = strat.get_position("T11")
+    pos.state = PositionState.HEDGED
+    pos.cycles_completed = 1
+    pos.entry_price_cents = 25
+    pos.hedge_trigger_price = 51
+
+    sig = strat.evaluate(_tick(8, 10, "T11"))
+    assert sig is not None
+    assert sig.limit_price == 10
+
+    new_pos = strat.get_position("T11")
+    new_pos.state = PositionState.WATCHING
+    strat.on_fill({
+        "ticker": "T11",
+        "side": "yes",
+        "price": 10,
+        "size_cents": 10,
+        "order_id": "oid-11",
+    })
+    assert new_pos.hedge_trigger_price == 36
+
+
+def test_entry_skipped_when_spread_too_wide():
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_trigger_price=68,
+        max_spread_cents=2,
+        entry_price_mode=EntryPriceMode.MARKET,
+    )
+    strat.add_watch_ticker("T12")
+    assert strat.evaluate(_tick(8, 12, "T12")) is None
+
+
+def test_no_entry_max_allows_higher_ask():
+    strat = GreenUpStrategy(
+        entry_max_price=None,
+        hedge_offset_cents=26,
+        max_spread_cents=8,
+        entry_price_mode=EntryPriceMode.MARKET,
+    )
+    strat.add_watch_ticker("T13")
+    sig = strat.evaluate(_tick(30, 35, "T13"))
+    assert sig is not None
+    assert sig.limit_price == 35
+    assert sig.meta["hedge_trigger_price"] == 61
+
+
+def test_entry_skipped_when_hedge_would_hit_price_cap():
+    strat = GreenUpStrategy(
+        entry_max_price=None,
+        hedge_offset_cents=26,
+        max_spread_cents=8,
+        entry_price_mode=EntryPriceMode.MARKET,
+    )
+    strat.add_watch_ticker("T14")
+    assert strat.evaluate(_tick(74, 76, "T14")) is None
+
+
+def test_resolve_entry_max_price():
+    from strategy.green_up_strategy import resolve_entry_max_price
+
+    assert resolve_entry_max_price(None) == 25
+    assert resolve_entry_max_price(30) == 30
+    assert resolve_entry_max_price(None, no_entry_max=True) is None
+    assert resolve_entry_max_price(None, env_value="0") is None
+    assert resolve_entry_max_price(None, env_value="none") is None
+    assert resolve_entry_max_price(None, env_value="40") == 40
+
+
+def test_resting_hedge_posts_gtc_no_at_trigger_price():
+    from strategy.green_up_strategy import HedgeMode, HedgeStyle
+
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_offset_cents=26,
+        hedge_mode=HedgeMode.FULL_GREEN,
+        hedge_style=HedgeStyle.RESTING,
+    )
+    strat.add_watch_ticker("T15")
+    pos = strat.get_position("T15")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.hedge_trigger_price = 51
+
+    sig = strat.evaluate(_tick(20, 22, "T15"))
+    assert sig is not None
+    assert sig.side.value == "no"
+    assert sig.limit_price == 49
+    assert sig.meta.get("time_in_force") == "gtc"
+    assert sig.meta.get("hedge_style") == "resting"
+    assert strat.get_position("T15").state == PositionState.HEDGING
+
+
+def test_resting_hedge_not_re_emitted_while_on_book():
+    from strategy.green_up_strategy import HedgeStyle
+
+    strat = GreenUpStrategy(
+        hedge_offset_cents=26,
+        hedge_style=HedgeStyle.RESTING,
+    )
+    strat.add_watch_ticker("T16")
+    pos = strat.get_position("T16")
+    pos.state = PositionState.HEDGING
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.hedge_trigger_price = 51
+    pos.hedge_order_id = "hedge-1"
+    pos.hedge_limit_price = 49
+
+    assert strat.evaluate(_tick(20, 22, "T16")) is None
+
+
+def test_stop_while_resting_hedge_cancels_hedge_order():
+    from strategy.green_up_strategy import HedgeStyle
+
+    strat = GreenUpStrategy(
+        stop_loss_cents=10,
+        hedge_style=HedgeStyle.RESTING,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T17")
+    pos = strat.get_position("T17")
+    pos.state = PositionState.HEDGING
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.entry_contracts = 1
+    pos.hedge_trigger_price = 51
+    pos.hedge_order_id = "hedge-2"
+    pos.hedge_limit_price = 49
+    pos.stop_loss_trigger_price = 15
+
+    sig = strat.evaluate(_tick(14, 15, "T17"))
+    assert sig is not None
+    assert sig.meta.get("phase") == "stop_loss"
+    assert sig.meta.get("cancel_order_id") == "hedge-2"
+    assert pos.hedge_order_id == ""
+

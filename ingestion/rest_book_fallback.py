@@ -11,7 +11,11 @@ import asyncio
 
 import config
 from discovery.market_client import MarketClient
-from ingestion.book_freshness import book_age_seconds, is_book_stale
+from ingestion.book_freshness import (
+    book_age_seconds,
+    book_needs_rest_refresh,
+    is_book_crossed,
+)
 from ingestion.market_ingestor import MarketIngestor
 from logging_.structured_logger import logger
 
@@ -61,16 +65,18 @@ async def _refresh_stale_books(
     market_client: MarketClient,
     stale_seconds: float,
 ) -> None:
-    stale_tickers = [
+    refresh_tickers = [
         ticker
         for ticker in ingestor.tickers
-        if is_book_stale(ingestor.get_book(ticker), stale_seconds)
+        if book_needs_rest_refresh(ingestor.get_book(ticker), stale_seconds)
     ]
-    if not stale_tickers:
+    if not refresh_tickers:
         return
 
-    for ticker in stale_tickers:
-        ws_age = book_age_seconds(ingestor.get_book(ticker))
+    for ticker in refresh_tickers:
+        ws_book = ingestor.get_book(ticker)
+        ws_age = book_age_seconds(ws_book)
+        reason = "crossed" if is_book_crossed(ws_book) else "stale"
         try:
             snap = await market_client.get_order_book(ticker, depth=5)
         except Exception as exc:
@@ -94,9 +100,12 @@ async def _refresh_stale_books(
             continue
 
         logger.info(
-            "REST book refresh (WS stale)",
+            f"REST book refresh (WS {reason})",
             ticker=ticker,
+            reason=reason,
             ws_age_seconds=round(ws_age, 1) if ws_age is not None else None,
+            ws_best_bid=ws_book.best_bid if ws_book else None,
+            ws_best_ask=ws_book.best_ask if ws_book else None,
             best_bid=snap.best_bid,
             best_ask=snap.best_ask,
             spread=snap.spread,

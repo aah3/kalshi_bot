@@ -124,6 +124,26 @@ def _rollback_pending_entry(ticker: str) -> None:
             pos.state = PositionState.SCANNING
 
 
+def _rollback_pending_stop(ticker: str) -> None:
+    """If a stop-loss order was not accepted, allow retry on the next tick."""
+    if not _strategy:
+        return
+    from strategy.green_up_strategy import GreenUpStrategy
+
+    if isinstance(_strategy, GreenUpStrategy):
+        _strategy.rollback_stop(ticker)
+
+
+def _rollback_pending_hedge(ticker: str) -> None:
+    """If a hedge order was not accepted, allow retry on the next tick."""
+    if not _strategy:
+        return
+    from strategy.green_up_strategy import GreenUpStrategy
+
+    if isinstance(_strategy, GreenUpStrategy):
+        _strategy.rollback_hedge(ticker)
+
+
 async def _register_markets_for_tickers(
     tickers: list[str],
     credentials: CredentialManager,
@@ -267,6 +287,10 @@ async def on_tick(tick: dict[str, Any]) -> None:
     if not _circuit_breaker.approve(signal_obj):
         if phase in ("entry", "leg_1"):
             _rollback_pending_entry(signal_obj.ticker)
+        elif phase == "hedge":
+            _rollback_pending_hedge(signal_obj.ticker)
+        elif phase == "stop_loss":
+            _rollback_pending_stop(signal_obj.ticker)
         return
 
     # Determine trade_type from signal metadata
@@ -275,11 +299,19 @@ async def on_tick(tick: dict[str, Any]) -> None:
     trade_type = f"leg_{arb_leg}" if arb_leg else phase
     ticker     = signal_obj.ticker
 
+    cancel_order_id = meta.get("cancel_order_id")
+    if cancel_order_id and _execution:
+        await _execution.cancel_order(cancel_order_id)
+
     # Submit order to exchange (blotter records on confirmed WS fill only)
     order = await _execution.submit_order(signal_obj)
     if not order:
         if phase in ("entry", "leg_1"):
             _rollback_pending_entry(ticker)
+        elif phase == "hedge":
+            _rollback_pending_hedge(ticker)
+        elif phase == "stop_loss":
+            _rollback_pending_stop(ticker)
         return
 
     order_id = order.get("order_id", "")
@@ -291,6 +323,22 @@ async def on_tick(tick: dict[str, Any]) -> None:
         "category":   meta.get("category", "Unknown"),
         "side":       signal_obj.side.value,
     }
+
+    if phase == "stop_loss":
+        from strategy.green_up_strategy import GreenUpStrategy
+
+        if isinstance(_strategy, GreenUpStrategy):
+            _strategy.register_stop_order(
+                ticker, order_id, signal_obj.limit_price
+            )
+
+    if phase == "hedge":
+        from strategy.green_up_strategy import GreenUpStrategy
+
+        if isinstance(_strategy, GreenUpStrategy):
+            _strategy.register_hedge_order(
+                ticker, order_id, signal_obj.limit_price
+            )
 
     if _alert_manager:
         _alert_manager.register_order(order_id, ticker)
@@ -471,7 +519,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         dest="entry_max",
         metavar="CENTS",
-        help="Green-up: max YES ask to enter (cents)",
+        help=(
+            "Green-up: max YES ask to enter (cents). Omit with --gu-no-entry-max "
+            "for no cap. Env KALSHI_GREEN_UP_ENTRY_MAX (0/none=off)"
+        ),
+    )
+    parser.add_argument(
+        "--gu-no-entry-max",
+        action="store_true",
+        help="Green-up: disable --entry-max cap (enter at current book prices)",
     )
     parser.add_argument(
         "--hedge-trigger",
@@ -480,7 +536,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         dest="hedge_trigger",
         metavar="CENTS",
-        help="Green-up: YES bid to trigger hedge (cents)",
+        help="Green-up: YES bid to trigger hedge (absolute mode; cents)",
+    )
+    parser.add_argument(
+        "--hedge-offset",
+        "--hedge_offset",
+        type=int,
+        default=None,
+        dest="hedge_offset",
+        metavar="CENTS",
+        help=(
+            "Green-up: hedge when YES bid >= entry + N cents (relative mode; "
+            "overrides --hedge-trigger). Env KALSHI_GREEN_UP_HEDGE_OFFSET"
+        ),
     )
     parser.add_argument(
         "--hedge-mode",
@@ -540,6 +608,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Green-up: cents added to bid for limit_offset entry mode "
             "(negative = bid minus |n|). Env KALSHI_GREEN_UP_LIMIT_OFFSET"
+        ),
+    )
+    parser.add_argument(
+        "--gu-max-spread",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help=(
+            "Green-up: skip entry when YES spread exceeds N cents "
+            "(env KALSHI_GREEN_UP_MAX_SPREAD, default 8)"
+        ),
+    )
+    parser.add_argument(
+        "--gu-hedge-style",
+        default=None,
+        choices=["trigger", "resting"],
+        help=(
+            "Green-up: ``trigger`` waits for YES bid >= hedge level; "
+            "``resting`` posts GTC buy-NO at trigger after entry fill "
+            "(env KALSHI_GREEN_UP_HEDGE_STYLE, default trigger)"
         ),
     )
     parser.add_argument(
@@ -1083,12 +1171,16 @@ async def main(args: argparse.Namespace | None = None) -> None:
             model_probs=model_probs,
             entry_max=args.entry_max,
             hedge_trigger=args.hedge_trigger,
+            hedge_offset=args.hedge_offset,
             hedge_mode=args.hedge_mode,
             stop_loss=args.stop_loss,
             gu_entry_mode=args.gu_entry_mode,
             gu_exit_mode=args.gu_exit_mode,
             gu_limit_offset=args.gu_limit_offset,
             gu_max_cycles=args.gu_max_cycles,
+            gu_max_spread=args.gu_max_spread,
+            gu_no_entry_max=args.gu_no_entry_max,
+            gu_hedge_style=args.gu_hedge_style,
             comp_pairs=comp_pairs,
             hp_min_yes_ask=args.hp_min_yes_ask,
             hp_max_yes_ask=args.hp_max_yes_ask,
@@ -1250,7 +1342,10 @@ async def main(args: argparse.Namespace | None = None) -> None:
         if isinstance(_strategy, GreenUpStrategy):
             startup_kw.update(
                 entry_max_cents=_strategy._entry_max_price,
+                max_spread_cents=_strategy._max_spread_cents,
                 hedge_trigger_cents=_strategy._hedge_trigger_price,
+                hedge_offset_cents=_strategy._hedge_offset_cents,
+                hedge_style=_strategy._hedge_style.value,
                 hedge_mode=_strategy._hedge_mode.value,
                 stop_loss_cents=_strategy._stop_loss_cents,
                 entry_price_mode=_strategy._entry_price_mode.value,

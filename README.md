@@ -261,19 +261,39 @@ Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Us
 
 **State machine per ticker:** `WATCHING` → `ENTERED` → `HEDGING` → `HEDGED`, or `ENTERED` → `STOPPING` → `STOPPED`.
 
+#### Entry and hedge parameters
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--entry-max` | 25¢ | Enter only when best YES **ask** ≤ this |
-| `--hedge-trigger` | 68¢ | Hedge when YES **bid** ≥ this |
+| `--entry-max` | 25¢ | Max YES **ask** to enter (optional underdog filter) |
+| `--gu-no-entry-max` | off | Disable entry cap — enter at current book prices |
+| `--hedge-trigger` | 68¢ | **Absolute** mode: hedge when YES **bid** ≥ this |
+| `--hedge-offset` | — | **Relative** mode: hedge when YES bid ≥ entry + N¢ (overrides `--hedge-trigger`) |
+| `--gu-hedge-style` | `trigger` | `trigger` = wait for bid; `resting` = GTC buy-NO at trigger right after entry fill |
 | `--hedge-mode` | `full_green` | `full_green` \| `stake_back` \| `partial` |
 | `--stop-loss` | 10 | Stop when YES bid falls **N cents** below entry (max loss ≈ N¢/contract) |
+| `--gu-max-spread` | 8 | Skip entry when YES spread exceeds N¢ |
 | `--gu-entry-mode` | `passive` | Pricing for **buy YES** entries |
-| `--gu-exit-mode` | `passive` | Pricing for **buy NO** hedge/stop legs |
+| `--gu-exit-mode` | `passive` | Pricing for **buy NO** on trigger-style hedges and stop legs |
 | `--gu-limit-offset` | 0 | With `limit_offset`: cents from bid (e.g. `-2`) |
 | `--gu-max-cycles` | 0 | Max completed entry→exit cycles per ticker (`0` = unlimited) |
 | `--max-concurrent-positions` | 0 | Cap simultaneous entry legs (`0` = unlimited) |
 
-**Hedge modes:**
+**Hedge trigger modes:**
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| Absolute | `--hedge-trigger 68` | Same YES bid threshold every cycle (session-wide) |
+| Relative | `--hedge-offset 26` | Per fill: hedge at entry + 26¢ (adapts each cycle) |
+
+**Hedge execution styles** (`--gu-hedge-style`):
+
+| Style | Behavior |
+|-------|----------|
+| `trigger` (default) | Wait until YES bid ≥ hedge level, then buy NO using `--gu-exit-mode` |
+| `resting` | Immediately after entry fill, post **GTC buy-NO** at `100 − hedge_trigger` (fills when YES rises to trigger). Stop-loss cancels the resting hedge. |
+
+**Hedge sizing modes:**
 
 | Mode | Outcome |
 |------|---------|
@@ -281,7 +301,7 @@ Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Us
 | `stake_back` | Hedge sized to recover stake; more upside if original YES wins |
 | `partial` | Scaled hedge between full green and stake back |
 
-**Sizing:** fractional Kelly from entry vs hedge-trigger odds, capped by `MAX_POSITION_CENTS`. Contracts ≈ `size_cents // entry_price`.
+**Sizing:** fractional Kelly from entry vs expected hedge-trigger odds, capped by `MAX_POSITION_CENTS`. Contracts ≈ `size_cents // entry_price`. Entry also requires positive locked-profit preview at the hedge target and spread ≤ `--gu-max-spread`.
 
 **Order pricing** (`--gu-entry-mode` / `--gu-exit-mode`):
 
@@ -292,21 +312,31 @@ Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Us
 | `market` | IOC market | IOC market |
 | `limit_at_bid` / `limit_at_ask` / `limit_at_mid` / `limit_offset` | Explicit prices | Same |
 
-**Recommended flow:**
+**Recommended flows:**
 
 ```bash
 # 1) Preview — screener-ranked underdogs, no orders
 python main.py --discover --discover-category Sports --strategy green_up \
   --discover-top 5 --discover-only
 
-# 2) Demo run — 5 parallel markets, aggressive entries, cap 5 positions
+# 2) Classic — absolute trigger, market entry, cross-spread hedge
 python main.py --discover --discover-category Sports --strategy green_up \
   --discover-top 5 --max-concurrent-positions 5 \
   --entry-max 25 --hedge-trigger 68 --hedge-mode full_green \
   --gu-entry-mode market --gu-exit-mode cross_spread \
   --monitor-interval 30
 
-# 3) Production micro-pilot (isolated DB/log) — see scripts/run_green_up_prod.ps1
+# 3) Dynamic — relative hedge, no entry cap, resting GTC hedge after fill
+python main.py --tickers YOUR-TICKER --strategy green_up \
+  --gu-no-entry-max --hedge-offset 26 --gu-hedge-style resting \
+  --gu-entry-mode passive --gu-max-spread 8 --stop-loss 10 \
+  --hedge-mode partial --max-concurrent-positions 5 --monitor-interval 30
+
+# 4) Replay recorded session with same params
+python tools/replay.py replay --input recordings/game.jsonl --strategy green_up \
+  --hedge-offset 26 --gu-hedge-style resting --gu-no-entry-max
+
+# 5) Production micro-pilot — see scripts/run_green_up_prod.ps1
 .\scripts\run_green_up_prod.ps1 -DiscoverOnly
 ```
 
@@ -826,8 +856,11 @@ kalshi_bot/
 KALSHI_STRATEGY=green_up
 KALSHI_GREEN_UP_ENTRY_MAX=25
 KALSHI_GREEN_UP_HEDGE_TRIGGER=68
+KALSHI_GREEN_UP_HEDGE_OFFSET=26
+KALSHI_GREEN_UP_HEDGE_STYLE=trigger
 KALSHI_GREEN_UP_HEDGE_MODE=full_green
 KALSHI_GREEN_UP_STOP_LOSS=10
+KALSHI_GREEN_UP_MAX_SPREAD=8
 KALSHI_GREEN_UP_ENTRY_MODE=passive
 KALSHI_GREEN_UP_EXIT_MODE=passive
 KALSHI_MAX_CONCURRENT_POSITIONS=5
@@ -835,7 +868,7 @@ KALSHI_LIVE_ONLY=true
 KALSHI_LIVE_MAX_MINUTES_TO_CLOSE=360
 ```
 
-CLI flags (`--entry-max`, `--hedge-trigger`, `--hedge-mode`, `--stop-loss`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--discover-max-minutes-to-close`) override these at runtime.
+CLI flags (`--entry-max`, `--gu-no-entry-max`, `--hedge-trigger`, `--hedge-offset`, `--gu-hedge-style`, `--hedge-mode`, `--stop-loss`, `--gu-max-spread`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--discover-max-minutes-to-close`) override these at runtime.
 
 ### High-probability environment variables
 
