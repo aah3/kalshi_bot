@@ -658,12 +658,22 @@ class GreenUpStrategy(BaseStrategy):
             pos.stop_limit_price = limit_price
 
     def rollback_stop(self, ticker: str) -> None:
-        """Allow stop-loss to retry after a failed submit or cancel."""
+        """
+        Allow stop-loss to retry after a failed submit or cancel.
+
+        If a resting stop is already on the book (the reprice path), keep the
+        position in STOPPING and retain ``stop_order_id`` so the next tick
+        retries the cancel/replace against the *same* order rather than stacking
+        a duplicate sell. Only revert to ENTERED when no stop order was ever
+        registered (a first-fire failure), so ``_check_stop_loss`` can re-arm.
+        """
         pos = self._positions.get(ticker)
-        if pos and pos.state == PositionState.STOPPING:
-            pos.state            = PositionState.ENTERED
-            pos.stop_order_id    = ""
-            pos.stop_limit_price = 0
+        if pos is None or pos.state != PositionState.STOPPING:
+            return
+        if pos.stop_order_id:
+            return
+        pos.state            = PositionState.ENTERED
+        pos.stop_limit_price = 0
 
     def register_hedge_order(
         self, ticker: str, order_id: str, limit_price: int
@@ -763,6 +773,16 @@ class GreenUpStrategy(BaseStrategy):
         if size_cents < 1:
             return None
 
+        # Kalshi fills whole contracts; the execution layer rounds the stake to
+        # contracts = max(size_cents // limit_price, 1). Mirror that here so the
+        # logged preview (hedge size, locked profit) and the registered stake
+        # match what actually fills — a sub-contract Kelly stake floors to one
+        # contract. Reject if a single contract would exceed the position cap.
+        contracts  = max(size_cents // limit_price, 1)
+        size_cents = contracts * limit_price
+        if size_cents > config.MAX_POSITION_CENTS:
+            return None
+
         vig_proxy   = max(spread / 2.0, 0.5) / 100.0
         edge_to_vig = edge / vig_proxy
 
@@ -789,6 +809,7 @@ class GreenUpStrategy(BaseStrategy):
         self._positions[ticker] = GreenUpPosition(
             ticker=ticker,
             entry_stake_cents=size_cents,
+            entry_contracts=contracts,
             state=PositionState.WATCHING,
         )
 
@@ -1078,6 +1099,21 @@ class GreenUpStrategy(BaseStrategy):
             return max(1, pos.entry_stake_cents // pos.entry_price_cents)
         return 1
 
+    def _stop_sell_mode(self) -> EntryPriceMode:
+        """
+        Pricing mode for the protective stop sell.
+
+        A stop-loss must actually exit the position. In PASSIVE mode the sell
+        rests at the ask, so in a fast-falling book no buyer ever lifts it and
+        the order chases the market down without filling — the loss is never
+        capped. Escalate PASSIVE to CROSS_SPREAD so the stop sells at the bid
+        (still a GTC limit) and crosses to get filled. Explicit aggressive or
+        maker modes chosen by the operator are left untouched.
+        """
+        if self._exit_price_mode == EntryPriceMode.PASSIVE:
+            return EntryPriceMode.CROSS_SPREAD
+        return self._exit_price_mode
+
     def _manage_resting_stop(
         self, pos: GreenUpPosition, tick: dict[str, Any]
     ) -> Signal | None:
@@ -1091,7 +1127,7 @@ class GreenUpStrategy(BaseStrategy):
             return None
 
         sell_price, order_type, tif = resolve_yes_sell_exit(
-            self._exit_price_mode,
+            self._stop_sell_mode(),
             best_bid,
             best_ask,
             self._limit_offset,
@@ -1110,6 +1146,7 @@ class GreenUpStrategy(BaseStrategy):
             order_type,
             tif,
             cancel_order_id=cancel_id,
+            is_reprice=True,
         )
 
     def _check_stop_loss(
@@ -1132,7 +1169,7 @@ class GreenUpStrategy(BaseStrategy):
             return None
 
         sell_price, order_type, tif = resolve_yes_sell_exit(
-            self._exit_price_mode,
+            self._stop_sell_mode(),
             best_bid,
             best_ask,
             self._limit_offset,
@@ -1160,6 +1197,7 @@ class GreenUpStrategy(BaseStrategy):
         tif: str,
         *,
         cancel_order_id: str | None = None,
+        is_reprice: bool = False,
     ) -> Signal:
         best_bid = tick.get("best_bid")
         spread   = tick.get("spread") or 2
@@ -1172,7 +1210,19 @@ class GreenUpStrategy(BaseStrategy):
         stop_edge   = (pos.entry_price_cents - sell_price) / 100.0
         edge_to_vig = stop_edge / vig_proxy if vig_proxy > 0 else 0.0
 
-        if not cancel_order_id:
+        # The first stop fire must always log the WARNING, even when it also
+        # cancels a resting hedge. Only an actual reprice (bid moved while the
+        # stop is already on book) logs the quieter info line.
+        if is_reprice:
+            logger.info(
+                "GreenUp: repricing resting stop sell",
+                ticker=pos.ticker,
+                old_price_cents=pos.stop_limit_price,
+                new_price_cents=sell_price,
+                cancel_order_id=cancel_order_id,
+                strategy=self.name,
+            )
+        else:
             logger.warning(
                 "GreenUp: stop-loss triggered",
                 ticker=pos.ticker,
@@ -1185,16 +1235,8 @@ class GreenUpStrategy(BaseStrategy):
                 est_proceeds_cents=proceeds_cents,
                 est_net_loss_cents=net_loss_cents,
                 est_net_loss_usd=round(net_loss_cents / 100, 2),
-                time_in_trade_s=round(pos.time_in_trade_s, 1),
-                strategy=self.name,
-            )
-        else:
-            logger.info(
-                "GreenUp: repricing resting stop sell",
-                ticker=pos.ticker,
-                old_price_cents=pos.stop_limit_price,
-                new_price_cents=sell_price,
                 cancel_order_id=cancel_order_id,
+                time_in_trade_s=round(pos.time_in_trade_s, 1),
                 strategy=self.name,
             )
 

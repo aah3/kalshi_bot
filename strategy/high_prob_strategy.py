@@ -57,9 +57,15 @@ from strategy.execution_price import (
     resolve_yes_buy,
     resolve_yes_sell,
 )
+from strategy.price_targets import stop_loss_trigger_price
 
 # Re-export for tests and callers that imported from this module.
-__all__ = ["EntryPriceMode", "HighProbStrategy", "PostFillMode"]
+__all__ = [
+    "EntryPriceMode",
+    "HighProbStrategy",
+    "PostFillMode",
+    "TakeProfitStyle",
+]
 
 
 # ── Defaults (overridable via constructor or env in factory) ─────────────────
@@ -73,6 +79,7 @@ DEFAULT_TAKE_PROFIT_OFFSET: int    = 3     # sell YES at entry + N cents
 DEFAULT_TAKE_PROFIT_PRICE: int     = 99    # hard cap for resting TP
 DEFAULT_STOP_LOSS_PCT: float       = 0.12  # exit if bid falls 12% below entry
 DEFAULT_LIMIT_OFFSET: int          = 0     # for LIMIT_OFFSET mode
+DEFAULT_MAX_CYCLES_PER_TICKER: int = 0     # 0 = unlimited re-entry after exit
 
 
 class PostFillMode(str, Enum):
@@ -82,17 +89,53 @@ class PostFillMode(str, Enum):
     TAKE_PROFIT_AND_STOP = "tp_and_stop"
 
 
+class TakeProfitStyle(str, Enum):
+    """How resting take-profit limit price is chosen."""
+
+    FIXED  = "fixed"   # use take_profit_price computed on entry fill (default)
+    AT_ASK = "at_ask"  # passive exit: max(computed_tp, current ask)
+
+
+def parse_take_profit_style(
+    value: str | None,
+    *,
+    default: TakeProfitStyle = TakeProfitStyle.FIXED,
+) -> TakeProfitStyle:
+    if value is None:
+        return default
+    key = value.strip().lower()
+    for style in TakeProfitStyle:
+        if style.value == key:
+            return style
+    raise ValueError(
+        f"Unknown take-profit style {value!r}. "
+        f"Choose: {', '.join(s.value for s in TakeProfitStyle)}"
+    )
+
+
+def parse_hp_stop_loss_cents(value: int | str | None) -> int | None:
+    """Parse --hp-stop-loss-cents / KALSHI_HP_STOP_LOSS_CENTS."""
+    if value is None:
+        return None
+    cents = int(value)
+    if cents < 1:
+        raise ValueError(f"hp-stop-loss-cents must be at least 1, got {value!r}")
+    return min(98, cents)
+
+
 class PositionState(str, Enum):
+    SCANNING     = "scanning"      # registered ticker, no entry order yet
     WATCHING     = "watching"      # entry signal emitted, awaiting fill
     ENTERED      = "entered"       # long YES, managing exit
     EXIT_PENDING = "exit_pending"  # exit order sent
-    CLOSED       = "closed"
+    CLOSED       = "closed"        # round-trip complete (may re-enter)
 
 
 @dataclass
 class HighProbPosition:
     ticker: str
-    state: PositionState = PositionState.WATCHING
+    state: PositionState = PositionState.SCANNING
+    cycles_completed: int = 0
 
     entry_price_cents: int = 0
     entry_stake_cents: int = 0
@@ -103,6 +146,9 @@ class HighProbPosition:
     stop_loss_trigger: int = 0
     tp_order_sent: bool = False
     stop_order_sent: bool = False
+    tp_order_id: str = ""
+    tp_limit_price: int = 0
+    stop_order_id: str = ""
 
     entered_at: float = field(default_factory=time.monotonic)
 
@@ -130,6 +176,9 @@ class HighProbStrategy(BaseStrategy):
         take_profit_pct: float | None = None,
         take_profit_price_cap: int = DEFAULT_TAKE_PROFIT_PRICE,
         stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
+        stop_loss_cents: int | None = None,
+        tp_style: TakeProfitStyle = TakeProfitStyle.FIXED,
+        max_cycles_per_ticker: int = DEFAULT_MAX_CYCLES_PER_TICKER,
         require_model_edge: bool = False,
     ) -> None:
         self._min_yes_ask = min_yes_ask
@@ -145,6 +194,9 @@ class HighProbStrategy(BaseStrategy):
         self._tp_pct = take_profit_pct
         self._tp_cap = take_profit_price_cap
         self._stop_loss_pct = stop_loss_pct
+        self._stop_loss_cents = stop_loss_cents
+        self._tp_style = tp_style
+        self._max_cycles_per_ticker = max(0, int(max_cycles_per_ticker))
         self._require_model_edge = require_model_edge
         assume_rt = getattr(config, "HP_ASSUME_ROUND_TRIP_FEES", False)
         self._round_trip_fees = (
@@ -166,12 +218,69 @@ class HighProbStrategy(BaseStrategy):
             )
         return min(self._tp_cap, entry_cents + self._tp_offset)
 
+    def _resolve_stop_loss_trigger(self, entry_cents: int) -> int:
+        if self._stop_loss_cents is not None:
+            return stop_loss_trigger_price(entry_cents, self._stop_loss_cents)
+        return max(1, int(entry_cents * (1.0 - self._stop_loss_pct)))
+
     @property
     def name(self) -> str:
         return f"high_prob_{self._entry_mode.value}"
 
     def add_watch_ticker(self, ticker: str) -> None:
         self._watch_tickers.add(ticker)
+        if ticker not in self._positions:
+            self._positions[ticker] = HighProbPosition(ticker=ticker)
+
+    def get_position(self, ticker: str) -> HighProbPosition | None:
+        return self._positions.get(ticker)
+
+    def register_tp_order(
+        self, ticker: str, order_id: str, limit_price: int
+    ) -> None:
+        pos = self._positions.get(ticker)
+        if pos and pos.state == PositionState.EXIT_PENDING:
+            pos.tp_order_id    = order_id
+            pos.tp_limit_price = limit_price
+
+    def register_stop_order(self, ticker: str, order_id: str) -> None:
+        pos = self._positions.get(ticker)
+        if pos and pos.state == PositionState.EXIT_PENDING:
+            pos.stop_order_id = order_id
+
+    def rollback_exit(self, ticker: str, phase: str) -> None:
+        """Allow TP/stop to retry after a failed submit or circuit-breaker reject."""
+        pos = self._positions.get(ticker)
+        if pos is None or pos.state != PositionState.EXIT_PENDING:
+            return
+        if phase == "exit":
+            pos.state             = PositionState.ENTERED
+            pos.tp_order_sent     = False
+            pos.tp_order_id       = ""
+            pos.tp_limit_price    = 0
+        elif phase == "stop_loss":
+            pos.stop_order_sent = False
+            pos.stop_order_id   = ""
+            if pos.tp_order_id:
+                pos.state = PositionState.EXIT_PENDING
+            else:
+                pos.state = PositionState.ENTERED
+
+    def summary(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "ticker":              ticker,
+                "state":               pos.state.value,
+                "entry_price_cents":   pos.entry_price_cents,
+                "entry_stake_cents":   pos.entry_stake_cents,
+                "take_profit_price":   pos.take_profit_price,
+                "stop_trigger_price":  pos.stop_loss_trigger,
+                "tp_limit_price":      pos.tp_limit_price,
+                "cycles_completed":    pos.cycles_completed,
+                "time_in_trade_s":     round(time.monotonic() - pos.entered_at, 1),
+            }
+            for ticker, pos in self._positions.items()
+        ]
 
     def set_model_probability(self, ticker: str, prob: float) -> None:
         if not 0.01 <= prob <= 0.99:
@@ -192,15 +301,49 @@ class HighProbStrategy(BaseStrategy):
 
         pos = self._positions.get(ticker)
 
-        if pos and pos.state == PositionState.ENTERED:
+        if pos and pos.state == PositionState.CLOSED:
+            if self._try_begin_new_cycle(pos):
+                return self._check_entry(ticker, tick, best_bid, best_ask, spread)
+            return None
+
+        if pos and pos.state in (PositionState.ENTERED, PositionState.EXIT_PENDING):
             return self._check_exit(pos, tick)
 
-        if pos is None or pos.state == PositionState.WATCHING:
-            if pos and pos.state == PositionState.WATCHING:
-                return None
+        if pos and pos.state == PositionState.WATCHING:
+            return None
+
+        if pos is None or pos.state == PositionState.SCANNING:
             return self._check_entry(ticker, tick, best_bid, best_ask, spread)
 
         return None
+
+    def _try_begin_new_cycle(self, pos: HighProbPosition) -> bool:
+        if (
+            self._max_cycles_per_ticker > 0
+            and pos.cycles_completed >= self._max_cycles_per_ticker
+        ):
+            logger.info(
+                "HighProb: max cycles reached — no further entries",
+                ticker=pos.ticker,
+                cycles_completed=pos.cycles_completed,
+                max_cycles=self._max_cycles_per_ticker,
+                strategy=self.name,
+            )
+            return False
+
+        completed = pos.cycles_completed
+        self._positions[pos.ticker] = HighProbPosition(
+            ticker=pos.ticker,
+            cycles_completed=completed,
+        )
+        logger.info(
+            "HighProb: starting new cycle",
+            ticker=pos.ticker,
+            cycles_completed=completed,
+            max_cycles=self._max_cycles_per_ticker or "unlimited",
+            strategy=self.name,
+        )
+        return True
 
     def on_fill(self, fill: dict[str, Any]) -> None:
         ticker = fill.get("ticker", "")
@@ -220,10 +363,7 @@ class HighProbStrategy(BaseStrategy):
             pos.take_profit_price = self._resolve_take_profit_price(
                 price, pos.entry_vig_cents,
             )
-            pos.stop_loss_trigger = max(
-                1,
-                int(price * (1.0 - self._stop_loss_pct)),
-            )
+            pos.stop_loss_trigger = self._resolve_stop_loss_trigger(price)
             pos.state = PositionState.ENTERED
             pos.tp_order_sent = False
             pos.stop_order_sent = False
@@ -239,18 +379,25 @@ class HighProbStrategy(BaseStrategy):
                 take_profit_pct=self._tp_pct,
                 entry_vig_cents=pos.entry_vig_cents,
                 stop_loss_trigger=pos.stop_loss_trigger,
+                stop_loss_cents=self._stop_loss_cents,
+                stop_loss_pct=self._stop_loss_pct,
                 strategy=self.name,
             )
 
         elif pos.state in (PositionState.ENTERED, PositionState.EXIT_PENDING) \
                 and side == Side.YES.value \
                 and (fill.get("action") == "sell" or fill.get("is_sell")):
+            pos.cycles_completed += 1
             pos.state = PositionState.CLOSED
+            pos.tp_order_id    = ""
+            pos.tp_limit_price = 0
+            pos.stop_order_id  = ""
             logger.info(
                 "HighProb: exit filled",
                 ticker=ticker,
                 exit_price_cents=price,
                 entry_price_cents=pos.entry_price_cents,
+                cycles_completed=pos.cycles_completed,
                 strategy=self.name,
             )
 
@@ -264,21 +411,25 @@ class HighProbStrategy(BaseStrategy):
         best_ask: int,
         spread: int | None,
     ) -> Signal | None:
-        if best_ask < self._min_yes_ask or best_ask > self._max_yes_ask:
-            return None
-
         if spread is not None and spread > self._max_spread:
             return None
 
+        limit_price, order_type, tif = resolve_yes_buy(
+            self._entry_mode, best_bid, best_ask, self._limit_offset,
+        )
+
+        if limit_price < self._min_yes_ask or limit_price > self._max_yes_ask:
+            return None
+
         passed, gross_roi, applied_roi = passes_roi_gate(
-            best_ask,
+            limit_price,
             self._min_roi_pct,
             round_trip_fees=self._round_trip_fees,
         )
         if not passed:
             return None
 
-        market_prob = best_ask / 100.0
+        market_prob = limit_price / 100.0
         model_prob = self._model_probs.get(ticker)
         confidence = model_prob if model_prob is not None else market_prob
 
@@ -300,10 +451,6 @@ class HighProbStrategy(BaseStrategy):
         else:
             edge_to_vig = edge / vig_proxy if vig_proxy > 0 else 0.0
 
-        limit_price, order_type, tif = resolve_yes_buy(
-            self._entry_mode, best_bid, best_ask, self._limit_offset,
-        )
-
         size_cents = min(self._stake_cents, config.MAX_POSITION_CENTS)
         if size_cents < 1:
             return None
@@ -315,7 +462,7 @@ class HighProbStrategy(BaseStrategy):
             entry_vig_cents=entry_vig,
         )
 
-        payout_cents = 100 - best_ask
+        payout_cents = 100 - limit_price
         logger.signal_generated(
             ticker=ticker,
             side=Side.YES.value,
@@ -360,6 +507,7 @@ class HighProbStrategy(BaseStrategy):
                 "model_prob":         model_prob,
                 "best_bid":           best_bid,
                 "best_ask":           best_ask,
+                "entry_limit_price":  limit_price,
             },
         )
 
@@ -377,9 +525,12 @@ class HighProbStrategy(BaseStrategy):
             return None
 
         mode = self._post_fill_mode
-        emit_tp = mode in (
-            PostFillMode.RESTING_TAKE_PROFIT,
-            PostFillMode.TAKE_PROFIT_AND_STOP,
+        emit_tp = (
+            pos.state == PositionState.ENTERED
+            and mode in (
+                PostFillMode.RESTING_TAKE_PROFIT,
+                PostFillMode.TAKE_PROFIT_AND_STOP,
+            )
         )
         emit_stop = mode in (
             PostFillMode.RESTING_STOP_LOSS,
@@ -396,7 +547,10 @@ class HighProbStrategy(BaseStrategy):
             _, order_type, tif = resolve_yes_sell(
                 self._exit_mode, best_bid, best_ask, self._limit_offset,
             )
-            if self._exit_mode == EntryPriceMode.PASSIVE:
+            if (
+                self._tp_style == TakeProfitStyle.AT_ASK
+                and self._exit_mode == EntryPriceMode.PASSIVE
+            ):
                 tp_price = max(tp_price, best_ask)
             return self._exit_signal(
                 pos,
@@ -409,8 +563,14 @@ class HighProbStrategy(BaseStrategy):
                 mark_tp_sent=True,
             )
 
-        # Stop: sell when bid breaches trigger
+        # Stop: sell when bid breaches trigger (cancels resting TP if on book)
         if emit_stop and not pos.stop_order_sent and best_bid <= pos.stop_loss_trigger:
+            cancel_id = pos.tp_order_id or None
+            if cancel_id:
+                pos.tp_order_id    = ""
+                pos.tp_limit_price = 0
+                pos.tp_order_sent  = False
+
             stop_mode = (
                 EntryPriceMode.CROSS_SPREAD
                 if self._exit_mode == EntryPriceMode.PASSIVE
@@ -428,6 +588,7 @@ class HighProbStrategy(BaseStrategy):
                 reason="stop_loss",
                 spread=spread,
                 mark_stop_sent=True,
+                cancel_order_id=cancel_id,
             )
 
         return None
@@ -444,6 +605,7 @@ class HighProbStrategy(BaseStrategy):
         *,
         mark_tp_sent: bool = False,
         mark_stop_sent: bool = False,
+        cancel_order_id: str | None = None,
     ) -> Signal:
         if mark_tp_sent:
             pos.tp_order_sent = True
@@ -456,15 +618,30 @@ class HighProbStrategy(BaseStrategy):
         exit_prob = limit_price / 100.0
         edge = exit_prob - (pos.entry_price_cents / 100.0)
 
-        logger.signal_generated(
-            ticker=pos.ticker,
-            side=Side.YES.value,
-            size_cents=contracts_value,
-            limit_price=limit_price,
-            phase=phase,
-            exit_reason=reason,
-            strategy=self.name,
-        )
+        log_kw: dict[str, Any] = {
+            "ticker": pos.ticker,
+            "side": Side.YES.value,
+            "size_cents": contracts_value,
+            "limit_price": limit_price,
+            "phase": phase,
+            "exit_reason": reason,
+            "strategy": self.name,
+        }
+        if cancel_order_id:
+            log_kw["cancel_order_id"] = cancel_order_id
+        logger.signal_generated(**log_kw)
+
+        meta: dict[str, Any] = {
+            "phase":             phase,
+            "order_type":        order_type,
+            "action":            "sell",
+            "time_in_force":     time_in_force,
+            "exit_reason":       reason,
+            "entry_price_cents": pos.entry_price_cents,
+            "post_fill_mode":    self._post_fill_mode.value,
+        }
+        if cancel_order_id:
+            meta["cancel_order_id"] = cancel_order_id
 
         return Signal(
             ticker=pos.ticker,
@@ -475,13 +652,5 @@ class HighProbStrategy(BaseStrategy):
             edge_to_vig=round(edge / vig_proxy, 4) if vig_proxy else 0.0,
             confidence=exit_prob,
             strategy=self.name,
-            meta={
-                "phase":           phase,
-                "order_type":      order_type,
-                "action":          "sell",
-                "time_in_force":   time_in_force,
-                "exit_reason":     reason,
-                "entry_price_cents": pos.entry_price_cents,
-                "post_fill_mode":  self._post_fill_mode.value,
-            },
+            meta=meta,
         )

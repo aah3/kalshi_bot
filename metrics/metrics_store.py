@@ -171,9 +171,22 @@ class MetricsStore:
             )
 
     def mark_signal_filled(self, ticker: str, order_id: str) -> None:
+        # SQLite is not built with SQLITE_ENABLE_UPDATE_DELETE_LIMIT on most
+        # platforms (incl. the stock Windows build), so UPDATE ... ORDER BY
+        # ... LIMIT raises "near \"ORDER\": syntax error". Scope the UPDATE to
+        # the most-recent matching row via a subquery on the primary key.
         with self._connect() as conn:
             conn.execute(
-                "UPDATE signals SET filled = 1 WHERE ticker = ? ORDER BY ts_us DESC LIMIT 1",
+                """
+                UPDATE signals
+                   SET filled = 1
+                 WHERE id = (
+                     SELECT id FROM signals
+                      WHERE ticker = ?
+                      ORDER BY ts_us DESC, id DESC
+                      LIMIT 1
+                 )
+                """,
                 (ticker,),
             )
 

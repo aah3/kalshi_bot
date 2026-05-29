@@ -187,6 +187,40 @@ class AlertManager:
         """Remove an order from tracking when it is cancelled."""
         self._open_orders.pop(order_id, None)
 
+    # ── Bot-ownership attribution ─────────────────────────────────────────────
+
+    def _bot_owned(self, ticker: str, side: str) -> dict[str, Any] | None:
+        """
+        Attribute an exchange position to what *this bot* opened.
+
+        The portfolio snapshot reflects the aggregate exchange position on a
+        ticker — it includes manual trades and other strategies, so a stop/
+        profit alert that quotes the whole position can badly misrepresent the
+        bot's own exposure (e.g. "-92% of cost" on a 1-contract bot trade that
+        is really sitting inside an 8-contract manual book). Sum the bot's own
+        still-open legs on the matching side from the blotter so the alert can
+        say how much of the position the bot actually owns.
+
+        Returns None when there is no blotter or the query fails (best effort).
+        """
+        if self._blotter is None:
+            return None
+        try:
+            legs = self._blotter.query_legs(ticker=ticker, status="open")
+        except Exception as exc:  # pragma: no cover - defensive, best effort
+            logger.debug("AlertManager: bot-ownership lookup failed",
+                         ticker=ticker, error=str(exc))
+            return None
+
+        contracts  = sum(leg.contracts for leg in legs if leg.side == side)
+        cost_cents = sum(
+            leg.entry_price * leg.contracts for leg in legs if leg.side == side
+        )
+        return {
+            "bot_owned_contracts":  contracts,
+            "bot_owned_cost_usd":   round(cost_cents / 100, 2),
+        }
+
     # ── Per-position checks ───────────────────────────────────────────────────
 
     def _check_profit_target(self, pos: Position) -> list[Alert]:
@@ -203,6 +237,20 @@ class AlertManager:
             return []
         self._arm(key)
 
+        data = {
+            "cost_basis_usd":     round(pos.cost_basis / 100, 2),
+            "unrealised_pnl_usd": round(pos.unrealised_pnl / 100, 2),
+            "pnl_pct":            round(pnl_pct * 100, 1),
+            "target_pct":         PROFIT_TARGET_PCT * 100,
+            "mark_price":         pos.mark_price,
+            "avg_entry_price":    pos.avg_entry_price,
+            "contracts":          pos.contracts,
+            "implied_prob_pct":   round(pos.implied_prob * 100, 1),
+        }
+        owned = self._bot_owned(pos.ticker, pos.side)
+        if owned is not None:
+            data.update(owned)
+
         return [Alert(
             alert_type=AlertType.PROFIT_TARGET,
             severity=AlertSeverity.WARNING,
@@ -213,16 +261,7 @@ class AlertManager:
                 f"({pnl_pct*100:.1f}% of cost)  "
                 f"Consider taking profit or placing a stop."
             ),
-            data={
-                "cost_basis_usd":     round(pos.cost_basis / 100, 2),
-                "unrealised_pnl_usd": round(pos.unrealised_pnl / 100, 2),
-                "pnl_pct":            round(pnl_pct * 100, 1),
-                "target_pct":         PROFIT_TARGET_PCT * 100,
-                "mark_price":         pos.mark_price,
-                "avg_entry_price":    pos.avg_entry_price,
-                "contracts":          pos.contracts,
-                "implied_prob_pct":   round(pos.implied_prob * 100, 1),
-            },
+            data=data,
         )]
 
     def _check_position_stop(self, pos: Position) -> list[Alert]:
@@ -239,6 +278,25 @@ class AlertManager:
             return []
         self._arm(key)
 
+        data = {
+            "cost_basis_usd":     round(pos.cost_basis / 100, 2),
+            "unrealised_pnl_usd": round(pos.unrealised_pnl / 100, 2),
+            "loss_pct":           round(loss_pct * 100, 1),
+            "stop_threshold_pct": POSITION_STOP_PCT * 100,
+            "mark_price":         pos.mark_price,
+            "avg_entry_price":    pos.avg_entry_price,
+            "contracts":          pos.contracts,
+        }
+        owned = self._bot_owned(pos.ticker, pos.side)
+        bot_note = ""
+        if owned is not None:
+            data.update(owned)
+            if owned["bot_owned_contracts"] < pos.contracts:
+                bot_note = (
+                    f"  (bot owns {owned['bot_owned_contracts']}/{pos.contracts} "
+                    f"contracts; rest is non-bot)"
+                )
+
         return [Alert(
             alert_type=AlertType.POSITION_STOP,
             severity=AlertSeverity.CRITICAL,
@@ -247,17 +305,9 @@ class AlertManager:
                 f"POSITION STOP ALERT: {pos.ticker} [{pos.side.upper()}]  "
                 f"unrealised P&L = -${abs(pos.unrealised_pnl)/100:.2f} "
                 f"(-{loss_pct*100:.1f}% of cost)  "
-                f"Consider closing or hedging this position."
+                f"Consider closing or hedging this position.{bot_note}"
             ),
-            data={
-                "cost_basis_usd":     round(pos.cost_basis / 100, 2),
-                "unrealised_pnl_usd": round(pos.unrealised_pnl / 100, 2),
-                "loss_pct":           round(loss_pct * 100, 1),
-                "stop_threshold_pct": POSITION_STOP_PCT * 100,
-                "mark_price":         pos.mark_price,
-                "avg_entry_price":    pos.avg_entry_price,
-                "contracts":          pos.contracts,
-            },
+            data=data,
         )]
 
     def _check_expiry(self, pos: Position) -> list[Alert]:

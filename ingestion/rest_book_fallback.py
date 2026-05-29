@@ -27,14 +27,26 @@ async def run_rest_book_fallback_loop(
     shutdown_event: asyncio.Event,
     poll_seconds: float | None = None,
     stale_seconds: float | None = None,
+    escalate_after_polls: int | None = None,
 ) -> None:
     """
     Periodically REST-refresh stale WS books and push ticks to the strategy.
 
     No-op when ``stale_seconds <= 0`` (feature disabled).
+
+    Escalation (WS-health alarm): when WS books stay stale for
+    ``escalate_after_polls`` consecutive polls, the socket is almost certainly
+    silently stalled (the REST refresh masks it for market data, but the WS-only
+    ``fill`` channel is still dead). We then force a WS reconnect so the fill
+    channel is re-established. ``escalate_after_polls <= 0`` disables escalation.
     """
     poll = poll_seconds if poll_seconds is not None else config.WS_BOOK_REST_FALLBACK_POLL_SECONDS
     stale = stale_seconds if stale_seconds is not None else config.WS_BOOK_REST_FALLBACK_SECONDS
+    escalate_after = (
+        escalate_after_polls
+        if escalate_after_polls is not None
+        else config.WS_STALE_ESCALATE_POLLS
+    )
 
     if stale <= 0:
         logger.info("REST book fallback disabled (WS_BOOK_REST_FALLBACK_SECONDS <= 0)")
@@ -44,14 +56,39 @@ async def run_rest_book_fallback_loop(
         "REST book fallback started",
         poll_seconds=poll,
         stale_seconds=stale,
+        escalate_after_polls=escalate_after,
         tickers=ingestor.tickers,
     )
 
+    consecutive_stale_polls = 0
     while not shutdown_event.is_set():
         try:
-            await _refresh_stale_books(ingestor, market_client, stale)
+            stale_count = await _refresh_stale_books(ingestor, market_client, stale)
         except Exception as exc:
             logger.warning(f"REST book fallback poll failed: {exc}")
+            stale_count = 0
+
+        if stale_count > 0:
+            consecutive_stale_polls += 1
+            if (
+                escalate_after > 0
+                and consecutive_stale_polls >= escalate_after
+                and hasattr(ingestor, "force_reconnect")
+            ):
+                logger.warning(
+                    "WS health alarm: books stale across consecutive polls — "
+                    "forcing WS reconnect to restore the fill channel",
+                    consecutive_stale_polls=consecutive_stale_polls,
+                    stale_tickers=stale_count,
+                    escalate_after_polls=escalate_after,
+                )
+                try:
+                    await ingestor.force_reconnect("rest_fallback_stale_escalation")
+                except Exception as exc:
+                    logger.warning(f"Forced WS reconnect failed: {exc}")
+                consecutive_stale_polls = 0
+        else:
+            consecutive_stale_polls = 0
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=poll)
@@ -64,14 +101,15 @@ async def _refresh_stale_books(
     ingestor: MarketIngestor,
     market_client: MarketClient,
     stale_seconds: float,
-) -> None:
+) -> int:
+    """Refresh stale WS books from REST. Returns the number of stale tickers."""
     refresh_tickers = [
         ticker
         for ticker in ingestor.tickers
         if book_needs_rest_refresh(ingestor.get_book(ticker), stale_seconds)
     ]
     if not refresh_tickers:
-        return
+        return 0
 
     for ticker in refresh_tickers:
         ws_book = ingestor.get_book(ticker)
@@ -111,6 +149,8 @@ async def _refresh_stale_books(
             spread=snap.spread,
         )
         ingestor.push_tick(ticker, event_type="rest_refresh")
+
+    return len(refresh_tickers)
 
 
 def make_market_client_from_session(

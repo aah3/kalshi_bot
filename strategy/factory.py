@@ -21,7 +21,12 @@ from strategy.green_up_strategy import (
 )
 from strategy.price_targets import parse_hedge_offset_cents
 from strategy.execution_price import EntryPriceMode
-from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
+from strategy.high_prob_strategy import (
+    HighProbStrategy,
+    PostFillMode,
+    parse_hp_stop_loss_cents,
+    parse_take_profit_style,
+)
 from strategy.kelly_strategy import KellyStrategy
 
 VALID_STRATEGIES = ("kelly", "green_up", "arb", "high_prob")
@@ -89,6 +94,12 @@ def build_strategy(
     hp_post_fill: str | None = None,
     hp_stake_cents: int | None = None,
     hp_take_profit_pct: float | None = None,
+    hp_take_profit_offset: int | None = None,
+    hp_stop_loss: float | None = None,
+    hp_stop_loss_cents: int | None = None,
+    hp_max_spread: int | None = None,
+    hp_tp_style: str | None = None,
+    hp_max_cycles: int | None = None,
     gu_entry_mode: str | None = None,
     gu_exit_mode: str | None = None,
     gu_limit_offset: int | None = None,
@@ -149,6 +160,14 @@ def build_strategy(
         post_key = (
             hp_post_fill or os.getenv("KALSHI_HP_POST_FILL", "hold")
         ).lower()
+        stop_loss_cents_raw = (
+            hp_stop_loss_cents
+            if hp_stop_loss_cents is not None
+            else os.getenv("KALSHI_HP_STOP_LOSS_CENTS")
+        )
+        tp_style_key = (
+            hp_tp_style or os.getenv("KALSHI_HP_TP_STYLE", "fixed")
+        ).lower()
         strat = HighProbStrategy(
             min_yes_ask=hp_min_yes_ask if hp_min_yes_ask is not None else _env_int(
                 "KALSHI_HP_MIN_YES_ASK", config.HP_MIN_YES_ASK
@@ -157,7 +176,11 @@ def build_strategy(
                 "KALSHI_HP_MAX_YES_ASK", config.HP_MAX_YES_ASK
             ),
             min_roi_pct=_env_float("KALSHI_HP_MIN_ROI_PCT", config.HP_MIN_ROI_PCT),
-            max_spread_cents=_env_int("KALSHI_HP_MAX_SPREAD", config.HP_MAX_SPREAD_CENTS),
+            max_spread_cents=(
+                hp_max_spread
+                if hp_max_spread is not None
+                else _env_int("KALSHI_HP_MAX_SPREAD", config.HP_MAX_SPREAD_CENTS)
+            ),
             stake_cents=hp_stake_cents if hp_stake_cents is not None else _env_int(
                 "KALSHI_HP_STAKE_CENTS", config.HP_STAKE_CENTS
             ),
@@ -165,15 +188,30 @@ def build_strategy(
             exit_price_mode=entry_map.get(exit_key, EntryPriceMode.PASSIVE),
             limit_offset_cents=_env_int("KALSHI_HP_LIMIT_OFFSET", config.HP_LIMIT_OFFSET),
             post_fill_mode=post_map.get(post_key, PostFillMode.HOLD_TO_SETTLEMENT),
-            take_profit_offset_cents=_env_int(
-                "KALSHI_HP_TAKE_PROFIT_OFFSET", config.HP_TAKE_PROFIT_OFFSET
+            take_profit_offset_cents=(
+                hp_take_profit_offset
+                if hp_take_profit_offset is not None
+                else _env_int(
+                    "KALSHI_HP_TAKE_PROFIT_OFFSET", config.HP_TAKE_PROFIT_OFFSET
+                )
             ),
             take_profit_pct=(
                 hp_take_profit_pct
                 if hp_take_profit_pct is not None
                 else getattr(config, "HP_TAKE_PROFIT_PCT", None)
             ),
-            stop_loss_pct=_env_float("KALSHI_HP_STOP_LOSS", config.HP_STOP_LOSS_PCT),
+            stop_loss_pct=(
+                hp_stop_loss
+                if hp_stop_loss is not None
+                else _env_float("KALSHI_HP_STOP_LOSS", config.HP_STOP_LOSS_PCT)
+            ),
+            stop_loss_cents=parse_hp_stop_loss_cents(stop_loss_cents_raw),
+            tp_style=parse_take_profit_style(tp_style_key),
+            max_cycles_per_ticker=(
+                hp_max_cycles
+                if hp_max_cycles is not None
+                else _env_int("KALSHI_HP_MAX_CYCLES_PER_TICKER", 0)
+            ),
             require_model_edge=os.getenv("KALSHI_HP_REQUIRE_MODEL_EDGE", "").lower()
             in ("1", "true", "yes"),
         )

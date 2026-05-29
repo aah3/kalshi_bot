@@ -183,10 +183,14 @@ FillCallback = Callable[[dict[str, Any]], None]
 
 def normalize_fill_message(data: dict[str, Any]) -> dict[str, Any]:
     """
-    Convert a Kalshi WebSocket ``fill`` channel payload to the internal fill dict
-    consumed by strategies, the circuit breaker, and the blotter hooks.
+    Convert a Kalshi ``fill`` payload to the internal fill dict consumed by
+    strategies, the circuit breaker, and the blotter hooks.
+
+    Handles both the WebSocket ``fill`` channel (``market_ticker``) and the REST
+    ``/portfolio/fills`` payload (``ticker``) so the same normaliser can be used
+    by the fill-reconciliation safety net.
     """
-    ticker = data.get("market_ticker", "")
+    ticker = data.get("market_ticker") or data.get("ticker") or ""
     side   = (data.get("purchased_side") or data.get("side") or "yes").lower()
 
     if data.get("yes_price_dollars") is not None:
@@ -251,6 +255,12 @@ class MarketIngestor:
         self._books: dict[str, OrderBook] = {t: OrderBook(ticker=t) for t in tickers}
         self._running     = False
         self._reconnect_delay = self._RECONNECT_BASE_DELAY
+        # Liveness watchdog state. A silently-stalled subscription keeps the socket
+        # open (pings still answered) but stops delivering deltas AND fills; we
+        # detect that by the absence of any inbound message and force a reconnect.
+        self._max_silence_seconds = config.WS_MAX_SILENCE_SECONDS
+        self._last_msg_monotonic: float = 0.0
+        self._ws: Any = None
 
     # ── Public ───────────────────────────────────────────────────────────────
 
@@ -303,8 +313,35 @@ class MarketIngestor:
 
     async def stop(self) -> None:
         self._running = False
+        await self._safe_close(self._ws)
+
+    async def force_reconnect(self, reason: str) -> None:
+        """
+        Tear down the current WebSocket so ``run()`` re-establishes it.
+
+        Called by external health checks (e.g. the REST book fallback) when the
+        socket appears alive but the subscription has gone silent. Closing the
+        socket ends the receive loop and triggers a fresh connect + re-subscribe,
+        which restores the ``fill`` channel.
+        """
+        if self._ws is None:
+            return
+        logger.warning("Forcing WebSocket reconnect", reason=reason, tickers=self._tickers)
+        await self._safe_close(self._ws)
 
     # ── Private ──────────────────────────────────────────────────────────────
+
+    def _mark_message(self) -> None:
+        self._last_msg_monotonic = time.monotonic()
+
+    @staticmethod
+    async def _safe_close(ws) -> None:
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
     async def _connect_and_stream(self) -> None:
         extra_headers: dict[str, str] = {}
@@ -313,7 +350,10 @@ class MarketIngestor:
 
         logger.info(f"Connecting to WebSocket: {config.WS_URL}", tickers=self._tickers)
 
-        ping_kw = {"ping_interval": config.WS_PING_INTERVAL_SECONDS}
+        ping_kw = {
+            "ping_interval": config.WS_PING_INTERVAL_SECONDS,
+            "ping_timeout":  config.WS_PING_TIMEOUT_SECONDS,
+        }
         header_attempts: list[dict[str, dict[str, str]]] = []
         if extra_headers:
             header_attempts.append({"additional_headers": extra_headers})
@@ -328,23 +368,52 @@ class MarketIngestor:
                     **ping_kw,
                     **header_kw,
                 ) as ws:
+                    self._ws = ws
+                    self._mark_message()
                     await self._subscribe(ws)
                     logger.info(
                         "WebSocket connected and subscribed",
                         tickers=self._tickers,
                         auth=bool(extra_headers),
                     )
-                    async for raw_message in ws:
-                        if not self._running:
-                            break
-                        await self._handle_message(raw_message)
+                    await self._stream_until_silent(ws)
                     return
             except TypeError as exc:
                 last_type_error = exc
                 continue
+            finally:
+                self._ws = None
 
         if last_type_error is not None:
             raise last_type_error
+
+    async def _stream_until_silent(self, ws) -> None:
+        """
+        Consume messages until the socket closes or goes silent past the watchdog
+        threshold. A silence timeout returns normally so ``run()`` reconnects
+        immediately (no backoff); a hard close propagates to ``run()``'s handler.
+        """
+        watchdog = self._max_silence_seconds
+        while self._running:
+            try:
+                if watchdog and watchdog > 0:
+                    raw_message = await asyncio.wait_for(ws.recv(), timeout=watchdog)
+                else:
+                    raw_message = await ws.recv()
+            except asyncio.TimeoutError:
+                silent_for = time.monotonic() - self._last_msg_monotonic
+                logger.warning(
+                    "WebSocket silent past watchdog threshold — forcing reconnect",
+                    silent_seconds=round(silent_for, 1),
+                    threshold_seconds=watchdog,
+                    tickers=self._tickers,
+                )
+                await self._safe_close(ws)
+                return
+            except ConnectionClosedOK:
+                return
+            self._mark_message()
+            await self._handle_message(raw_message)
 
     async def _subscribe(self, ws) -> None:
         """Send subscription commands for all tickers."""

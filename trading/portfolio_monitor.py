@@ -344,6 +344,10 @@ class PortfolioMonitor:
         snapshot = await self.refresh()
         return next((p for p in snapshot.positions if p.ticker == ticker), None)
 
+    async def fetch_fills(self, limit: int = 100) -> list[dict]:
+        """Public wrapper over ``GET /portfolio/fills`` for fill reconciliation."""
+        return await self._fetch_fills(limit=limit)
+
     # ── Private: API calls ────────────────────────────────────────────────────
 
     async def _fetch_positions(self) -> list[dict]:

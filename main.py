@@ -64,6 +64,7 @@ from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_p
 from monitoring.session_table import SessionMonitor
 from ingestion.rest_book_fallback import make_market_client_from_session, run_rest_book_fallback_loop
 from trading.auth_check import verify_portfolio_credentials
+from trading.fill_reconciler import run_fill_reconciliation_loop
 from trading.portfolio_monitor import PortfolioMonitor
 
 
@@ -103,6 +104,9 @@ _shutdown_event = asyncio.Event()
 # is linked to the correct blotter parent row.
 _active_trades: dict[str, str] = {}
 _pending_orders: dict[str, dict[str, Any]] = {}  # order_id -> submit context for blotter
+# Fill ids already applied, so the WebSocket and REST-reconciliation paths never
+# double-count the same fill.
+_processed_fill_ids: set[str] = set()
 _max_concurrent_positions: int = 0
 _live_rules = None
 _portfolio_snapshot = None  # latest exchange-backed snapshot (risk sync)
@@ -122,6 +126,23 @@ def _rollback_pending_entry(ticker: str) -> None:
         pos = _strategy.get_position(ticker)
         if pos and pos.state == PositionState.WATCHING:
             pos.state = PositionState.SCANNING
+
+    from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+
+    if isinstance(_strategy, HighProbStrategy):
+        pos = _strategy.get_position(ticker)
+        if pos and pos.state == HPState.WATCHING:
+            pos.state = HPState.SCANNING
+
+
+def _rollback_pending_exit(ticker: str, phase: str) -> None:
+    """If a high-prob TP/stop order was not accepted, allow retry on the next tick."""
+    if not _strategy:
+        return
+    from strategy.high_prob_strategy import HighProbStrategy
+
+    if isinstance(_strategy, HighProbStrategy):
+        _strategy.rollback_exit(ticker, phase)
 
 
 def _rollback_pending_stop(ticker: str) -> None:
@@ -155,20 +176,23 @@ async def _register_markets_for_tickers(
     from discovery.market_client import MarketClient
     from discovery.market_registry import register_markets
 
-    client = MarketClient(credentials, rate_limiter)
+    # MarketClient opens its aiohttp session in __aenter__; using it outside
+    # the async context leaves self._session=None and every get_market() fails
+    # with "must be used as async context manager".
     markets = []
-    for ticker in dict.fromkeys(tickers):
-        try:
-            summary = await client.get_market(ticker)
-        except Exception as exc:
-            logger.warning(
-                "Could not fetch market metadata",
-                ticker=ticker,
-                error=str(exc),
-            )
-            continue
-        if summary:
-            markets.append(summary)
+    async with MarketClient(credentials, rate_limiter) as client:
+        for ticker in dict.fromkeys(tickers):
+            try:
+                summary = await client.get_market(ticker)
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch market metadata",
+                    ticker=ticker,
+                    error=str(exc),
+                )
+                continue
+            if summary:
+                markets.append(summary)
     if markets:
         register_markets(markets)
         logger.info(
@@ -289,8 +313,13 @@ async def on_tick(tick: dict[str, Any]) -> None:
             _rollback_pending_entry(signal_obj.ticker)
         elif phase == "hedge":
             _rollback_pending_hedge(signal_obj.ticker)
-        elif phase == "stop_loss":
-            _rollback_pending_stop(signal_obj.ticker)
+        elif phase in ("exit", "stop_loss"):
+            from strategy.high_prob_strategy import HighProbStrategy
+
+            if isinstance(_strategy, HighProbStrategy):
+                _rollback_pending_exit(signal_obj.ticker, phase)
+            elif phase == "stop_loss":
+                _rollback_pending_stop(signal_obj.ticker)
         return
 
     # Determine trade_type from signal metadata
@@ -301,7 +330,31 @@ async def on_tick(tick: dict[str, Any]) -> None:
 
     cancel_order_id = meta.get("cancel_order_id")
     if cancel_order_id and _execution:
-        await _execution.cancel_order(cancel_order_id)
+        cancelled = await _execution.cancel_order(cancel_order_id)
+        if not cancelled:
+            # Never submit the replacement while the prior resting order may
+            # still be live — that is exactly how duplicate stop/hedge orders
+            # pile up (the abandoned-order leak seen in production). Roll back
+            # so the strategy retries the cancel+replace on a later tick.
+            logger.warning(
+                "Skipping replacement order: prior order cancel failed",
+                ticker=ticker,
+                cancel_order_id=cancel_order_id,
+                phase=phase,
+                strategy=signal_obj.strategy,
+            )
+            if phase in ("entry", "leg_1"):
+                _rollback_pending_entry(ticker)
+            elif phase == "hedge":
+                _rollback_pending_hedge(ticker)
+            elif phase in ("exit", "stop_loss"):
+                from strategy.high_prob_strategy import HighProbStrategy
+
+                if isinstance(_strategy, HighProbStrategy):
+                    _rollback_pending_exit(ticker, phase)
+                elif phase == "stop_loss":
+                    _rollback_pending_stop(ticker)
+            return
 
     # Submit order to exchange (blotter records on confirmed WS fill only)
     order = await _execution.submit_order(signal_obj)
@@ -310,8 +363,13 @@ async def on_tick(tick: dict[str, Any]) -> None:
             _rollback_pending_entry(ticker)
         elif phase == "hedge":
             _rollback_pending_hedge(ticker)
-        elif phase == "stop_loss":
-            _rollback_pending_stop(ticker)
+        elif phase in ("exit", "stop_loss"):
+            from strategy.high_prob_strategy import HighProbStrategy
+
+            if isinstance(_strategy, HighProbStrategy):
+                _rollback_pending_exit(ticker, phase)
+            elif phase == "stop_loss":
+                _rollback_pending_stop(ticker)
         return
 
     order_id = order.get("order_id", "")
@@ -326,9 +384,20 @@ async def on_tick(tick: dict[str, Any]) -> None:
 
     if phase == "stop_loss":
         from strategy.green_up_strategy import GreenUpStrategy
+        from strategy.high_prob_strategy import HighProbStrategy
 
         if isinstance(_strategy, GreenUpStrategy):
             _strategy.register_stop_order(
+                ticker, order_id, signal_obj.limit_price
+            )
+        elif isinstance(_strategy, HighProbStrategy):
+            _strategy.register_stop_order(ticker, order_id)
+
+    if phase == "exit":
+        from strategy.high_prob_strategy import HighProbStrategy
+
+        if isinstance(_strategy, HighProbStrategy):
+            _strategy.register_tp_order(
                 ticker, order_id, signal_obj.limit_price
             )
 
@@ -344,16 +413,44 @@ async def on_tick(tick: dict[str, Any]) -> None:
         _alert_manager.register_order(order_id, ticker)
 
 
-# ── Fill confirmed (WebSocket) ────────────────────────────────────────────────
+# ── Fill confirmed (WebSocket or REST reconciliation) ─────────────────────────
+
+def _fill_dedup_key(fill: dict[str, Any]) -> str:
+    """Stable identity for a fill so it is applied at most once."""
+    trade_id = fill.get("trade_id")
+    if trade_id:
+        return f"t:{trade_id}"
+    return "c:{}:{}:{}:{}".format(
+        fill.get("order_id", ""),
+        fill.get("contracts", 0),
+        fill.get("price", 0),
+        fill.get("action") or fill.get("side", ""),
+    )
+
+
+def _known_order_ids() -> set[str]:
+    """Order ids the bot is still tracking (awaiting a fill) for reconciliation."""
+    ids = set(_pending_orders.keys())
+    if _execution:
+        ids |= set(_execution.open_orders.keys())
+    return ids
+
 
 def on_fill_received(fill: dict[str, Any]) -> None:
     global _active_trades
     """
-    Called when a confirmed fill arrives via the WebSocket ``fill`` channel.
+    Called when a confirmed fill arrives — either from the WebSocket ``fill``
+    channel or from the REST fill-reconciliation safety net.
 
     Authoritative fill record — advances strategy state machines, updates risk,
-    blotter legs, and clears fill-timeout alerts.
+    blotter legs, and clears fill-timeout alerts. Idempotent: a fill already
+    applied (by id) is ignored, so the WS and REST paths can run concurrently.
     """
+    dedup_key = _fill_dedup_key(fill)
+    if dedup_key in _processed_fill_ids:
+        return
+    _processed_fill_ids.add(dedup_key)
+
     order_id = fill.get("order_id", "")
     ticker   = fill.get("ticker", "")
     pending  = _pending_orders.get(order_id)
@@ -412,10 +509,18 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
     if _strategy and _blotter and ticker:
         from strategy.green_up_strategy import GreenUpStrategy, PositionState
+        from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
 
         if isinstance(_strategy, GreenUpStrategy):
             pos = _strategy.get_position(ticker)
             if pos and pos.state in (PositionState.HEDGED, PositionState.STOPPED):
+                trade_id = _active_trades.pop(ticker, None)
+                if trade_id:
+                    _blotter.close_trade(trade_id, notes=pos.state.value)
+
+        if isinstance(_strategy, HighProbStrategy):
+            pos = _strategy.get_position(ticker)
+            if pos and pos.state == HPState.CLOSED:
                 trade_id = _active_trades.pop(ticker, None)
                 if trade_id:
                     _blotter.close_trade(trade_id, notes=pos.state.value)
@@ -695,6 +800,65 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "High-prob: take-profit as fraction of (entry+vig), e.g. 0.30 for 30%% "
             "(values >1 treated as percent); env KALSHI_HP_TAKE_PROFIT_PCT"
+        ),
+    )
+    parser.add_argument(
+        "--hp-take-profit-offset",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help=(
+            "High-prob: resting TP at entry + N cents when pct not set "
+            "(env KALSHI_HP_TAKE_PROFIT_OFFSET, default 3)"
+        ),
+    )
+    parser.add_argument(
+        "--hp-stop-loss",
+        type=float,
+        default=None,
+        help=(
+            "High-prob: stop when YES bid falls this fraction below entry "
+            "(default 0.12); ignored if --hp-stop-loss-cents is set. "
+            "Env KALSHI_HP_STOP_LOSS"
+        ),
+    )
+    parser.add_argument(
+        "--hp-stop-loss-cents",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help=(
+            "High-prob: stop when YES bid falls N cents below entry "
+            "(overrides --hp-stop-loss). Env KALSHI_HP_STOP_LOSS_CENTS"
+        ),
+    )
+    parser.add_argument(
+        "--hp-max-spread",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help=(
+            "High-prob: skip entry when YES spread exceeds N cents "
+            "(env KALSHI_HP_MAX_SPREAD, default 8)"
+        ),
+    )
+    parser.add_argument(
+        "--hp-tp-style",
+        default=None,
+        choices=["fixed", "at_ask"],
+        help=(
+            "High-prob: resting TP price — fixed (entry-based target) or "
+            "at_ask (legacy max with ask). Env KALSHI_HP_TP_STYLE"
+        ),
+    )
+    parser.add_argument(
+        "--hp-max-cycles",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "High-prob: max completed entry→exit cycles per ticker (0=unlimited). "
+            "Env KALSHI_HP_MAX_CYCLES_PER_TICKER"
         ),
     )
     parser.add_argument(
@@ -1188,6 +1352,12 @@ async def main(args: argparse.Namespace | None = None) -> None:
             hp_post_fill=args.hp_post_fill,
             hp_stake_cents=args.hp_stake_cents,
             hp_take_profit_pct=args.hp_take_profit_pct,
+            hp_take_profit_offset=args.hp_take_profit_offset,
+            hp_stop_loss=args.hp_stop_loss,
+            hp_stop_loss_cents=args.hp_stop_loss_cents,
+            hp_max_spread=args.hp_max_spread,
+            hp_tp_style=args.hp_tp_style,
+            hp_max_cycles=args.hp_max_cycles,
             hp_exit_mode=args.hp_exit_mode,
         )
     except ValueError as exc:
@@ -1293,6 +1463,18 @@ async def main(args: argparse.Namespace | None = None) -> None:
             ),
             name="rest_book_fallback",
         )
+    fill_reconcile_task = None
+    if config.FILL_RECONCILE_SECONDS > 0:
+        fill_reconcile_task = asyncio.create_task(
+            run_fill_reconciliation_loop(
+                fetch_fills=lambda: _portfolio_monitor.fetch_fills(limit=100),
+                on_fill=on_fill_received,
+                known_order_ids=_known_order_ids,
+                shutdown_event=_shutdown_event,
+                interval_seconds=config.FILL_RECONCILE_SECONDS,
+            ),
+            name="fill_reconciler",
+        )
     ingestor_task = asyncio.create_task(
         _ingestor.run(), name="market_ingestor"
     )
@@ -1396,11 +1578,13 @@ async def main(args: argparse.Namespace | None = None) -> None:
         except asyncio.CancelledError:
             pass
 
-    # Stop alert manager, portfolio risk sync, and REST book fallback
+    # Stop alert manager, portfolio risk sync, REST book fallback, and reconciler
     alert_task.cancel()
     risk_sync_task.cancel()
     if book_fallback_task:
         book_fallback_task.cancel()
+    if fill_reconcile_task:
+        fill_reconcile_task.cancel()
     try:
         await alert_task
     except asyncio.CancelledError:
@@ -1412,6 +1596,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
     if book_fallback_task:
         try:
             await book_fallback_task
+        except asyncio.CancelledError:
+            pass
+    if fill_reconcile_task:
+        try:
+            await fill_reconcile_task
         except asyncio.CancelledError:
             pass
 

@@ -350,13 +350,25 @@ Env block: [Green-up environment variables](#green-up-environment-variables) bel
 
 **Idea:** buy **YES** when the market already implies a high win probability (default ask **85–97¢**), accepting a smaller payout per contract. Entries must pass **fee-adjusted ROI** when `HP_USE_FEE_ADJUSTED_ROI=true` (default).
 
+Entry gates (min/max band, ROI, spread) apply to the **limit price** you will actually trade (`--hp-entry-mode`), not the raw ask — so passive entries at the bid are validated correctly.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--hp-min-yes-ask` / `--hp-max-yes-ask` | 85 / 97 | Entry window (cents) |
+| `--hp-min-yes-ask` / `--hp-max-yes-ask` | 85 / 97 | Entry window on **limit price** (cents) |
 | `--hp-stake-cents` | min(5000, cap) | Fixed stake per entry |
 | `--hp-entry-mode` / `--hp-exit-mode` | `passive` | Limit/market pricing |
 | `--hp-post-fill` | `hold` | After fill: hold, TP, stop, or both |
 | `--hp-take-profit-pct` | — | TP as fraction of (entry + vig), e.g. `0.30` |
+| `--hp-take-profit-offset` | 3 | TP at entry + N¢ when pct not set |
+| `--hp-tp-style` | `fixed` | `fixed` = entry-based TP; `at_ask` = max(TP, ask) |
+| `--hp-stop-loss` | 0.12 | Stop fraction below entry (ignored if cents set) |
+| `--hp-stop-loss-cents` | — | Stop N¢ below entry (overrides fraction) |
+| `--hp-max-spread` | 8 | Skip entry when spread exceeds N¢ |
+| `--hp-max-cycles` | 0 | Max completed entry→exit cycles per ticker (`0` = unlimited) |
+
+**Take-profit / stop (per fill):** computed on entry fill from actual fill price — offset, pct×(entry+vig), or cent stop via shared `price_targets`. Stop-loss while a resting TP is on book **cancels the TP order** before submitting the stop sell.
+
+**Re-entry:** after an exit fill the ticker returns to `scanning` and may enter again when the book qualifies, up to `--hp-max-cycles` (same pattern as green_up).
 
 **Entry / exit modes:**
 
@@ -384,15 +396,16 @@ Stop-loss exits use `cross_spread` when exit mode is `passive`, so stops cross t
 # Preview Politics high-ROI candidates
 python main.py --discover --discover-category Politics --strategy high_prob --discover-only
 
-# Trade Sports with resting take-profit
+# Passive entry with cent stop and fixed resting TP
+python main.py --discover --discover-category Sports --strategy high_prob \
+  --hp-entry-mode passive --hp-post-fill resting_take_profit \
+  --hp-take-profit-offset 3 --hp-stop-loss-cents 10 --hp-max-spread 8 \
+  --max-concurrent-positions 2 --monitor-interval 30
+
+# Percent take-profit (legacy at_ask TP style available via --hp-tp-style at_ask)
 python main.py --discover --discover-category Sports --strategy high_prob \
   --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit \
   --hp-take-profit-pct 0.25 --max-concurrent-positions 2 --monitor-interval 30
-
-# Kelly strategy with discovery (still need model probs)
-python main.py --discover --discover-category Sports --strategy kelly \
-  --max-concurrent-positions 2 --monitor-interval 30 \
-  --model-prob SOME-TICKER:0.72
 ```
 
 Production script: `scripts/run_high_prob_prod.ps1` (fixed $1 stake, isolated prod DB/log).
@@ -849,6 +862,10 @@ kalshi_bot/
 | `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS` | 30 | Circuit breaker portfolio refresh |
 | `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS` | 60 | REST refresh when WS book is older than this (0 = off) |
 | `KALSHI_WS_BOOK_REST_FALLBACK_POLL_SECONDS` | 15 | How often to check for stale WS books |
+| `KALSHI_WS_MAX_SILENCE_SECONDS` | 45 | Force WS reconnect if no message of any type arrives in this window (0 = off) |
+| `KALSHI_WS_PING_TIMEOUT_SECONDS` | 10 | Pong deadline passed to the WS client (detects dead sockets) |
+| `KALSHI_WS_STALE_ESCALATE_POLLS` | 3 | Consecutive stale REST-fallback polls before forcing a WS reconnect (0 = off) |
+| `KALSHI_FILL_RECONCILE_SECONDS` | 20 | Poll `/portfolio/fills` to recover fills the WS missed (0 = off) |
 
 ### Green-up environment variables
 
@@ -881,7 +898,13 @@ KALSHI_HP_USE_FEE_ADJUSTED_ROI=true
 KALSHI_HP_ENTRY_MODE=passive
 KALSHI_HP_EXIT_MODE=passive
 KALSHI_HP_POST_FILL=resting_take_profit
-KALSHI_HP_TAKE_PROFIT_PCT=0.30
+KALSHI_HP_TAKE_PROFIT_OFFSET=3
+KALSHI_HP_TAKE_PROFIT_PCT=
+KALSHI_HP_TP_STYLE=fixed
+KALSHI_HP_STOP_LOSS=0.12
+KALSHI_HP_STOP_LOSS_CENTS=
+KALSHI_HP_MAX_SPREAD=8
+KALSHI_HP_MAX_CYCLES_PER_TICKER=0
 KALSHI_HP_STAKE_CENTS=5000
 
 KALSHI_DISCOVER=true

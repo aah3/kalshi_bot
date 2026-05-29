@@ -21,6 +21,7 @@ from metrics.blotter import Blotter
 from metrics.calculator import MetricsCalculator
 from strategy.base_strategy import BaseStrategy
 from strategy.green_up_strategy import GreenUpStrategy
+from strategy.high_prob_strategy import HighProbStrategy
 from trading.portfolio_monitor import PortfolioMonitor, PortfolioSnapshot
 
 
@@ -73,6 +74,34 @@ def _action_hint(
         return "profit locked"
     if state == "stopped":
         return "stopped out"
+    return state
+
+
+def _hp_action_hint(
+    state: str,
+    bid: int | None,
+    tp_at: int,
+    stop_at: int,
+    *,
+    min_ask: int | None = None,
+    max_ask: int | None = None,
+) -> str:
+    if state in ("scanning", "watching"):
+        if min_ask is not None and max_ask is not None:
+            return f"watch entry ({min_ask}-{max_ask}c limit)"
+        return "watch entry"
+    if state == "entered":
+        if bid is not None and stop_at and bid <= stop_at:
+            return "STOP zone"
+        if tp_at:
+            return f"hold -> TP @{tp_at}c"
+        return "hold"
+    if state == "exit_pending":
+        if bid is not None and stop_at and bid <= stop_at:
+            return "STOP (cancel TP)"
+        return "resting TP on book"
+    if state == "closed":
+        return "cycle done"
     return state
 
 
@@ -131,6 +160,14 @@ def build_ticker_rows(
     green: GreenUpStrategy | None = (
         strategy if isinstance(strategy, GreenUpStrategy) else None
     )
+    """Merge order book, strategy state, and strategy-specific previews per ticker."""
+    rows: list[dict[str, Any]] = []
+    green: GreenUpStrategy | None = (
+        strategy if isinstance(strategy, GreenUpStrategy) else None
+    )
+    high_prob: HighProbStrategy | None = (
+        strategy if isinstance(strategy, HighProbStrategy) else None
+    )
     summaries: dict[str, dict] = {}
     if strategy and hasattr(strategy, "summary"):
         for s in strategy.summary():
@@ -142,23 +179,55 @@ def build_ticker_rows(
         )
 
         s = summaries.get(ticker, {})
-        state = s.get("state", "—")
-        entry_max = green._entry_max_price if green else None
-        hedge_offset = green._hedge_offset_cents if green else None
-        hedge_style = green._hedge_style.value if green else None
-        hedge_at = s.get("hedge_trigger_price") or (
-            green._hedge_trigger_price if green else 68
-        )
-        stop_at = s.get("stop_trigger_price") or 0
+        if not s and high_prob:
+            pos = high_prob.get_position(ticker)
+            if pos:
+                state = pos.state.value
+            else:
+                state = "—"
+        else:
+            state = s.get("state", "—")
 
-        preview_locked: float | None = None
-        preview_hedge: int | None = None
-        if green and state == "entered" and bid is not None:
-            pos = green.get_position(ticker)
-            if pos and pos.entry_price_cents > 0:
-                no_px = 100 - bid
-                if no_px > 0:
-                    preview_hedge, preview_locked = pos.compute_full_green(no_px)
+        hedge_at = stop_at = 0
+        action = state
+
+        if green:
+            entry_max = green._entry_max_price
+            hedge_offset = green._hedge_offset_cents
+            hedge_style = green._hedge_style.value
+            hedge_at = s.get("hedge_trigger_price") or green._hedge_trigger_price
+            stop_at = s.get("stop_trigger_price") or 0
+            preview_locked: float | None = None
+            if state == "entered" and bid is not None:
+                pos = green.get_position(ticker)
+                if pos and pos.entry_price_cents > 0:
+                    no_px = 100 - bid
+                    if no_px > 0:
+                        _, preview_locked = pos.compute_full_green(no_px)
+            action = _action_hint(
+                state if state != "—" else "watching",
+                bid, hedge_at, stop_at, entry_max,
+                hedge_offset=hedge_offset,
+                hedge_style=hedge_style,
+            )
+            locked_usd = s.get("locked_profit_usd") or (
+                round(preview_locked / 100, 2) if preview_locked else None
+            )
+        elif high_prob:
+            tp_at = s.get("take_profit_price") or s.get("tp_limit_price") or 0
+            stop_at = s.get("stop_trigger_price") or 0
+            hedge_at = tp_at
+            action = _hp_action_hint(
+                state if state != "—" else "scanning",
+                bid, tp_at, stop_at,
+                min_ask=high_prob._min_yes_ask,
+                max_ask=high_prob._max_yes_ask,
+            )
+            locked_usd = None
+        else:
+            hedge_at = s.get("hedge_trigger_price") or 0
+            stop_at = s.get("stop_trigger_price") or 0
+            locked_usd = s.get("locked_profit_usd")
 
         rows.append({
             "ticker":      ticker,
@@ -172,19 +241,10 @@ def build_ticker_rows(
             "stake_usd":   (s.get("entry_stake_cents") or 0) / 100,
             "hedge_at":    hedge_at,
             "stop_at":     stop_at,
-            "locked_usd":  s.get("locked_profit_usd") or (
-                round(preview_locked / 100, 2) if preview_locked else None
-            ),
-            "preview_locked_usd": (
-                round(preview_locked / 100, 2) if preview_locked else None
-            ),
+            "locked_usd":  locked_usd,
+            "preview_locked_usd": locked_usd,
             "time_s":      s.get("time_in_trade_s"),
-            "action":      _action_hint(
-                state if state != "—" else "watching",
-                bid, hedge_at, stop_at, entry_max,
-                hedge_offset=hedge_offset,
-                hedge_style=hedge_style,
-            ),
+            "action":      action,
         })
 
     return rows

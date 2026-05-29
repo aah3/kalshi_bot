@@ -252,6 +252,80 @@ def test_stop_loss_fires_when_bid_drops_enough():
     assert strat.get_position("T5").state == PositionState.STOPPING
 
 
+def test_passive_exit_stop_crosses_spread_to_bid():
+    """Regression: a passive exit must still cross to the bid for the stop leg.
+
+    With PASSIVE pricing a sell rests at the ask and never fills in a falling
+    book, so the loss is never capped. The stop must escalate to cross-spread
+    (sell at the bid) so it actually exits.
+    """
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_trigger_price=100,
+        stop_loss_cents=12,
+        exit_price_mode=EntryPriceMode.PASSIVE,
+    )
+    strat.add_watch_ticker("T18")
+    pos = strat.get_position("T18")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 26
+    pos.entry_stake_cents = 26
+    pos.entry_contracts = 1
+    pos.stop_loss_trigger_price = stop_loss_trigger_price(26, 12)  # 14
+
+    sig = strat.evaluate(_tick(14, 15, "T18"))
+    assert sig is not None
+    assert sig.meta.get("phase") == "stop_loss"
+    assert sig.meta.get("action") == "sell"
+    assert sig.meta.get("time_in_force") == "gtc"
+    # Crosses to the bid (14), NOT resting at the ask (15).
+    assert sig.limit_price == 14
+
+
+def test_passive_resting_stop_reprices_to_bid():
+    """A repriced resting stop in passive mode must also chase the bid, not the ask."""
+    strat = GreenUpStrategy(
+        stop_loss_cents=12,
+        exit_price_mode=EntryPriceMode.PASSIVE,
+    )
+    strat.add_watch_ticker("T19")
+    pos = strat.get_position("T19")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 24
+    pos.entry_stake_cents = 24
+    pos.entry_contracts = 1
+    pos.stop_order_id = "ord-9"
+    pos.stop_limit_price = 12
+
+    sig = strat.evaluate(_tick(8, 9, "T19"))
+    assert sig is not None
+    assert sig.limit_price == 8
+    assert sig.meta.get("cancel_order_id") == "ord-9"
+
+
+def test_explicit_maker_exit_mode_is_preserved_for_stop():
+    """An operator who deliberately picks a non-passive exit mode keeps it."""
+    strat = GreenUpStrategy(
+        entry_max_price=99,
+        hedge_trigger_price=100,
+        stop_loss_cents=12,
+        exit_price_mode=EntryPriceMode.LIMIT_AT_MID,
+    )
+    strat.add_watch_ticker("T20")
+    pos = strat.get_position("T20")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 26
+    pos.entry_stake_cents = 26
+    pos.entry_contracts = 1
+    pos.stop_loss_trigger_price = stop_loss_trigger_price(26, 12)  # 14
+
+    sig = strat.evaluate(_tick(10, 16, "T20"))
+    assert sig is not None
+    assert sig.meta.get("phase") == "stop_loss"
+    # limit_at_mid -> (10 + 16) // 2 == 13, untouched by the passive escalation.
+    assert sig.limit_price == 13
+
+
 def test_entry_fill_sets_stop_trigger_from_cents():
     strat = GreenUpStrategy(
         entry_max_price=25,
@@ -416,6 +490,31 @@ def test_second_cycle_uses_new_entry_for_relative_hedge():
     assert new_pos.hedge_trigger_price == 36
 
 
+def test_entry_size_rounds_to_whole_contracts(monkeypatch):
+    """Entry stake must be an exact multiple of the entry price so the logged
+    preview (hedge size / locked profit) matches what actually fills. A
+    sub-contract Kelly stake floors to one contract."""
+    monkeypatch.setattr(cfg, "MAX_POSITION_CENTS", 100)
+    monkeypatch.setattr(cfg, "KELLY_DIVISOR", 4)
+
+    strat = GreenUpStrategy(
+        entry_max_price=None,
+        hedge_offset_cents=26,
+        max_spread_cents=8,
+        entry_price_mode=EntryPriceMode.MARKET,   # limit_price = best_ask
+    )
+    strat.add_watch_ticker("T25")
+    sig = strat.evaluate(_tick(20, 22, "T25"))
+    assert sig is not None
+    assert sig.limit_price == 22
+    # Kelly wants < 1 contract here -> floored to 1 contract == 22c.
+    assert sig.size_cents == 22
+    assert sig.size_cents % sig.limit_price == 0
+    # Preview economics now reflect the real 22c stake (full-green at trigger 48).
+    assert sig.meta["preview_locked_profit_cents"] == 26
+    assert strat.get_position("T25").entry_stake_cents == 22
+
+
 def test_entry_skipped_when_spread_too_wide():
     strat = GreenUpStrategy(
         entry_max_price=99,
@@ -531,4 +630,119 @@ def test_stop_while_resting_hedge_cancels_hedge_order():
     assert sig.meta.get("phase") == "stop_loss"
     assert sig.meta.get("cancel_order_id") == "hedge-2"
     assert pos.hedge_order_id == ""
+
+
+def test_rollback_stop_reverts_to_entered_on_first_fire_failure():
+    """First stop fire never registered an order -> re-arm via ENTERED."""
+    strat = GreenUpStrategy(stop_loss_cents=10)
+    strat.add_watch_ticker("T21")
+    pos = strat.get_position("T21")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.stop_order_id = ""
+    pos.stop_limit_price = 0
+
+    strat.rollback_stop("T21")
+    assert pos.state == PositionState.ENTERED
+
+
+def test_rollback_stop_keeps_resting_order_on_reprice_failure():
+    """A live resting stop must be retained so retries target the same order,
+    not stack a duplicate sell (the production order-leak fix)."""
+    strat = GreenUpStrategy(stop_loss_cents=10)
+    strat.add_watch_ticker("T22")
+    pos = strat.get_position("T22")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.stop_order_id = "live-stop-1"
+    pos.stop_limit_price = 9
+
+    strat.rollback_stop("T22")
+    assert pos.state == PositionState.STOPPING
+    assert pos.stop_order_id == "live-stop-1"
+    assert pos.stop_limit_price == 9
+
+
+def test_first_stop_logs_warning_even_when_cancelling_hedge(monkeypatch):
+    """Regression: the first stop fire must log the WARNING even when it also
+    cancels a resting hedge; only true reprices use the quieter info line."""
+    import strategy.green_up_strategy as gu
+
+    class _Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            def _fn(*args, **kwargs):
+                self.calls.append((name, args[0] if args else "", kwargs))
+            return _fn
+
+    rec = _Recorder()
+    monkeypatch.setattr(gu, "logger", rec)
+
+    strat = gu.GreenUpStrategy(
+        stop_loss_cents=10,
+        hedge_style=gu.HedgeStyle.RESTING,
+        exit_price_mode=EntryPriceMode.PASSIVE,
+    )
+    strat.add_watch_ticker("T23")
+    pos = strat.get_position("T23")
+    pos.state = PositionState.HEDGING
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.entry_contracts = 1
+    pos.hedge_trigger_price = 51
+    pos.hedge_order_id = "hedge-9"
+    pos.hedge_limit_price = 49
+    pos.stop_loss_trigger_price = 15
+
+    sig = strat.evaluate(_tick(14, 15, "T23"))
+    assert sig is not None
+    assert sig.meta.get("cancel_order_id") == "hedge-9"
+    assert any(
+        name == "warning" and "stop-loss triggered" in msg
+        for name, msg, _ in rec.calls
+    )
+    assert not any(
+        name == "info" and "repricing" in msg for name, msg, _ in rec.calls
+    )
+
+
+def test_reprice_logs_info_not_warning(monkeypatch):
+    """A genuine reprice of an on-book stop logs info, not the trigger warning."""
+    import strategy.green_up_strategy as gu
+
+    class _Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            def _fn(*args, **kwargs):
+                self.calls.append((name, args[0] if args else "", kwargs))
+            return _fn
+
+    rec = _Recorder()
+    monkeypatch.setattr(gu, "logger", rec)
+
+    strat = gu.GreenUpStrategy(
+        stop_loss_cents=12,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T24")
+    pos = strat.get_position("T24")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 24
+    pos.entry_stake_cents = 24
+    pos.entry_contracts = 1
+    pos.stop_order_id = "ord-7"
+    pos.stop_limit_price = 10
+
+    sig = strat.evaluate(_tick(8, 9, "T24"))
+    assert sig is not None
+    assert any(
+        name == "info" and "repricing" in msg for name, msg, _ in rec.calls
+    )
+    assert not any(name == "warning" for name, _, _ in rec.calls)
 

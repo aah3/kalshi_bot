@@ -253,6 +253,14 @@ class ReplayEngine:
                 hp_entry_mode=self._strat_kwargs.get("hp_entry_mode"),
                 hp_post_fill=self._strat_kwargs.get("hp_post_fill"),
                 hp_stake_cents=self._strat_kwargs.get("hp_stake_cents"),
+                hp_take_profit_pct=self._strat_kwargs.get("hp_take_profit_pct"),
+                hp_take_profit_offset=self._strat_kwargs.get("hp_take_profit_offset"),
+                hp_stop_loss=self._strat_kwargs.get("hp_stop_loss"),
+                hp_stop_loss_cents=self._strat_kwargs.get("hp_stop_loss_cents"),
+                hp_max_spread=self._strat_kwargs.get("hp_max_spread"),
+                hp_tp_style=self._strat_kwargs.get("hp_tp_style"),
+                hp_max_cycles=self._strat_kwargs.get("hp_max_cycles"),
+                hp_exit_mode=self._strat_kwargs.get("hp_exit_mode"),
             )
 
         else:
@@ -638,6 +646,19 @@ async def _run_replay(args) -> None:
             "gu_no_entry_max": getattr(args, "gu_no_entry_max", False),
             "gu_hedge_style":  getattr(args, "gu_hedge_style", None),
             "gu_max_cycles":   getattr(args, "gu_max_cycles", None),
+            "hp_min_yes_ask":  getattr(args, "hp_min_yes_ask", None),
+            "hp_max_yes_ask":  getattr(args, "hp_max_yes_ask", None),
+            "hp_entry_mode":   getattr(args, "hp_entry_mode", None),
+            "hp_exit_mode":    getattr(args, "hp_exit_mode", None),
+            "hp_post_fill":    getattr(args, "hp_post_fill", None),
+            "hp_stake_cents":  getattr(args, "hp_stake_cents", None),
+            "hp_take_profit_pct": getattr(args, "hp_take_profit_pct", None),
+            "hp_take_profit_offset": getattr(args, "hp_take_profit_offset", None),
+            "hp_stop_loss":    getattr(args, "hp_stop_loss", None),
+            "hp_stop_loss_cents": getattr(args, "hp_stop_loss_cents", None),
+            "hp_max_spread":   getattr(args, "hp_max_spread", None),
+            "hp_tp_style":     getattr(args, "hp_tp_style", None),
+            "hp_max_cycles":   getattr(args, "hp_max_cycles", None),
             "tickers":         tickers,
             "comp_pairs":      getattr(args, "comp_pairs", []) or [],
         },
@@ -747,6 +768,64 @@ p_rep.add_argument(
 p_rep.add_argument(
     "--gu-max-cycles",
     type=int, default=None, dest="gu_max_cycles",
+)
+p_rep.add_argument(
+    "--hp-min-yes-ask", type=int, default=None, dest="hp_min_yes_ask",
+)
+p_rep.add_argument(
+    "--hp-max-yes-ask", type=int, default=None, dest="hp_max_yes_ask",
+)
+p_rep.add_argument(
+    "--hp-entry-mode",
+    default=None,
+    dest="hp_entry_mode",
+    choices=[
+        "passive", "cross_spread", "market",
+        "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+    ],
+)
+p_rep.add_argument(
+    "--hp-exit-mode",
+    default=None,
+    dest="hp_exit_mode",
+    choices=[
+        "passive", "cross_spread", "market",
+        "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+    ],
+)
+p_rep.add_argument(
+    "--hp-post-fill",
+    default=None,
+    dest="hp_post_fill",
+    choices=["hold", "resting_take_profit", "resting_stop", "tp_and_stop"],
+)
+p_rep.add_argument(
+    "--hp-stake-cents", type=int, default=None, dest="hp_stake_cents",
+)
+p_rep.add_argument(
+    "--hp-take-profit-pct", type=float, default=None, dest="hp_take_profit_pct",
+)
+p_rep.add_argument(
+    "--hp-take-profit-offset", type=int, default=None, dest="hp_take_profit_offset",
+)
+p_rep.add_argument(
+    "--hp-stop-loss", type=float, default=None, dest="hp_stop_loss",
+)
+p_rep.add_argument(
+    "--hp-stop-loss-cents", type=int, default=None, dest="hp_stop_loss_cents",
+)
+p_rep.add_argument(
+    "--hp-max-spread", type=int, default=None, dest="hp_max_spread",
+)
+p_rep.add_argument(
+    "--hp-tp-style",
+    default=None,
+    dest="hp_tp_style",
+    choices=["fixed", "at_ask"],
+)
+p_rep.add_argument(
+    "--hp-max-cycles",
+    type=int, default=None, dest="hp_max_cycles",
 )
 p_rep.add_argument("--comp-pairs",    nargs="*",  metavar="T1:T2",
                    help="Complementary arb pairs e.g. PRES-DEM:PRES-REP")

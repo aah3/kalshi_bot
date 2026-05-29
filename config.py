@@ -190,6 +190,24 @@ WS_BOOK_REST_FALLBACK_SECONDS: float = float(
 WS_BOOK_REST_FALLBACK_POLL_SECONDS: float = float(
     os.getenv("KALSHI_WS_BOOK_REST_FALLBACK_POLL_SECONDS", "15")
 )
+# WS liveness watchdog: if no message of ANY type arrives within this window, the
+# socket is treated as silently stalled and force-reconnected (0 = off). This is
+# the primary guard against a half-open / server-silenced WS that still answers
+# pings but stops delivering order-book deltas AND user fills.
+WS_MAX_SILENCE_SECONDS: float = float(
+    os.getenv("KALSHI_WS_MAX_SILENCE_SECONDS", "45")
+)
+# Explicit pong deadline passed to websockets.connect (detects truly dead sockets).
+WS_PING_TIMEOUT_SECONDS: int = int(os.getenv("KALSHI_WS_PING_TIMEOUT_SECONDS", "10"))
+# Consecutive REST-fallback polls with stale WS books before forcing a WS
+# reconnect (escalation path, 0 = off). With the default 15s poll, 3 polls ≈ 45s.
+WS_STALE_ESCALATE_POLLS: int = int(os.getenv("KALSHI_WS_STALE_ESCALATE_POLLS", "3"))
+# Fill reconciliation: poll /portfolio/fills to recover fills the WS missed and
+# re-drive strategy/blotter/risk state (0 = off). Defense-in-depth for the
+# WS-only fill path — without it a missed fill leaves a position unmanaged.
+FILL_RECONCILE_SECONDS: float = float(
+    os.getenv("KALSHI_FILL_RECONCILE_SECONDS", "20")
+)
 
 # ─── Risk / Circuit Breaker ───────────────────────────────────────────────────
 
@@ -215,7 +233,7 @@ DAILY_LOSS_LIMIT_CENTS: int = _resolve_env_int(
     "DAILY_LOSS_LIMIT_CENTS",
     "KALSHI_DAILY_LOSS_LIMIT_CENTS",
     demo_default=50_000,
-    prod_default=1_000,
+    prod_default=500,
 )
 
 LIVE_TRADING_ONLY: bool = os.getenv("KALSHI_LIVE_ONLY", "true").strip().lower() in (

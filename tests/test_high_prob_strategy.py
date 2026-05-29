@@ -56,7 +56,12 @@ from discovery.market_math import (
     vig_proxy_cents,
 )
 from strategy.execution_price import EntryPriceMode, resolve_yes_buy
-from strategy.high_prob_strategy import HighProbStrategy, PostFillMode
+from strategy.high_prob_strategy import (
+    HighProbStrategy,
+    PostFillMode,
+    PositionState,
+    TakeProfitStyle,
+)
 
 
 def _tick(bid: int, ask: int, ticker: str = "TEST-MKT") -> dict:
@@ -150,6 +155,27 @@ class TestHighProbEntry:
         self.strat.evaluate(_tick(88, 90))
         assert self.strat.evaluate(_tick(88, 90)) is None
 
+    def test_passive_entry_rejects_when_limit_below_min_ask(self):
+        """Entry band and ROI apply to limit price (bid), not raw ask."""
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            entry_price_mode=EntryPriceMode.PASSIVE,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        assert strat.evaluate(_tick(82, 90)) is None
+
+    def test_passive_entry_allowed_when_bid_in_band(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            entry_price_mode=EntryPriceMode.PASSIVE,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        sig = strat.evaluate(_tick(88, 90))
+        assert sig is not None
+        assert sig.limit_price == 88
+
 
 class TestHighProbExit:
     def test_resting_take_profit_after_fill(self):
@@ -220,6 +246,157 @@ class TestHighProbExit:
         assert exit_sig is not None
         assert exit_sig.meta["phase"] == "stop_loss"
         assert exit_sig.meta["time_in_force"] == "ioc"
+
+    def test_stop_loss_cents_on_fill(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            stop_loss_cents=10,
+            post_fill_mode=PostFillMode.RESTING_STOP_LOSS,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "ord-2",
+        })
+        assert strat._positions["TEST-MKT"].stop_loss_trigger == 80
+
+    def test_resting_tp_fixed_keeps_computed_price_below_ask(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            entry_price_mode=EntryPriceMode.LIMIT_AT_ASK,
+            post_fill_mode=PostFillMode.RESTING_TAKE_PROFIT,
+            take_profit_offset_cents=3,
+            tp_style=TakeProfitStyle.FIXED,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "ord-3",
+        })
+        exit_sig = strat.evaluate(_tick(91, 96))
+        assert exit_sig is not None
+        assert exit_sig.limit_price == 93
+
+    def test_resting_tp_at_ask_bumps_to_current_ask(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            entry_price_mode=EntryPriceMode.LIMIT_AT_ASK,
+            post_fill_mode=PostFillMode.RESTING_TAKE_PROFIT,
+            take_profit_offset_cents=3,
+            tp_style=TakeProfitStyle.AT_ASK,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "ord-4",
+        })
+        exit_sig = strat.evaluate(_tick(91, 96))
+        assert exit_sig is not None
+        assert exit_sig.limit_price == 96
+
+
+class TestHighProbCycles:
+    def test_unlimited_cycles_reenters_after_exit(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            max_cycles_per_ticker=0,
+            entry_price_mode=EntryPriceMode.LIMIT_AT_ASK,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "e1",
+        })
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "action": "sell",
+            "price": 93,
+            "size_cents": 4_650,
+            "order_id": "x1",
+        })
+        assert strat.get_position("TEST-MKT").state == PositionState.CLOSED
+        sig = strat.evaluate(_tick(88, 90))
+        assert sig is not None
+        assert strat.get_position("TEST-MKT").state == PositionState.WATCHING
+
+    def test_max_cycles_blocks_reentry(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            max_cycles_per_ticker=1,
+            entry_price_mode=EntryPriceMode.LIMIT_AT_ASK,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "e1",
+        })
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "action": "sell",
+            "price": 93,
+            "size_cents": 4_650,
+            "order_id": "x1",
+        })
+        assert strat.get_position("TEST-MKT").cycles_completed == 1
+        assert strat.evaluate(_tick(88, 90)) is None
+
+
+class TestHighProbStopCancelsTp:
+    def test_stop_while_resting_tp_cancels_tp_order(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            post_fill_mode=PostFillMode.TAKE_PROFIT_AND_STOP,
+            stop_loss_cents=10,
+            take_profit_offset_cents=3,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "e2",
+        })
+        strat.evaluate(_tick(91, 93))
+        pos = strat.get_position("TEST-MKT")
+        pos.tp_order_id = "tp-1"
+        pos.tp_limit_price = 93
+        pos.state = PositionState.EXIT_PENDING
+
+        sig = strat.evaluate(_tick(79, 81))
+        assert sig is not None
+        assert sig.meta.get("phase") == "stop_loss"
+        assert sig.meta.get("cancel_order_id") == "tp-1"
+        assert pos.tp_order_id == ""
 
 
 if __name__ == "__main__":
