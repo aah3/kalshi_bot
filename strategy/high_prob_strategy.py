@@ -384,22 +384,39 @@ class HighProbStrategy(BaseStrategy):
                 strategy=self.name,
             )
 
-        elif pos.state in (PositionState.ENTERED, PositionState.EXIT_PENDING) \
+        # Exit fill — flatten the YES position.
+        #
+        # Kalshi may report a YES-sell on the contra ("no") side and often omits
+        # ``action``, so the EXIT_PENDING path must not depend on side labels.
+        # While an exit is working, match by resting order id when known.
+        elif pos.state == PositionState.EXIT_PENDING:
+            known_ids = [oid for oid in (pos.tp_order_id, pos.stop_order_id) if oid]
+            if known_ids and order_id and order_id not in known_ids:
+                return
+            self._apply_exit_fill(pos, price)
+
+        elif pos.state == PositionState.ENTERED \
                 and side == Side.YES.value \
                 and (fill.get("action") == "sell" or fill.get("is_sell")):
-            pos.cycles_completed += 1
-            pos.state = PositionState.CLOSED
-            pos.tp_order_id    = ""
-            pos.tp_limit_price = 0
-            pos.stop_order_id  = ""
-            logger.info(
-                "HighProb: exit filled",
-                ticker=ticker,
-                exit_price_cents=price,
-                entry_price_cents=pos.entry_price_cents,
-                cycles_completed=pos.cycles_completed,
-                strategy=self.name,
-            )
+            self._apply_exit_fill(pos, price)
+
+    def _apply_exit_fill(self, pos: HighProbPosition, exit_price: int) -> None:
+        """Mark round-trip complete after a confirmed exit/stop fill."""
+        pos.cycles_completed += 1
+        pos.state = PositionState.CLOSED
+        pos.tp_order_id    = ""
+        pos.tp_limit_price = 0
+        pos.stop_order_id  = ""
+        pos.tp_order_sent     = False
+        pos.stop_order_sent   = False
+        logger.info(
+            "HighProb: exit filled",
+            ticker=pos.ticker,
+            exit_price_cents=exit_price,
+            entry_price_cents=pos.entry_price_cents,
+            cycles_completed=pos.cycles_completed,
+            strategy=self.name,
+        )
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 

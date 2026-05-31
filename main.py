@@ -516,6 +516,7 @@ def on_fill_received(fill: dict[str, Any]) -> None:
     order_id = fill.get("order_id", "")
     ticker   = fill.get("ticker", "")
     pending  = _pending_orders.get(order_id)
+    exit_entry_closed = False
 
     if _strategy:
         _strategy.on_fill(fill)
@@ -541,7 +542,7 @@ def on_fill_received(fill: dict[str, Any]) -> None:
             if trade_type in ("exit", "stop_loss"):
                 # Closing fill — realise P&L against the open entry leg rather
                 # than booking a phantom new opposing position.
-                _close_entry_leg_on_exit(
+                exit_entry_closed = _close_entry_leg_on_exit(
                     trade_id, ticker, price, trade_type, order_id
                 )
             else:
@@ -603,6 +604,12 @@ def on_fill_received(fill: dict[str, Any]) -> None:
                 trade_id = _active_trades.pop(ticker, None)
                 if trade_id:
                     _blotter.close_trade(trade_id, notes=pos.state.value)
+            elif exit_entry_closed and ticker in _active_trades:
+                # Entry leg closed in blotter but strategy missed the fill
+                # label (contra-side / missing action) — still roll up parent.
+                trade_id = _active_trades.pop(ticker, None)
+                if trade_id:
+                    _blotter.close_trade(trade_id, notes="exit")
 
     if _execution:
         _execution.record_fill(fill)

@@ -391,3 +391,81 @@ def test_hedge_fill_marks_trade_hedged_not_closed():
             main._active_trades, main._pending_orders,
         ) = saved
 
+
+def test_high_prob_exit_fill_closes_entry_leg_with_realised_pnl():
+    """End-to-end: contra-side exit fill closes entry leg and parent trade."""
+    import config
+    import main
+    from metrics.blotter import Blotter
+    from strategy.high_prob_strategy import HighProbStrategy, PositionState
+
+    expected_fee = int(config.FEE_PER_CONTRACT_CENTS * 1)
+    expected_pnl = (93 - 90) * 1 - expected_fee
+
+    saved = (
+        main._blotter, main._strategy, main._store, main._execution,
+        main._circuit_breaker, main._alert_manager,
+        dict(main._active_trades), dict(main._pending_orders),
+    )
+    try:
+        ticker = "KXTEST-HP-EXIT"
+        blotter = Blotter(":memory:")
+        strat   = HighProbStrategy(min_yes_ask=85, min_roi_pct=0.0)
+        strat.add_watch_ticker(ticker)
+
+        main._blotter         = blotter
+        main._strategy        = strat
+        main._store           = None
+        main._execution       = None
+        main._circuit_breaker = None
+        main._alert_manager   = None
+        main._active_trades   = {}
+        main._pending_orders  = {}
+        main._processed_fill_ids.clear()
+
+        pos = strat.get_position(ticker)
+        pos.state = PositionState.WATCHING
+        main._pending_orders["entry-1"] = {
+            "ticker": ticker, "trade_type": "entry", "meta": {},
+            "strategy": "high_prob_passive", "category": "Sports",
+            "side": "yes",
+        }
+        main.on_fill_received({
+            "trade_id": "E1", "order_id": "entry-1", "ticker": ticker,
+            "side": "yes", "action": "buy", "price": 90, "size_cents": 90,
+            "contracts": 1,
+        })
+        trade_id = main._active_trades[ticker]
+
+        pos = strat.get_position(ticker)
+        pos.state = PositionState.EXIT_PENDING
+        pos.tp_order_id = "exit-1"
+        main._pending_orders["exit-1"] = {
+            "ticker": ticker, "trade_type": "exit", "meta": {},
+            "strategy": "high_prob_passive", "category": "Sports",
+            "side": "yes",
+        }
+        main.on_fill_received({
+            "trade_id": "X1", "order_id": "exit-1", "ticker": ticker,
+            "side": "no", "price": 93, "size_cents": 93, "contracts": 1,
+        })
+
+        assert strat.get_position(ticker).state == PositionState.CLOSED
+        assert ticker not in main._active_trades
+
+        parents = blotter.query_trades(trade_id=trade_id)
+        assert len(parents) == 1
+        assert parents[0].status == "closed"
+        assert parents[0].net_pnl_cents == expected_pnl
+
+        legs = blotter.query_legs(parent_trade_id=trade_id)
+        assert len(legs) == 1
+        assert legs[0].status == "closed"
+        assert legs[0].realised_pnl_cents == expected_pnl
+    finally:
+        (
+            main._blotter, main._strategy, main._store, main._execution,
+            main._circuit_breaker, main._alert_manager,
+            main._active_trades, main._pending_orders,
+        ) = saved
+

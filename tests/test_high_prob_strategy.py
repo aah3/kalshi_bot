@@ -399,6 +399,52 @@ class TestHighProbStopCancelsTp:
         assert pos.tp_order_id == ""
 
 
+def test_exit_fill_on_no_side_while_exit_pending():
+    """Kalshi reports YES-sell on the contra ('no') side; EXIT_PENDING must
+    still finalise the round-trip when the fill matches the resting exit."""
+    strat = HighProbStrategy(
+        min_yes_ask=85,
+        min_roi_pct=0.0,
+        post_fill_mode=PostFillMode.RESTING_TAKE_PROFIT,
+    )
+    strat.add_watch_ticker("TEST-MKT")
+    pos = strat.get_position("TEST-MKT")
+    pos.state = PositionState.EXIT_PENDING
+    pos.entry_price_cents = 90
+    pos.entry_stake_cents = 5_000
+    pos.tp_order_id = "tp-exit-1"
+    pos.tp_order_sent = True
+
+    strat.on_fill({
+        "ticker": "TEST-MKT",
+        "side": "no",
+        "price": 93,
+        "size_cents": 4_650,
+        "order_id": "tp-exit-1",
+    })
+    assert pos.state == PositionState.CLOSED
+    assert pos.tp_order_id == ""
+    assert pos.cycles_completed == 1
+
+
+def test_exit_fill_ignores_unrelated_order_id():
+    strat = HighProbStrategy(min_yes_ask=85, min_roi_pct=0.0)
+    strat.add_watch_ticker("TEST-MKT")
+    pos = strat.get_position("TEST-MKT")
+    pos.state = PositionState.EXIT_PENDING
+    pos.entry_price_cents = 90
+    pos.tp_order_id = "tp-exit-1"
+
+    strat.on_fill({
+        "ticker": "TEST-MKT",
+        "side": "no",
+        "price": 93,
+        "size_cents": 4_650,
+        "order_id": "some-other-order",
+    })
+    assert pos.state == PositionState.EXIT_PENDING
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
