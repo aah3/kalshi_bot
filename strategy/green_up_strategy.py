@@ -119,6 +119,9 @@ DEFAULT_HEDGE_TRIGGER_PRICE: int      = 68    # cents; YES bid must reach this t
 DEFAULT_STOP_LOSS_CENTS: int           = 10    # max loss per contract before stop (cents)
 DEFAULT_MAX_SPREAD_CENTS: int          = 8     # skip entry when spread exceeds this
 DEFAULT_PARTIAL_HEDGE_FRACTION: float = 0.50  # PARTIAL mode: hedge 50% of full-green size
+# Consecutive cancel/replace failures against a resting stop before we treat the
+# order as gone (already filled or cancelled on the venue) and stop spinning.
+MAX_STOP_CANCEL_FAILURES: int          = 3
 
 
 def resolve_entry_max_price(
@@ -236,6 +239,7 @@ class GreenUpPosition:
     # Resting stop-loss order (GTC sell YES)
     stop_order_id:     str  = ""
     stop_limit_price:  int  = 0
+    stop_cancel_failures: int = 0   # consecutive cancel/replace failures on the stop
 
     # Hedge leg
     hedge_price_cents: int  = 0   # NO price paid (cents, 1-99)
@@ -579,16 +583,25 @@ class GreenUpStrategy(BaseStrategy):
                 strategy=self.name,
             )
 
-        # Stop-loss fill (GTC sell YES at bid)
-        elif pos.state == PositionState.STOPPING and side == Side.YES.value:
-            action = (fill.get("action") or "buy").lower()
-            if action != "sell":
+        # Stop-loss fill (GTC sell YES at bid).
+        #
+        # The protective sell reduces our YES position. Kalshi reports a
+        # YES-sell as a fill on the contra ("no") side and frequently omits the
+        # ``action`` field, so stop recognition must NOT depend on the reported
+        # side — gating on side=="yes" left the position stuck in STOPPING,
+        # which spun the resting-stop reprice loop indefinitely and left the
+        # trade unrecorded as closed. While STOPPING the resting stop is the
+        # only working order, so we match it by order id when known and
+        # otherwise accept the fill by state.
+        elif pos.state == PositionState.STOPPING:
+            if pos.stop_order_id and order_id and order_id != pos.stop_order_id:
                 return
 
             pos.state             = PositionState.STOPPED
             pos.cycles_completed += 1
             pos.stop_order_id     = ""
             pos.stop_limit_price  = 0
+            pos.stop_cancel_failures = 0
 
             net_loss_cents = pos.entry_stake_cents - size_c
 
@@ -654,8 +667,9 @@ class GreenUpStrategy(BaseStrategy):
         """Track a resting GTC stop sell after the exchange accepts it."""
         pos = self._positions.get(ticker)
         if pos and pos.state == PositionState.STOPPING:
-            pos.stop_order_id    = order_id
-            pos.stop_limit_price = limit_price
+            pos.stop_order_id        = order_id
+            pos.stop_limit_price     = limit_price
+            pos.stop_cancel_failures = 0   # fresh order accepted — clear failures
 
     def rollback_stop(self, ticker: str) -> None:
         """
@@ -666,14 +680,32 @@ class GreenUpStrategy(BaseStrategy):
         retries the cancel/replace against the *same* order rather than stacking
         a duplicate sell. Only revert to ENTERED when no stop order was ever
         registered (a first-fire failure), so ``_check_stop_loss`` can re-arm.
+
+        Repeated cancel failures against the same resting stop almost always
+        mean the order is already gone (filled or cancelled on the venue);
+        retrying forever spins thousands of dead cancels. After
+        ``MAX_STOP_CANCEL_FAILURES`` consecutive failures, drop the stale id and
+        revert to ENTERED so the stop can re-arm cleanly (or REST fill
+        reconciliation can finalise STOPPED).
         """
         pos = self._positions.get(ticker)
         if pos is None or pos.state != PositionState.STOPPING:
             return
         if pos.stop_order_id:
-            return
-        pos.state            = PositionState.ENTERED
-        pos.stop_limit_price = 0
+            pos.stop_cancel_failures += 1
+            if pos.stop_cancel_failures < MAX_STOP_CANCEL_FAILURES:
+                return
+            logger.warning(
+                "GreenUp: stop cancel kept failing — treating resting stop as gone",
+                ticker=ticker,
+                stop_order_id=pos.stop_order_id,
+                consecutive_failures=pos.stop_cancel_failures,
+                strategy=self.name,
+            )
+            pos.stop_order_id = ""
+        pos.state                = PositionState.ENTERED
+        pos.stop_limit_price     = 0
+        pos.stop_cancel_failures = 0
 
     def register_hedge_order(
         self, ticker: str, order_id: str, limit_price: int

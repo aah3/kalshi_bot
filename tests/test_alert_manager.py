@@ -112,3 +112,29 @@ def test_position_stop_without_blotter_omits_attribution(AlertManager):
     assert len(alerts) == 1
     assert "bot_owned_contracts" not in alerts[0].data
     assert "bot owns" not in alerts[0].message
+
+
+def test_position_stop_skipped_when_bot_owns_none(AlertManager):
+    # Exchange shows an 8-contract YES position but the bot owns none of it
+    # (manual / other-strategy holding). No CRITICAL alert should fire — this
+    # was the source of phantom RISK_BREACH events for unrelated positions.
+    blotter = _StubBlotter([_leg("OTHER", "yes", 4, 50)])  # different ticker
+    mgr = AlertManager(blotter=blotter)
+    pos = _position("TK", "yes", contracts=8, avg_entry_price=31,
+                    mark_price=14, cost_basis=250, unrealised_pnl=-130)
+
+    assert mgr._check_position_stop(pos) == []
+    # Cooldown must NOT be armed by a skipped alert, so a later legitimate
+    # bot-owned alert can still fire immediately.
+    assert (mgr._cooldown == {}) or all(
+        k[0].value != "POSITION_STOP" for k in mgr._cooldown
+    )
+
+
+def test_profit_target_skipped_when_bot_owns_none(AlertManager):
+    blotter = _StubBlotter([])  # bot owns nothing on this ticker
+    mgr = AlertManager(blotter=blotter)
+    pos = _position("TK", "yes", contracts=8, avg_entry_price=31,
+                    mark_price=80, cost_basis=250, unrealised_pnl=300)
+
+    assert mgr._check_profit_target(pos) == []

@@ -57,8 +57,20 @@ def rules_from_activity_hours(
 def is_market_live(
     market: MarketSummary,
     rules: LiveMarketRules,
+    *,
+    check_update_recency: bool = True,
 ) -> tuple[bool, str]:
-    """REST metadata check for discovery / periodic refresh."""
+    """
+    REST metadata check for discovery / periodic refresh.
+
+    ``check_update_recency`` gates the API ``updated_time`` staleness rule. That
+    rule is meaningful at *discovery* time (choosing which markets to subscribe
+    to) but counter-productive as a *per-tick* entry gate: the registry metadata
+    is captured once at startup and never refreshed, so ``minutes_since_update``
+    can only grow even while the live WebSocket book proves the market is
+    actively trading. Runtime callers (``is_tick_live``) pass ``False`` and rely
+    on book/trade freshness instead.
+    """
     if not rules.enabled:
         return True, "live check disabled"
 
@@ -68,7 +80,7 @@ def is_market_live(
     if rules.min_volume_24h and market.volume_24h < rules.min_volume_24h:
         return False, f"volume_24h={market.volume_24h} < {rules.min_volume_24h}"
 
-    if rules.max_minutes_since_update is not None:
+    if check_update_recency and rules.max_minutes_since_update is not None:
         if market.minutes_since_update is None:
             return False, "no updated_at from API"
         if market.minutes_since_update > rules.max_minutes_since_update:
@@ -107,7 +119,10 @@ def is_tick_live(
         return True, "live check disabled"
 
     if market is not None:
-        ok, reason = is_market_live(market, rules)
+        # Trust the live WebSocket book for runtime freshness; skip the REST
+        # ``updated_time`` recency rule (a discovery-time concept that never
+        # refreshes mid-session and falsely blocks actively-trading markets).
+        ok, reason = is_market_live(market, rules, check_update_recency=False)
         if not ok:
             return False, f"metadata: {reason}"
 
@@ -127,13 +142,28 @@ def is_tick_live(
 
     if rules.max_trade_stale_minutes is not None:
         trade_us = getattr(book, "last_trade_at_us", 0) or 0
-        if trade_us <= 0:
-            return False, "no recent trade on WebSocket tape"
-        trade_age_min = (now_us - trade_us) / 60_000_000.0
-        if trade_age_min > rules.max_trade_stale_minutes:
-            return False, (
-                f"last trade {trade_age_min:.0f}m ago "
-                f"(max {rules.max_trade_stale_minutes:.0f}m)"
-            )
+        if trade_us > 0:
+            # A trade has printed on the tape — enforce the staleness window so
+            # a market that has since gone quiet is filtered out.
+            trade_age_min = (now_us - trade_us) / 60_000_000.0
+            if trade_age_min > rules.max_trade_stale_minutes:
+                return False, (
+                    f"last trade {trade_age_min:.0f}m ago "
+                    f"(max {rules.max_trade_stale_minutes:.0f}m)"
+                )
+        else:
+            # No trade observed on the WS tape yet. The tape only records prints
+            # seen *after* connecting, so an active market legitimately has no
+            # trade right after startup. Use how long we have been watching this
+            # book as a grace window: an active market prints within
+            # ``max_trade_stale_minutes``; a book silent for the whole window is
+            # treated as too quiet and blocked.
+            watch_us = getattr(book, "created_at_us", 0) or updated_us
+            watch_age_min = (now_us - watch_us) / 60_000_000.0
+            if watch_age_min > rules.max_trade_stale_minutes:
+                return False, (
+                    f"no trade in {watch_age_min:.0f}m watching "
+                    f"(max {rules.max_trade_stale_minutes:.0f}m)"
+                )
 
     return True, "live"

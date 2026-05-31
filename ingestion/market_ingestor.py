@@ -55,6 +55,11 @@ class OrderBook:
     last_trade_price: int | None = None
     last_trade_at_us: int = 0
     updated_at_us: int = 0
+    # When this book object was first created (≈ when we began watching the
+    # market). Used as a grace-window anchor: the WS trade tape only records
+    # prints seen *after* connection, so a fresh book legitimately has no trade
+    # yet even on an active market. See discovery.live_market.is_tick_live.
+    created_at_us: int = field(default_factory=lambda: int(time.time() * 1_000_000))
 
     @property
     def best_bid(self) -> int | None:

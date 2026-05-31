@@ -232,6 +232,18 @@ class AlertManager:
         if pnl_pct < PROFIT_TARGET_PCT:
             return []
 
+        # Mirror the position-stop scoping: don't alert on positions the bot
+        # owns none of (aggregate exchange holdings it cannot act on).
+        owned = self._bot_owned(pos.ticker, pos.side)
+        if owned is not None and owned["bot_owned_contracts"] <= 0:
+            logger.debug(
+                "AlertManager: skipping PROFIT_TARGET on non-bot position",
+                ticker=pos.ticker,
+                side=pos.side,
+                exchange_contracts=pos.contracts,
+            )
+            return []
+
         key = (AlertType.PROFIT_TARGET, pos.ticker)
         if self._suppressed(key):
             return []
@@ -247,7 +259,6 @@ class AlertManager:
             "contracts":          pos.contracts,
             "implied_prob_pct":   round(pos.implied_prob * 100, 1),
         }
-        owned = self._bot_owned(pos.ticker, pos.side)
         if owned is not None:
             data.update(owned)
 
@@ -273,6 +284,22 @@ class AlertManager:
         if loss_pct < POSITION_STOP_PCT:
             return []
 
+        # Only alert on positions the bot actually holds. The snapshot is the
+        # aggregate exchange position (manual trades + other strategies), so a
+        # stop on a position the bot owns *none* of is noise it cannot act on —
+        # and because POSITION_STOP is CRITICAL it was emitting RISK_BREACH
+        # events for unrelated holdings. Skip when attribution shows zero
+        # bot-owned contracts; keep firing when attribution is unavailable.
+        owned = self._bot_owned(pos.ticker, pos.side)
+        if owned is not None and owned["bot_owned_contracts"] <= 0:
+            logger.debug(
+                "AlertManager: skipping POSITION_STOP on non-bot position",
+                ticker=pos.ticker,
+                side=pos.side,
+                exchange_contracts=pos.contracts,
+            )
+            return []
+
         key = (AlertType.POSITION_STOP, pos.ticker)
         if self._suppressed(key):
             return []
@@ -287,7 +314,6 @@ class AlertManager:
             "avg_entry_price":    pos.avg_entry_price,
             "contracts":          pos.contracts,
         }
-        owned = self._bot_owned(pos.ticker, pos.side)
         bot_note = ""
         if owned is not None:
             data.update(owned)

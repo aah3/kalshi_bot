@@ -675,22 +675,22 @@ python tools/blotter.py detail --trade-id T-0001
 
 ---
 
-## Implementation status (2026-05-25)
+## Implementation status (2026-05-29)
 
-Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off.
+Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off. Supersedes the 2026-05-25 snapshot.
 
 ### Summary
 
 | Phase | Code / tooling | Live certification |
 |-------|----------------|-------------------|
 | Environment profiles | Done | Verify each session with `python -c "import config; …"` |
-| Week 1 — platform baseline | Mostly done | **In progress** — soak, circuit breaker, manual sell not formally signed |
-| Week 2 — `high_prob` + `green_up` | Done | **Partial** — `testing.md` has commands; no 3× session sign-off per strategy |
+| Week 1 — platform baseline | Done | **In progress** — soak, circuit breaker, manual sell not formally signed |
+| Week 2 — `high_prob` + `green_up` | Done (hardened) | **Partial** — `testing.md` has commands; no 3× session sign-off per strategy |
 | Week 3 — `kelly` + `arb` | Done | **Not started** — no documented demo sessions |
 | Week 4 — demo soak + prod dry-run | Tooling done | **Not started** — no 2-week soak; prod dry-run not recorded |
 | Week 5+ — prod micro-pilot | Scripts ready | **Blocked** — waiting on Week 4 |
 
-**Automated tests:** `153/159` pass in full suite; 6 failures are test-isolation issues (duplicate `test_circuit_breaker_v0.py` + config shims leaking `FEE_PER_CONTRACT_CENTS=0`). Individual failing tests pass in isolation. Fix before treating Week 1 step 1.2 as complete.
+**Automated tests:** `194/194` pass (`python -m pytest tests/ -q`, ~1.5 s). The 2026-05-25 isolation failures are **resolved**: the duplicate `test_circuit_breaker_v0.py` was removed and `tests/conftest.py` now isolates the `FEE_PER_CONTRACT_CENTS` config shim. **Roadmap step 1.2 (P0 #2) is no longer a blocker.** Net since last snapshot: +35 tests, with new suites for fill reconciliation, alert manager, metrics store, book freshness, price targets, and expanded green-up execution.
 
 ### Definition of done (demo) — status
 
@@ -701,14 +701,14 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | 3 | Live gates | Implemented | Default on; `--no-live-only` used in many `testing.md` runs |
 | 4 | SIGINT shutdown | Implemented | `main.py` cancel-all + settlement check; needs signed live run |
 | 5 | Circuit breaker | Implemented | Unit tests + portfolio sync; live Tests A/B not recorded in checklist |
-| 6 | Automated tests | **Blocked** | 6 suite failures (isolation); 153 tests otherwise green |
+| 6 | Automated tests | **Done** | `194/194` green in full suite; isolation failures fixed |
 
 ### Week-by-week certification progress
 
 | Week | Step | Code ready? | Certified? |
 |------|------|-------------|------------|
 | 1 | 1.1 Demo keys / startup | Yes | Assumed (active dev) |
-| 1 | 1.2 `pytest tests/` | **No** | 6 isolation failures |
+| 1 | 1.2 `pytest tests/` | **Yes** | 194/194 green; isolation fixed |
 | 1 | 1.3 Config profile print | Yes | — |
 | 1 | 1.4 ~30 min soak + Ctrl+C | Yes | Not signed in README checklist |
 | 1 | 1.5 Circuit breaker live (A + B) | Yes | Not signed |
@@ -733,47 +733,81 @@ These ship in code but are not separate certification steps:
 - **Sector concentration limit** — `KALSHI_MAX_SECTOR_CONCENTRATION` in circuit breaker (prod scripts set `1.0` for micro-pilot)
 - **Trending category** — cross-category volume scan default for discovery
 
-### Post-certification backlog — unchanged
+### Built since the 2026-05-25 snapshot (resilience + strategy hardening)
 
-Still deferred per [backlog](#post-certification-feature-backlog-defer-until-demo-done):
+Major reliability work landed in commits `69e104f` (price targets / green-up refactor) and `772e74a` (WS liveness watchdog + REST fill reconciliation):
 
-- Fill funnel metrics (sent → exchange fill → WS confirm)
-- Blotter CLI `--resolution` / unified search
-- Manual `trade.py` → blotter sync
-- Auto-flatten on shutdown (optional flag)
-- Native green_up resting take-profit (use hedge or `high_prob` low-band workaround)
+**Connection & fill resilience**
+- **WS liveness watchdog** — `ingestion/market_ingestor.py` forces a reconnect when the socket is silent past `KALSHI_WS_MAX_SILENCE_SECONDS` (default 45 s), catching half-open sockets that keep TCP alive but stop delivering data.
+- **WS-health escalation** — `ingestion/rest_book_fallback.py` counts consecutive stale-book polls and calls `force_reconnect()` after `KALSHI_WS_STALE_ESCALATE_POLLS` (default 3) so the WS-only `fill` channel is re-established, not just the market-data books.
+- **REST fill reconciliation** — `trading/fill_reconciler.py` polls `GET /portfolio/fills` every `KALSHI_FILL_RECONCILE_SECONDS` (default 20 s) and re-drives `on_fill` for any tracked open order the WebSocket missed. `on_fill_received` dedups by fill/trade id so WS + REST paths are safe to run together. **Closes most of the "fills silently dropped" risk that previously left exits unmanaged.**
 
-### Production readiness gaps (priority order)
+**Observability**
+- **AlertManager** (`risk/alert_manager.py`) — six alert types (profit target, position stop, expiry warning/urgent, fill timeout, low balance) with per-key cooldown and **bot-ownership attribution** (separates the bot's own legs from manual/other positions on the same ticker via the blotter). Runs as a background task off `PortfolioMonitor`.
+- **PortfolioMonitor** (`trading/portfolio_monitor.py`) — mark-to-market snapshot of all open positions (unrealised P&L, implied prob, expiry) feeding the circuit-breaker sync, alert manager, and session table.
+- **MetricsStore** (`metrics/metrics_store.py`) — SQLite tables for fills, equity snapshots, and signal intent; exposes `get_signal_fill_rate()` (a first cut at the deferred fill-funnel metric) and legacy-table migration.
+
+**Strategy hardening (`green_up`, `high_prob`)**
+- **Per-fill price targets** (`strategy/price_targets.py`) — hedge/stop triggers are now computed from the *actual* entry fill price, so later cycles adapt instead of using a static session threshold. Relative hedging via `--hedge-offset` (hedge when YES bid ≥ entry + N¢).
+- **Green-up resting hedge** — `--gu-hedge-style resting` posts a GTC buy-NO at the trigger-implied price immediately after entry fill (vs `trigger`, which waits for the bid to reach the level).
+- **Green-up stop that actually fills** — `_stop_sell_mode()` escalates `PASSIVE` stops to `CROSS_SPREAD` so a protective sell crosses to the bid instead of resting at the ask and chasing a falling book without filling. Resting stops reprice as the bid moves (`_manage_resting_stop`), and `rollback_hedge` / `rollback_stop` let legs retry safely after a failed submit or circuit-breaker reject.
+- **Contract-rounding alignment** — green-up sizes the entry to whole contracts (`size_cents = contracts × limit_price`) so the logged hedge/locked-profit preview matches what actually fills.
+- **High-prob fee-adjusted ROI gate** — entries pass `passes_roi_gate()` with round-trip fees baked in (`HP_USE_FEE_ADJUSTED_ROI`); take-profit supports `--hp-take-profit-pct` (vig-aware) or legacy offset, with `--hp-tp-style fixed|at_ask`, combined `tp_and_stop` post-fill mode, cents-or-pct stop loss, and optional `--hp-require-model-edge`.
+- **Shared execution pricing** (`strategy/execution_price.py`) — unified `passive` / `cross_spread` / `market` / `limit_offset` resolution for YES buy, YES sell, YES exit, and NO buy legs across both strategies.
+- All new CLI flags are wired in `main.py` (`--gu-hedge-style`, `--gu-limit-offset`, `--gu-max-spread`, `--gu-no-entry-max`, `--hedge-offset`, `--hp-exit-mode`, `--hp-take-profit-pct`, `--hp-stop-loss-cents`, `--hp-tp-style`).
+
+### Correctness gap found in this audit — FIXED (2026-05-29)
+
+- **`PortfolioMonitor.session_realised_pnl_cents` was a placeholder.** `refresh()` previously computed realised P&L as `sum(int(f.get("is_taker", 0)) for f in fills)` — taker flags, **not** dollars — so "Session realised P&L" in the portfolio report / session table / dashboard was meaningless. **Fixed:** `realized_pnl_cents_from_fills()` now does weighted-average-cost matching per `(ticker, side)` over `/portfolio/fills`, booking `contracts_closed × (sell_price − avg_cost)` on each closing sell. Sells beyond the tracked long (opening buy predates the fills window) are ignored rather than assumed free, so the figure is conservative. Settlement payouts (hold-to-expiry) remain on the `SettlementWatcher` → blotter / equity-snapshot path and are intentionally excluded. Covered by `tests/test_portfolio_pnl.py` (10 cases). The circuit breaker was never affected (it keys off `portfolio_value_cents`).
+
+### Session P&L display reconciled with kill switch — FIXED (2026-05-30)
+
+- **The live monitor's "Session" figure did not match the metric the kill switch trips on.** The session table / dashboard showed `session_realised_pnl_cents` (realised-only, from closing fills), while the circuit breaker's session-loss limit (check #2) trips on the change in **total mark-to-market equity** (`portfolio_value_cents − _session_start_equity`, which includes *unrealised* P&L). In a production run the monitor displayed `Session $0.00` the whole time while a held position bled unrealised P&L, then the breaker fired `session loss limit exceeded session_pnl=-522 limit=-500` — confusing because the two numbers measure different things. **Fixed:** `PortfolioMonitor` now tracks a session-start *equity* baseline and exposes `PortfolioSnapshot.session_total_pnl_cents` (= realised + unrealised since the monitor started). The live monitor's "Session" and the dashboard now display this total; the circuit breaker adopts the same baseline on first `sync_from_portfolio()` so its session-loss metric is **definitionally identical** to the displayed figure (single source of truth). Trip logic is unchanged. Covered by two new cases in `tests/test_circuit_breaker_sync.py` (baseline adoption + trips on unrealised-only session loss).
+
+### Post-certification backlog — status
+
+| Item | Status |
+|------|--------|
+| Fill funnel metrics (sent → exchange fill → WS confirm) | **Partial** — `MetricsStore.get_signal_fill_rate()` gives sent→filled; full funnel + dashboard still open |
+| Blotter CLI `--resolution` / unified search | Deferred |
+| Manual `trade.py` → blotter sync | Deferred (workaround exists) |
+| Auto-flatten on shutdown (optional flag) | Deferred (by design — positions survive Ctrl+C) |
+| Native green_up resting take-profit | Deferred — `--gu-hedge-style resting` covers the hedge leg; a true "+X¢ TP" still uses the `high_prob` low-band workaround |
+| REST fill reconciliation (WS safety net) | **Done** — `trading/fill_reconciler.py` |
+
+### Production readiness gaps (priority order, updated 2026-05-29)
 
 **P0 — must fix before real money**
 
-1. Complete Week 1–4 demo certification (README checklist all checked)
-2. Fix full `pytest` suite (remove duplicate `tests/test_circuit_breaker_v0.py`; isolate config shims)
+1. Complete Week 1–4 demo certification (README checklist all checked) — *still the primary blocker; all code paths exist but no signed sessions*
+2. ~~Fix full `pytest` suite~~ — **DONE** (194/194 green; isolation fixed)
 3. Live circuit breaker Tests A + B on demo with session notes
-4. Blotter ↔ exchange reconciliation on bot-driven orders for each strategy you will run in prod
-5. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier
+4. Blotter ↔ exchange reconciliation on bot-driven orders for each strategy you will run in prod — *now easier to verify with REST fill reconciliation + `PortfolioMonitor`*
+5. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier (now feeds the high-prob fee-adjusted ROI gate)
 
 **P1 — before unattended / 24×7 prod**
 
-6. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl`
-7. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
-8. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
-9. External alerting on `risk_breach`, `kill switch`, repeated WS disconnect — today alerts are JSONL + stderr only
-10. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
+6. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl` — *exercise the WS watchdog + REST fallback + fill reconciliation under real disconnects*
+7. ~~Fix `PortfolioMonitor` session-realised-P&L placeholder~~ — **DONE** (2026-05-29; `realized_pnl_cents_from_fills` + `tests/test_portfolio_pnl.py`)
+8. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
+9. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
+10. **External** alerting sink for `risk_breach` / `kill switch` / repeated WS disconnect / `AlertManager` CRITICAL — *structured alerts now exist in code, but delivery is still JSONL + stderr only; add a webhook/email/Slack/PagerDuty transport*
+11. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
+12. Tune the new resilience knobs for prod and document chosen values: `KALSHI_WS_MAX_SILENCE_SECONDS`, `KALSHI_WS_STALE_ESCALATE_POLLS`, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`, `KALSHI_FILL_RECONCILE_SECONDS`
 
 **P2 — operational maturity**
 
-11. CI pipeline (`pytest` on push) — no `.github/workflows` today
-12. Secrets outside flat `.env` (vault / host env) for prod keys
-13. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter durability
-14. Runbook for orphan orders, partial arb legs, manual flatten
-15. Python 3.11+ on runtime host (README requirement; dev machine may be 3.10)
+13. CI pipeline (`pytest` on push) — **no `.github/workflows` today**; now high-value and low-effort since the suite is fully green (aligns with project CI/CD standards)
+14. Secrets outside flat `.env` (vault / host env) for prod keys
+15. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter + metrics durability
+16. Runbook for orphan orders, partial arb legs, manual flatten, and forced-reconnect storms
+17. Python 3.11+ on runtime host (README requirement; dev machine may be 3.10)
 
 **P3 — nice to have**
 
-16. Docker / container health checks
-17. Fill funnel metrics and dashboard hardening
-18. Manual trade → blotter sync for mixed manual/bot workflows
+18. Docker / container health checks
+19. Full fill-funnel metrics and dashboard hardening (build on `MetricsStore`)
+20. Manual trade → blotter sync for mixed manual/bot workflows
 
 ---
 

@@ -71,3 +71,37 @@ def test_query_legs_by_trade_type(blotter):
     assert len(hedges) == 1
     assert entries[0].trade_type == "entry"
     assert hedges[0].trade_type == "hedge"
+
+
+def test_mark_trade_hedged_keeps_parent_open_for_settlement(blotter):
+    tid = blotter.open_trade(ticker="T-H", strategy="green_up_full_green")
+    blotter.record_fill(
+        parent_trade_id=tid,
+        order_id="e1",
+        side="yes",
+        entry_price=25,
+        contracts=1,
+        trade_type="entry",
+    )
+    blotter.record_fill(
+        parent_trade_id=tid,
+        order_id="h1",
+        side="no",
+        entry_price=40,
+        contracts=1,
+        trade_type="hedge",
+    )
+
+    blotter.mark_trade_hedged(tid, locked_profit_cents=350, notes="hedged")
+
+    parents = blotter.query_trades(trade_id=tid)
+    assert len(parents) == 1
+    assert parents[0].status == "hedged"
+    assert parents[0].net_pnl_cents is None
+    assert "locked_profit_cents=350" in parents[0].notes
+
+    unsettled = blotter.open_positions_summary()
+    assert any(p["trade_id"] == tid for p in unsettled)
+
+    legs = blotter.query_legs(parent_trade_id=tid, status="open")
+    assert len(legs) == 2

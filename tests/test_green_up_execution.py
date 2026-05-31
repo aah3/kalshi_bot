@@ -368,6 +368,55 @@ def test_stop_loss_fill_on_yes_sell():
     assert pos.state == PositionState.STOPPED
 
 
+def test_stop_loss_fill_on_no_side_contra_label():
+    """Kalshi reports a YES-sell as a fill on the contra ('no') side and often
+    omits ``action``. Stop recognition must not depend on the reported side,
+    otherwise the position stays stuck in STOPPING (the production reprice-loop
+    bug)."""
+    strat = GreenUpStrategy(stop_loss_cents=12)
+    strat.add_watch_ticker("T7b")
+    pos = strat.get_position("T7b")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 61
+    pos.entry_stake_cents = 61
+    pos.entry_contracts = 1
+    pos.stop_order_id = "stop-42"
+
+    strat.on_fill({
+        "ticker": "T7b",
+        "side": "no",          # contra label for a YES sell
+        "price": 43,
+        "size_cents": 43,
+        "contracts": 1,
+        "order_id": "stop-42",  # matches the resting stop order
+    })
+    assert pos.state == PositionState.STOPPED
+    assert pos.stop_order_id == ""
+
+
+def test_stop_fill_ignores_unrelated_order_id():
+    """A fill for a different order id must not finalise the stop while one is
+    resting (avoids a stray fill closing the wrong position)."""
+    strat = GreenUpStrategy(stop_loss_cents=12)
+    strat.add_watch_ticker("T7c")
+    pos = strat.get_position("T7c")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 61
+    pos.entry_stake_cents = 61
+    pos.entry_contracts = 1
+    pos.stop_order_id = "stop-99"
+
+    strat.on_fill({
+        "ticker": "T7c",
+        "side": "no",
+        "price": 43,
+        "size_cents": 43,
+        "contracts": 1,
+        "order_id": "some-other-order",
+    })
+    assert pos.state == PositionState.STOPPING
+
+
 def test_stop_reprices_when_bid_moves():
     strat = GreenUpStrategy(
         stop_loss_cents=12,
@@ -663,6 +712,48 @@ def test_rollback_stop_keeps_resting_order_on_reprice_failure():
     assert pos.state == PositionState.STOPPING
     assert pos.stop_order_id == "live-stop-1"
     assert pos.stop_limit_price == 9
+
+
+def test_rollback_stop_drops_dead_order_after_repeated_failures():
+    """Repeated cancel failures mean the resting stop is gone (already filled or
+    cancelled on the venue). Retrying forever spins thousands of dead cancels,
+    so after MAX_STOP_CANCEL_FAILURES we drop the id and re-arm via ENTERED."""
+    import strategy.green_up_strategy as gu
+
+    strat = gu.GreenUpStrategy(stop_loss_cents=10)
+    strat.add_watch_ticker("T24")
+    pos = strat.get_position("T24")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 25
+    pos.entry_stake_cents = 25
+    pos.stop_order_id = "dead-stop-1"
+    pos.stop_limit_price = 9
+
+    for _ in range(gu.MAX_STOP_CANCEL_FAILURES - 1):
+        strat.rollback_stop("T24")
+        assert pos.state == PositionState.STOPPING
+        assert pos.stop_order_id == "dead-stop-1"
+
+    strat.rollback_stop("T24")  # threshold reached
+    assert pos.state == PositionState.ENTERED
+    assert pos.stop_order_id == ""
+    assert pos.stop_cancel_failures == 0
+
+
+def test_register_stop_order_clears_failure_counter():
+    """A successfully accepted reprice resets the consecutive-failure counter so
+    transient cancel failures never accumulate toward the dead-order cutoff."""
+    strat = GreenUpStrategy(stop_loss_cents=10)
+    strat.add_watch_ticker("T25")
+    pos = strat.get_position("T25")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 25
+    pos.stop_order_id = "stop-a"
+    pos.stop_cancel_failures = 2
+
+    strat.register_stop_order("T25", "stop-b", 9)
+    assert pos.stop_order_id == "stop-b"
+    assert pos.stop_cancel_failures == 0
 
 
 def test_first_stop_logs_warning_even_when_cancelling_hedge(monkeypatch):

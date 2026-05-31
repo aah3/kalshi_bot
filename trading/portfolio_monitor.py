@@ -37,8 +37,74 @@ import config
 from credentials.credential_manager import CredentialManager
 from discovery.market_client import MarketClient, OrderBookSnapshot
 from execution.rate_limiter import BucketType, RateLimiter
+from ingestion.market_ingestor import normalize_fill_message
 from logging_.structured_logger import logger
 from trading.position_parse import parse_market_position
+
+
+# ── Realised P&L from fills ───────────────────────────────────────────────────
+
+def realized_pnl_cents_from_fills(fills_raw: list[dict[str, Any]]) -> int:
+    """
+    Compute realised trading P&L (in cents) from raw Kalshi fills.
+
+    Kalshi positions are long-only: you buy YES or NO and a ``sell`` fill
+    reduces an existing long. Realised P&L is booked when a sell closes (part
+    of) a long at a price different from its weighted-average cost:
+
+        realised += contracts_closed × (sell_price − avg_cost)   (per ticker/side)
+
+    Cost basis is tracked per ``(ticker, side)``. Sells are matched only against
+    the position accumulated *within this fill set*; any excess close whose
+    opening buy predates the fills window is ignored rather than assumed free,
+    so the figure is conservative rather than inflated.
+
+    Settlement payouts (holding to expiry) are **not** returned by
+    ``/portfolio/fills`` and are therefore excluded here — those flow through
+    the ``SettlementWatcher`` → blotter / equity-snapshot path. This function
+    captures realised P&L from *closing trades* (hedge / stop / take-profit
+    exits), which is what the session monitor displays.
+
+    Args:
+        fills_raw: Raw fill dicts from ``GET /portfolio/fills`` (any order).
+
+    Returns:
+        Realised P&L in cents (may be negative).
+    """
+    # Oldest-first so cost basis accumulates before it is drawn down.
+    ordered = sorted(fills_raw, key=lambda f: f.get("created_time") or "")
+
+    held: dict[tuple[str, str], int] = {}   # (ticker, side) -> contracts open
+    cost: dict[tuple[str, str], int] = {}   # (ticker, side) -> total cost cents
+    realized = 0
+
+    for raw in ordered:
+        fill      = normalize_fill_message(raw)
+        ticker    = fill["ticker"]
+        side      = fill["side"]
+        price     = fill["price"]
+        contracts = fill["contracts"]
+        action    = (fill.get("action") or "buy").lower()
+        if not ticker or contracts <= 0:
+            continue
+
+        key      = (ticker, side)
+        open_qty = held.get(key, 0)
+
+        if action == "sell":
+            closable = min(contracts, open_qty)
+            if closable > 0:
+                avg_cost  = cost[key] / open_qty
+                realized += round(closable * (price - avg_cost))
+                cost[key] = max(0, cost[key] - round(closable * avg_cost))
+                held[key] = open_qty - closable
+            # Excess sell beyond the tracked long opened before the fills
+            # window — cost basis unknown, so leave it out of realised P&L.
+        else:  # buy (or unknown) → opens / adds to the long
+            held[key] = open_qty + contracts
+            cost[key] = cost.get(key, 0) + contracts * price
+
+    return int(realized)
 
 
 # ── Position model ────────────────────────────────────────────────────────────
@@ -140,6 +206,12 @@ class PortfolioSnapshot:
     total_unrealised_pnl_cents: int
     total_max_payout_cents: int        # if ALL positions win
     session_realised_pnl_cents: int    # realised since monitor started
+    # Total session P&L = change in mark-to-market equity since the monitor
+    # started (realised + unrealised + cash moves). This is the SAME quantity
+    # the circuit breaker's session-loss limit trips on — display it so the
+    # operator sees what the kill switch is watching. Defaults to 0 so callers
+    # constructing snapshots in tests need not supply it.
+    session_total_pnl_cents: int       = 0
     snapped_at:         datetime       = field(default_factory=lambda: datetime.now(timezone.utc))
 
     # Risk metrics
@@ -169,6 +241,7 @@ class PortfolioSnapshot:
         print(f"  {'Open positions value:':<30} ${sum(p.current_value for p in self.positions)/100:>10.2f}")
         print(f"  {'Total cost basis:':<30} ${self.total_cost_basis_cents/100:>10.2f}")
         print(f"  {'Unrealised P&L:':<30} ${self.total_unrealised_pnl_cents/100:>+10.2f}  ({self._pnl_pct():+.1f}%)")
+        print(f"  {'Session P&L (total):':<30} ${self.session_total_pnl_cents/100:>+10.2f}")
         print(f"  {'Session realised P&L:':<30} ${self.session_realised_pnl_cents/100:>+10.2f}")
         print(f"  {'Max payout (all win):':<30} ${self.total_max_payout_cents/100:>10.2f}")
         print(f"  {'Open positions:':<30} {self.num_positions}")
@@ -230,7 +303,8 @@ class PortfolioMonitor:
         self._creds   = credentials
         self._limiter = rate_limiter
         self._session: aiohttp.ClientSession | None = None
-        self._session_start_realised: int = 0   # baseline for session P&L
+        self._session_start_realised: int = 0    # baseline for realised session P&L
+        self._session_start_equity: int | None = None  # baseline for total session P&L
         self._session_started = False
 
     async def __aenter__(self) -> "PortfolioMonitor":
@@ -277,11 +351,10 @@ class PortfolioMonitor:
         # Parse balance
         cash_balance = int(balance_raw.get("balance", 0))
 
-        # Session realised P&L (fills since monitor started)
-        realised_total = sum(
-            int(f.get("is_taker", 0))  # placeholder — use actual fill P&L
-            for f in fills_raw
-        )
+        # Session realised P&L: realised trading P&L from closing fills,
+        # rebased to the monitor's start so the figure reflects P&L booked
+        # during this session (see realized_pnl_cents_from_fills).
+        realised_total = realized_pnl_cents_from_fills(fills_raw)
         if not self._session_started:
             self._session_start_realised = realised_total
             self._session_started = True
@@ -292,6 +365,13 @@ class PortfolioMonitor:
         total_unrealised  = sum(p.unrealised_pnl for p in positions)
         total_max_payout  = sum(p.max_payout for p in positions)
         portfolio_value   = cash_balance + sum(p.current_value for p in positions)
+
+        # Total session P&L: change in mark-to-market equity since the monitor's
+        # first refresh. Baselined here so it matches the circuit breaker's
+        # session-loss metric (the breaker adopts this same baseline on sync).
+        if self._session_start_equity is None:
+            self._session_start_equity = portfolio_value
+        session_total = portfolio_value - self._session_start_equity
 
         # Risk: largest position as % of total value
         largest_pct = 0.0
@@ -306,6 +386,7 @@ class PortfolioMonitor:
             total_unrealised_pnl_cents=total_unrealised,
             total_max_payout_cents=total_max_payout,
             session_realised_pnl_cents=session_realised,
+            session_total_pnl_cents=session_total,
             largest_position_pct=largest_pct,
             num_positions=len(positions),
         )

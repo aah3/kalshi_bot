@@ -592,6 +592,50 @@ class Blotter:
         )
         return pnl
 
+    # ── Write: mark hedged (awaiting settlement) ────────────────────────────
+
+    def mark_trade_hedged(
+        self,
+        trade_id:              str,
+        locked_profit_cents:   int | None = None,
+        notes:                 str = "",
+    ) -> None:
+        """
+        Both legs are filled and profit is locked, but the market has not
+        resolved yet. Keep entry + hedge legs ``open`` and defer P&L rollup
+        until ``SettlementWatcher`` settles the trade.
+
+        Calling ``close_trade`` here was wrong: no legs are closed yet, so
+        net P&L rolled up as zero even though locked profit was known.
+        """
+        note_parts: list[str] = []
+        if notes:
+            note_parts.append(notes)
+        if locked_profit_cents is not None:
+            note_parts.append(f"locked_profit_cents={locked_profit_cents}")
+        combined = "; ".join(note_parts)
+
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE parent_trades SET
+                    status = 'hedged',
+                    notes  = CASE WHEN ? != '' THEN ? ELSE notes END
+                WHERE trade_id = ?
+                """,
+                (combined, combined, trade_id),
+            )
+
+        logger.info(
+            "Blotter: trade hedged (awaiting settlement)",
+            trade_id=trade_id,
+            locked_profit_cents=locked_profit_cents,
+            locked_profit_usd=(
+                round(locked_profit_cents / 100, 2)
+                if locked_profit_cents is not None else None
+            ),
+        )
+
     # ── Write: close a parent trade ───────────────────────────────────────────
 
     def close_trade(
@@ -851,7 +895,7 @@ class Blotter:
         return [_summary_row(r) for r in rows]
 
     def open_positions_summary(self) -> list[dict]:
-        """All open parent trades with their current cost basis."""
+        """Parent trades still awaiting settlement (open entry and/or hedged)."""
         with self._conn() as conn:
             rows = conn.execute(
                 """
@@ -859,7 +903,7 @@ class Blotter:
                        total_contracts, total_cost_cents, total_fees_cents,
                        num_legs, entry_time
                 FROM parent_trades
-                WHERE status = 'open'
+                WHERE status IN ('open', 'hedged', 'partially_hedged')
                 ORDER BY entry_time DESC
                 """,
             ).fetchall()

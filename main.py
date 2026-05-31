@@ -436,6 +436,68 @@ def _known_order_ids() -> set[str]:
     return ids
 
 
+def _close_entry_leg_on_exit(
+    trade_id:   str,
+    ticker:     str,
+    exit_price: int,
+    close_type: str,
+    order_id:   str,
+) -> bool:
+    """
+    Realise P&L on an early exit/stop by closing the open entry leg.
+
+    Green-up stops and high-prob take-profits *flatten* the YES position rather
+    than opening a new one. Booking the closing fill as a fresh leg (the old
+    behaviour) left the entry leg perpetually "open" with no realised P&L and a
+    phantom extra contract on the parent trade. Closing the entry leg at the
+    fill price records the true realised P&L instead.
+
+    The venue reports a YES sell on the contra ("no") side, but ``close_leg``
+    derives P&L from the entry leg's own side/price, so the result is correct
+    regardless of how the closing fill's side is labelled.
+
+    Returns True when an entry leg was closed.
+    """
+    if _blotter is None:
+        return False
+
+    open_entries = _blotter.query_legs(
+        parent_trade_id=trade_id, trade_type="entry", status="open"
+    )
+    if not open_entries:
+        # Arbitrage entries are booked as leg_1/leg_2 — fall back to any open leg.
+        open_entries = _blotter.query_legs(
+            parent_trade_id=trade_id, status="open"
+        )
+    if not open_entries:
+        logger.warning(
+            "Blotter: exit fill with no open entry leg — skipping close",
+            trade_id=trade_id,
+            ticker=ticker,
+            order_id=order_id,
+            close_type=close_type,
+        )
+        return False
+
+    entry_leg = open_entries[0]
+    pnl = _blotter.close_leg(
+        entry_leg.leg_id,
+        exit_price=exit_price,
+        close_type=close_type,
+    )
+    logger.info(
+        "Blotter: entry leg closed on exit fill",
+        leg_id=entry_leg.leg_id,
+        trade_id=trade_id,
+        ticker=ticker,
+        exit_price=exit_price,
+        realised_pnl_cents=pnl,
+        realised_pnl_usd=round(pnl / 100, 2),
+        close_type=close_type,
+    )
+    return True
+
+
 def on_fill_received(fill: dict[str, Any]) -> None:
     global _active_trades
     """
@@ -462,6 +524,8 @@ def on_fill_received(fill: dict[str, Any]) -> None:
     if _blotter and pending and ticker:
         trade_type = pending.get("trade_type", "entry")
         meta       = pending.get("meta") or {}
+        price      = int(fill.get("price") or 0)
+        contracts  = int(fill.get("contracts") or 0)
         if trade_type in ("entry", "leg_1") and ticker not in _active_trades:
             trade_id = _blotter.open_trade(
                 ticker=ticker,
@@ -474,25 +538,30 @@ def on_fill_received(fill: dict[str, Any]) -> None:
             trade_id = _active_trades.get(ticker)
 
         if trade_id:
-            price     = int(fill.get("price") or 0)
-            contracts = int(fill.get("contracts") or 0)
-            leg_id = _blotter.record_fill(
-                parent_trade_id=trade_id,
-                order_id=order_id,
-                side=fill.get("side", pending.get("side", "yes")),
-                trade_type=trade_type,
-                contracts=contracts,
-                entry_price=price,
-                strategy=pending.get("strategy", ""),
-                strategy_meta=meta,
-            )
-            logger.info(
-                "Blotter: leg recorded (fill confirmed)",
-                leg_id=leg_id,
-                trade_id=trade_id,
-                order_id=order_id,
-                contracts=contracts,
-            )
+            if trade_type in ("exit", "stop_loss"):
+                # Closing fill — realise P&L against the open entry leg rather
+                # than booking a phantom new opposing position.
+                _close_entry_leg_on_exit(
+                    trade_id, ticker, price, trade_type, order_id
+                )
+            else:
+                leg_id = _blotter.record_fill(
+                    parent_trade_id=trade_id,
+                    order_id=order_id,
+                    side=fill.get("side", pending.get("side", "yes")),
+                    trade_type=trade_type,
+                    contracts=contracts,
+                    entry_price=price,
+                    strategy=pending.get("strategy", ""),
+                    strategy_meta=meta,
+                )
+                logger.info(
+                    "Blotter: leg recorded (fill confirmed)",
+                    leg_id=leg_id,
+                    trade_id=trade_id,
+                    order_id=order_id,
+                    contracts=contracts,
+                )
 
         if _store:
             size_cents = int(fill.get("size_cents") or 0)
@@ -513,7 +582,17 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
         if isinstance(_strategy, GreenUpStrategy):
             pos = _strategy.get_position(ticker)
-            if pos and pos.state in (PositionState.HEDGED, PositionState.STOPPED):
+            if pos and pos.state == PositionState.HEDGED:
+                trade_id = _active_trades.pop(ticker, None)
+                if trade_id:
+                    # Both legs filled — profit locked but not realised until
+                    # settlement. Do not close_trade (that rolled up net_pnl=0).
+                    _blotter.mark_trade_hedged(
+                        trade_id,
+                        locked_profit_cents=pos.locked_profit_cents,
+                        notes=pos.state.value,
+                    )
+            elif pos and pos.state == PositionState.STOPPED:
                 trade_id = _active_trades.pop(ticker, None)
                 if trade_id:
                     _blotter.close_trade(trade_id, notes=pos.state.value)

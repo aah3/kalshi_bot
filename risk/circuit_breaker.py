@@ -197,7 +197,13 @@ class CircuitBreaker:
 
         equity = snapshot.portfolio_value_cents
         if self._session_start_equity is None:
-            self._session_start_equity = equity
+            # Adopt the monitor's session baseline so the breaker's session-loss
+            # metric (equity - _session_start_equity) is identical to the
+            # snapshot's session_total_pnl_cents shown on the live monitor /
+            # dashboard. Falls back to current equity when the snapshot carries
+            # no session figure (e.g. unit tests build bare snapshots).
+            session_total = getattr(snapshot, "session_total_pnl_cents", 0)
+            self._session_start_equity = equity - session_total
 
         self._last_portfolio_equity = equity
         self._check_drawdown()

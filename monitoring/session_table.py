@@ -280,13 +280,16 @@ def render_session_table(
 
     # Account strip
     if portfolio:
-        cash   = portfolio.cash_balance_cents / 100
-        unreal = portfolio.total_unrealised_pnl_cents / 100
-        real   = portfolio.session_realised_pnl_cents / 100
-        inv    = portfolio.total_cost_basis_cents / 100
+        cash    = portfolio.cash_balance_cents / 100
+        unreal  = portfolio.total_unrealised_pnl_cents / 100
+        # "Session" = total equity change since bot start (realised + unrealised).
+        # This is the exact figure the circuit breaker's session-loss limit
+        # trips on, so the operator sees what the kill switch is watching.
+        session = portfolio.session_total_pnl_cents / 100
+        inv     = portfolio.total_cost_basis_cents / 100
         print(
             f"  Cash ${cash:,.2f}  |  Invested ${inv:,.2f}  |  "
-            f"Unrealised {_pnl_str(unreal)}  |  Session {_pnl_str(real)}  |  "
+            f"Unrealised {_pnl_str(unreal)}  |  Session {_pnl_str(session)}  |  "
             f"Positions {portfolio.num_positions}  |  "
             f"Open orders {execution_open}  |  Blotter open {blotter_open}"
         )

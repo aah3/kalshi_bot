@@ -222,3 +222,172 @@ def test_on_fill_received_is_idempotent():
     main.on_fill_received(fill)   # REST reconciliation re-delivery (must be ignored)
     assert len(main._processed_fill_ids) == 1
 
+
+# ── Closing fills realise P&L on the entry leg (no phantom new position) ──────
+
+def test_stop_fill_closes_entry_leg_with_realised_pnl():
+    """Regression for the production bug where a stop fill (reported on the
+    contra 'no' side) was booked as a brand-new open leg, leaving the entry leg
+    perpetually open with no realised P&L and a phantom extra contract.
+
+    A stop fill must now CLOSE the entry leg at the fill price and roll the
+    realised loss up into the parent trade."""
+    import config
+    import main
+    from metrics.blotter import Blotter
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState
+
+    saved = (
+        main._blotter, main._strategy, main._store, main._execution,
+        main._circuit_breaker, main._alert_manager,
+        dict(main._active_trades), dict(main._pending_orders),
+    )
+    try:
+        ticker = "KXTEST-CLOSE-LEG"
+        blotter = Blotter(":memory:")
+        strat   = GreenUpStrategy(stop_loss_cents=10)
+        strat.add_watch_ticker(ticker)
+
+        main._blotter         = blotter
+        main._strategy        = strat
+        main._store           = None
+        main._execution       = None
+        main._circuit_breaker = None
+        main._alert_manager   = None
+        main._active_trades   = {}
+        main._pending_orders  = {}
+        main._processed_fill_ids.clear()
+
+        # 1) Entry fill: buy 1 YES @ 61c -> opens trade + entry leg.
+        # A pending entry order puts the position in WATCHING (real flow).
+        strat.get_position(ticker).state = PositionState.WATCHING
+        main._pending_orders["entry-1"] = {
+            "ticker": ticker, "trade_type": "entry", "meta": {},
+            "strategy": "green_up_full_green_market", "category": "Sports",
+            "side": "yes",
+        }
+        main.on_fill_received({
+            "trade_id": "E1", "order_id": "entry-1", "ticker": ticker,
+            "side": "yes", "action": "buy", "price": 61, "size_cents": 61,
+            "contracts": 1,
+        })
+        assert strat.get_position(ticker).state == PositionState.ENTERED
+        trade_id = main._active_trades[ticker]
+        legs = blotter.query_legs(parent_trade_id=trade_id)
+        assert len(legs) == 1 and legs[0].status == "open"
+
+        # 2) Stop fires: arm the resting stop, then it fills on the 'no' side.
+        pos = strat.get_position(ticker)
+        pos.state = PositionState.STOPPING
+        pos.stop_order_id = "stop-1"
+        main._pending_orders["stop-1"] = {
+            "ticker": ticker, "trade_type": "stop_loss", "meta": {},
+            "strategy": "green_up_full_green_market", "category": "Sports",
+            "side": "yes",
+        }
+        main.on_fill_received({
+            "trade_id": "S1", "order_id": "stop-1", "ticker": ticker,
+            "side": "no", "price": 43, "size_cents": 43, "contracts": 1,
+        })
+
+        # Strategy finalised the stop; trade is no longer active.
+        assert strat.get_position(ticker).state == PositionState.STOPPED
+        assert ticker not in main._active_trades
+
+        # Still exactly ONE leg — the entry leg, now CLOSED with realised P&L.
+        legs = blotter.query_legs(parent_trade_id=trade_id)
+        assert len(legs) == 1
+        entry_leg = legs[0]
+        assert entry_leg.status == "closed"
+        assert entry_leg.exit_price == 43
+        expected_fee = int(config.FEE_PER_CONTRACT_CENTS * 1)
+        assert entry_leg.realised_pnl_cents == (43 - 61) * 1 - expected_fee
+
+        # Parent trade closed and net P&L reflects the realised loss.
+        parent = blotter.query_trades()
+        parent = [p for p in parent if p.trade_id == trade_id][0]
+        assert parent.status == "closed"
+        assert parent.net_pnl_cents == (43 - 61) * 1 - expected_fee
+        assert parent.total_contracts == 1   # no phantom second contract
+    finally:
+        (
+            main._blotter, main._strategy, main._store, main._execution,
+            main._circuit_breaker, main._alert_manager,
+            main._active_trades, main._pending_orders,
+        ) = saved
+
+
+def test_hedge_fill_marks_trade_hedged_not_closed():
+    """Regression: hedge fill must mark the parent ``hedged`` and keep both
+    legs open for settlement — not ``close_trade`` with net_pnl=0."""
+    import main
+    from metrics.blotter import Blotter
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState
+
+    saved = (
+        main._blotter, main._strategy, main._store, main._execution,
+        main._circuit_breaker, main._alert_manager,
+        dict(main._active_trades), dict(main._pending_orders),
+    )
+    try:
+        ticker = "KXTEST-HEDGE-LEG"
+        blotter = Blotter(":memory:")
+        strat   = GreenUpStrategy(hedge_offset_cents=26)
+        strat.add_watch_ticker(ticker)
+
+        main._blotter         = blotter
+        main._strategy        = strat
+        main._store           = None
+        main._execution       = None
+        main._circuit_breaker = None
+        main._alert_manager   = None
+        main._active_trades   = {}
+        main._pending_orders  = {}
+        main._processed_fill_ids.clear()
+
+        pos = strat.get_position(ticker)
+        pos.state = PositionState.WATCHING
+        main._pending_orders["entry-1"] = {
+            "ticker": ticker, "trade_type": "entry", "meta": {},
+            "strategy": "green_up_full_green_market", "category": "Sports",
+            "side": "yes",
+        }
+        main.on_fill_received({
+            "trade_id": "E1", "order_id": "entry-1", "ticker": ticker,
+            "side": "yes", "action": "buy", "price": 25, "size_cents": 25,
+            "contracts": 1,
+        })
+        trade_id = main._active_trades[ticker]
+
+        pos = strat.get_position(ticker)
+        pos.state = PositionState.HEDGING
+        main._pending_orders["hedge-1"] = {
+            "ticker": ticker, "trade_type": "hedge", "meta": {},
+            "strategy": "green_up_full_green_market", "category": "Sports",
+            "side": "no",
+        }
+        main.on_fill_received({
+            "trade_id": "H1", "order_id": "hedge-1", "ticker": ticker,
+            "side": "no", "action": "buy", "price": 49, "size_cents": 49,
+            "contracts": 1,
+        })
+
+        assert strat.get_position(ticker).state == PositionState.HEDGED
+        assert ticker not in main._active_trades
+
+        parents = blotter.query_trades(trade_id=trade_id)
+        assert len(parents) == 1
+        assert parents[0].status == "hedged"
+        assert parents[0].net_pnl_cents is None
+        assert "locked_profit_cents=" in parents[0].notes
+
+        legs = blotter.query_legs(parent_trade_id=trade_id, status="open")
+        assert len(legs) == 2
+        assert any(p["trade_id"] == trade_id for p in blotter.open_positions_summary())
+    finally:
+        (
+            main._blotter, main._strategy, main._store, main._execution,
+            main._circuit_breaker, main._alert_manager,
+            main._active_trades, main._pending_orders,
+        ) = saved
+

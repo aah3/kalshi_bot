@@ -113,6 +113,7 @@ def _render_account(snapshot: PortfolioSnapshot | None) -> None:
     value    = sum(p.current_value for p in snapshot.positions) / 100
     unreal   = snapshot.total_unrealised_pnl_cents / 100
     realised = snapshot.session_realised_pnl_cents / 100
+    session  = snapshot.session_total_pnl_cents / 100
     max_pay  = snapshot.total_max_payout_cents / 100
 
     pnl_pct = (unreal / invested * 100) if invested > 0 else 0.0
@@ -124,7 +125,7 @@ def _render_account(snapshot: PortfolioSnapshot | None) -> None:
         f"Unrealised P&L: {_pnl_color(unreal)} ({pnl_pct:+.1f}%)"
     )
     print(
-        f"  Session realised: {_pnl_color(realised)}   "
+        f"  Session P&L: {_pnl_color(session)} (realised {_pnl_color(realised)})   "
         f"Max payout (all win): ${max_pay:.2f}   "
         f"Open positions: {snapshot.num_positions}"
     )
