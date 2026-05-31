@@ -4,16 +4,21 @@ Production-grade automated trading system for [Kalshi](https://kalshi.com) binar
 
 ### Recent updates
 
+- **Trade lifecycle & blotter P&L (2026-05-30/31)** — exit/stop fills **close the entry leg** with realised P&L (no phantom opposing legs); green_up hedged parents stay `hedged` until settlement (`mark_trade_hedged`); stop/exit fills finalize even when Kalshi reports contra-side labels (`side: "no"`). Same fill handling for `high_prob`. Maintenance: `scripts/cleanup_stale_trades.py`.
+- **Test/prod isolation** — `pytest` redirects logs and DB to a temp sandbox so the suite cannot append to `kalshi_bot_prod.jsonl` / `kalshi_bot_prod.db`.
+- **Position alerts** — `AlertManager` skips stop/profit alerts on exchange positions the bot does not own (no CRITICAL noise on manual holdings).
+- **Runtime live gates** — per-tick entry checks use WebSocket book/tape freshness; REST `updated_time` staleness applies at discovery only (fixes false “market not live” blocks on active in-play markets).
 - **Demo / production profiles** — switch `KALSHI_ENV` only; per-env API keys, DB path, log file, and risk caps (`KALSHI_DEMO_*` / `KALSHI_PROD_*`)
 - **Live market registry** — discovery and entries default to recently updated, soon-closing markets with fresh WebSocket books and recent tape
 - **Strategy discovery presets** — `--discover` auto-applies filters/ranking matched to `--strategy` (overridable per flag)
 - **Entry gates** — block new entries on low cash or markets too close to expiry (`risk/entry_gates.py`)
 - **Concurrent position cap** — `--max-concurrent-positions` limits simultaneous entry legs (hedges/stops still run)
-- **Green-up** — multi-ticker parallel watch, hedge modes (`full_green` / `stake_back` / `partial`), configurable entry/exit pricing and max cycles per ticker
-- **High-probability** — fee-adjusted ROI gating, post-fill take-profit / stop modes, fixed or Kelly-capped stake
+- **Green-up** — multi-ticker parallel watch, hedge modes (`full_green` / `stake_back` / `partial`), configurable entry/exit pricing, resting hedge/stop with safe reprice guards, max cycles per ticker
+- **High-probability** — fee-adjusted ROI gating, post-fill take-profit / stop modes, fixed or Kelly-capped stake; exit fills hardened like green_up
+- **Resilience** — WS liveness watchdog, REST book fallback + reconnect escalation, REST fill reconciliation (`KALSHI_FILL_RECONCILE_SECONDS`)
 - **Prod scripts** — `scripts/run_green_up_prod.ps1`, `scripts/run_high_prob_prod.ps1`, `scripts/compare_prod_sessions.ps1` (isolated DB/logs for A/B)
 - **Blotter queries** — filter trades/legs by strategy, category, date, resolution; export CSV
-- **Roadmap** — certification plan in [docs/ROADMAP.md](docs/ROADMAP.md)
+- **Roadmap** — certification plan and implementation status in [docs/ROADMAP.md](docs/ROADMAP.md)
 
 ## Requirements
 
@@ -602,8 +607,19 @@ Every trade opened through **`main.py`** is recorded in a SQLite database (defau
 
 | Table | Contents |
 |-------|----------|
-| `parent_trades` | One row per logical trade (e.g. full green-up cycle) — net P&L, category, strategy, hold time, resolution |
+| `parent_trades` | One row per logical trade — status `open` → `hedged` (both legs filled, awaiting settlement) → `closed` / `settled`; net P&L rolled up when legs close |
 | `trades` | One row per **leg** (entry, hedge, stop) — side, prices, fees, `trade_type` |
+
+**Lifecycle accounting (bot-driven orders):**
+
+| Event | Blotter behavior |
+|-------|------------------|
+| Entry fill | Opens parent + `entry` leg |
+| Hedge fill (green_up) | Records `hedge` leg; parent → **`hedged`** (legs stay open until market resolves) |
+| Exit / stop fill | **`close_leg`** on the open entry leg at fill price (realised P&L); parent → **`closed`** when strategy completes |
+| Settlement | `SettlementWatcher` closes remaining open legs; parent → **`settled`** |
+
+Stale or pre-fix rows (phantom second legs, parents stuck `open` after stop) can be reconciled with `python scripts/cleanup_stale_trades.py` (dry-run by default; `--apply` to persist).
 
 The same database also holds **metrics** tables (`signals`, `metrics_fills`, `equity_snapshots`) for fill rate, Sharpe, and drawdown. Structured JSON logs go to `kalshi_bot.jsonl` (`KALSHI_LOG_FILE`).
 
@@ -627,7 +643,7 @@ The same database also holds **metrics** tables (`signals`, `metrics_fills`, `eq
 
 | Filter | Flag | Example |
 |--------|------|---------|
-| Status | `--status` | `open`, `closed`, `settled` |
+| Status | `--status` | `open`, `hedged`, `closed`, `settled` |
 | Category | `--category` | `Sports`, `Politics` |
 | Strategy | `--strategy` | `green_up` (substring match) |
 | Ticker | `--ticker` | exact market ticker |
@@ -702,7 +718,7 @@ Common issues when running the bot or `tools/trade.py`. Check structured logs in
 
 | Check | What to do |
 |-------|------------|
-| Live gates | Default requires fresh WS book (≤30 min) and recent tape (≤2 h). Wait for WS snapshots or temporarily `--no-live-only` to test. |
+| Live gates | Default requires fresh WS book (≤30 min) and recent tape (≤2 h). Runtime entry uses WS freshness only — REST `updated_time` is a **discovery** filter, not re-checked every tick. Wait for WS snapshots or temporarily `--no-live-only` to test. |
 | Entry price | Green-up only buys when YES **ask** ≤ `--entry-max` (default 25¢). Prices above that are expected skips. |
 | WebSocket | Strategy entries need WS ticks, not REST-only monitor prices. Confirm ingestor connected (no repeated WS errors in logs). |
 | Concurrent cap | `--max-concurrent-positions N` blocks **new entries** when N legs are open; hedges/stops still fire. |
@@ -752,6 +768,22 @@ Common issues when running the bot or `tools/trade.py`. Check structured logs in
 
 **Fix:** Use Kalshi account history for manual legs, or annotate via blotter CLI if you import them later.
 
+### False `POSITION STOP` / `RISK_BREACH` on holdings you did not open
+
+**Symptom:** Log shows `POSITION STOP ALERT` / `RISK_BREACH` for a ticker the bot never traded, often with `(bot owns 0/N contracts; rest is non-bot)`.
+
+**Cause:** The exchange portfolio includes **all** your positions; alerts used to fire on aggregate unrealised loss even when the bot owned none of the contracts.
+
+**Fix:** Current builds skip stop/profit alerts when blotter attribution shows **zero bot-owned contracts**. If you still see phantom `RISK_BREACH` drawdown values in an old log, check whether `pytest` ran against prod paths — the test suite now redirects logs/DB to a temp directory (`tests/conftest.py`).
+
+### Blotter parent stuck `open` after stop or hedge
+
+**Symptom:** Exchange is flat but `tools/blotter.py open` still lists the trade; `net_pnl_cents` is null or parent shows two open legs after a stop.
+
+**Cause:** Pre-2026-05-31 builds booked stop fills as new legs instead of closing the entry leg, or called `close_trade` on hedged parents before settlement (net P&L = 0).
+
+**Fix:** Upgrade to current code. Reconcile legacy rows: `python scripts/cleanup_stale_trades.py --reconcile-stops --cancel T-XXXX --apply` (see script help; dry-run without `--apply` first).
+
 ### Credentials / environment
 
 | Symptom | Fix |
@@ -778,12 +810,13 @@ Common issues when running the bot or `tools/trade.py`. Check structured logs in
 ## Production checklist
 
 - [ ] Two+ weeks demo trading without unhandled exceptions
-- [ ] `python -m pytest tests/ -v` all green
+- [ ] `python -m pytest tests/ -v` all green (**224/224** as of 2026-05-31)
 - [ ] Kelly calibration ratio 0.85–1.10 (30+ settled trades per strategy)
 - [ ] Clean SIGINT shutdown (orders cancelled)
 - [ ] Circuit breaker tested in demo (`MAX_DRAWDOWN_PCT=0.01`) — uses live portfolio sync every `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS`
 - [ ] Pre-trade gates verified: low balance and `KALSHI_MIN_MINUTES_TO_EXPIRY` block new entries
-- [ ] Blotter legs match exchange fills only (no optimistic submit-time rows)
+- [ ] Blotter legs match exchange fills; exit/stop closes entry leg with realised P&L; hedged parents show `hedged` until settlement
+- [ ] At least one signed **green_up** and **high_prob** demo session with full entry → exit/hedge/stop cycle (see [ROADMAP Week 2](docs/ROADMAP.md#week-2--certify-high_prob-and-green_up))
 - [ ] `config.py` reviewed: `MAX_POSITION_CENTS`, `DAILY_LOSS_LIMIT_CENTS`, fees
 - [ ] `KALSHI_ENV=production` not set in shell profiles by accident
 
@@ -796,7 +829,7 @@ kalshi_bot/
 ├── config.py                     Tunable parameters (demo/prod profiles, fees, risk)
 ├── main.py                       Bot entry point + discovery CLI
 ├── docs/ROADMAP.md               Certification / rollout plan
-├── scripts/                      Production PowerShell runners + session compare
+├── scripts/                      Production PowerShell runners, cleanup_stale_trades, session compare
 ├── strategy/
 │   ├── base_strategy.py          Signal interface
 │   ├── factory.py                build_strategy() by name

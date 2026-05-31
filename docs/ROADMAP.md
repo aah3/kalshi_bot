@@ -321,7 +321,7 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 | Step | Command (example) | Expected output | If it fails |
 |------|-------------------|-----------------|-------------|
 | 2.5 | `main.py --discover --discover-category Sports --strategy green_up --discover-top 5 --gu-entry-mode market --max-concurrent-positions 5` | Live Sports tickers, states watching→entered | Live gates block → wait for WS; check `--entry-max` |
-| 2.6 | Through hedge or stop | Blotter shows `hedge` or `stop_loss` leg | Tune `--hedge-trigger`, `--gu-exit-mode cross_spread` |
+| 2.6 | Through hedge or stop | **Hedge:** parent `hedged`, entry + `hedge` legs open until settlement. **Stop:** entry leg **closed** at stop fill price, parent `closed`, realised P&L on entry leg | Tune `--hedge-trigger`, `--gu-exit-mode cross_spread`; if parent stuck `open`, run `scripts/cleanup_stale_trades.py` |
 | 2.7 | Flatten manually if needed | `trade.py close` works | Sell uses bid floor; portfolio shows side |
 
 **Week 2 deliverable:** Two sections in `testing.txt` (or this doc) with exact commands + 3 session notes each.
@@ -498,7 +498,7 @@ Session monitor / logs should show state transitions per ticker. One **parent tr
    | Entry signal | `ORDER_SENT` buy YES | Price matches mode (bid for passive) |
    | Fill | Fill event / `ENTERED` | Exchange portfolio shows YES |
    | Hedge or stop | `ORDER_SENT` buy NO or stop leg | State → `HEDGING` or `STOPPING` |
-   | Complete | `HEDGED` or `STOPPED` | Blotter has 2 legs (entry + hedge/stop) |
+   | Complete | `HEDGED` or `STOPPED` | **Hedge:** parent `hedged`, two open legs. **Stop:** entry leg closed with realised P&L, parent `closed` (not a phantom second leg) |
 
 5. **Reconcile:**
 
@@ -508,7 +508,19 @@ Session monitor / logs should show state transitions per ticker. One **parent tr
    python tools/blotter.py detail --trade-id T-XXXX
    ```
 
-   Exchange fills must match blotter legs (fees within tolerance). Parent trade status should move toward `closed` / `hedged` as legs complete.
+   Exchange fills must match blotter legs (fees within tolerance). Parent status: **`hedged`** when both legs filled (await settlement), **`closed`** after stop or high_prob exit, **`settled`** after `SettlementWatcher` resolves the market.
+
+### Phase D — P&L and settlement
+
+| When | Command | What to verify |
+|------|---------|----------------|
+| Intraday | `blotter.py detail --trade-id …` | Leg prices, fees; stop/exit shows **closed** entry leg with `realized_pnl_cents` |
+| After hedge | `blotter.py open --status hedged` | Parent `hedged`; entry + hedge legs open; net P&L null until settlement |
+| End of day | `blotter_report.py performance --days 1` | Per-strategy net (realised from closed legs only) |
+| After event | `blotter.py trades --status settled` | Resolution matches Kalshi UI; both legs closed |
+| Legacy cleanup | `python scripts/cleanup_stale_trades.py` (dry-run) | Reconciles pre-fix phantom legs / stuck parents; `--apply` to persist |
+
+Settlement watcher runs every 5 min while bot is up; final check also runs on shutdown.
 
 ### Phase B — Discovery mode, parallel tickers (production-like)
 
@@ -538,16 +550,6 @@ python tools/trade.py portfolio
 ```
 
 Document: number of round-trips, net P&L per trade ID, any manual `trade.py close` interventions.
-
-### Phase D — P&L and settlement
-
-| When | Command | What to verify |
-|------|---------|----------------|
-| Intraday | `blotter.py detail --trade-id …` | Leg prices, fees, unrealized |
-| End of day | `blotter_report.py performance --days 1` | Per-strategy net |
-| After event | `blotter.py trades --status settled` | Resolution matches Kalshi UI |
-
-Settlement watcher runs every 5 min while bot is up; final check also runs on shutdown.
 
 ### Pricing modes (entry at bid vs bid − n¢)
 
@@ -675,9 +677,9 @@ python tools/blotter.py detail --trade-id T-0001
 
 ---
 
-## Implementation status (2026-05-29)
+## Implementation status (2026-05-31)
 
-Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off. Supersedes the 2026-05-25 snapshot.
+Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off. Supersedes the 2026-05-29 snapshot.
 
 ### Summary
 
@@ -685,30 +687,30 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 |-------|----------------|-------------------|
 | Environment profiles | Done | Verify each session with `python -c "import config; …"` |
 | Week 1 — platform baseline | Done | **In progress** — soak, circuit breaker, manual sell not formally signed |
-| Week 2 — `high_prob` + `green_up` | Done (hardened) | **Partial** — `testing.md` has commands; no 3× session sign-off per strategy |
+| Week 2 — `high_prob` + `green_up` | Done (hardened) | **Partial** — `testing.md` has commands; **one prod green_up micro-run** (2026-05-30) exercised entry→stop; post-run bugs fixed; no 3× demo sign-off per strategy |
 | Week 3 — `kelly` + `arb` | Done | **Not started** — no documented demo sessions |
 | Week 4 — demo soak + prod dry-run | Tooling done | **Not started** — no 2-week soak; prod dry-run not recorded |
-| Week 5+ — prod micro-pilot | Scripts ready | **Blocked** — waiting on Week 4 |
+| Week 5+ — prod micro-pilot | Scripts ready | **Partial** — green_up prod session logged; awaiting clean re-run after lifecycle fixes |
 
-**Automated tests:** `194/194` pass (`python -m pytest tests/ -q`, ~1.5 s). The 2026-05-25 isolation failures are **resolved**: the duplicate `test_circuit_breaker_v0.py` was removed and `tests/conftest.py` now isolates the `FEE_PER_CONTRACT_CENTS` config shim. **Roadmap step 1.2 (P0 #2) is no longer a blocker.** Net since last snapshot: +35 tests, with new suites for fill reconciliation, alert manager, metrics store, book freshness, price targets, and expanded green-up execution.
+**Automated tests:** `224/224` pass (`python -m pytest tests/ -q`). Net since 2026-05-29 snapshot: +30 tests covering stop/exit fill reconciliation, hedge accounting, high_prob exit fills, alert scoping, live-market runtime gates, and stale-trade cleanup.
 
 ### Definition of done (demo) — status
 
 | # | Criterion | Status | Notes |
 |---|-----------|--------|-------|
-| 1 | Discover → WS → signal → order → fill → blotter | Partial | Platform path exists; not all four strategies have a documented end-to-end fill cycle |
-| 2 | Exchange matches bot | Partial | Blotter + `trade.py portfolio`; manual `trade.py` orders still excluded from blotter (known gap) |
+| 1 | Discover → WS → signal → order → fill → blotter | **Improved** | Exit/stop fills now close entry legs with realised P&L; hedged parents await settlement; prod green_up stop path validated post-fix |
+| 2 | Exchange matches bot | **Improved** | Blotter + `trade.py portfolio`; `scripts/cleanup_stale_trades.py` for legacy rows; manual `trade.py` orders still excluded (known gap) |
 | 3 | Live gates | Implemented | Default on; `--no-live-only` used in many `testing.md` runs |
 | 4 | SIGINT shutdown | Implemented | `main.py` cancel-all + settlement check; needs signed live run |
 | 5 | Circuit breaker | Implemented | Unit tests + portfolio sync; live Tests A/B not recorded in checklist |
-| 6 | Automated tests | **Done** | `194/194` green in full suite; isolation failures fixed |
+| 6 | Automated tests | **Done** | `224/224` green in full suite |
 
 ### Week-by-week certification progress
 
 | Week | Step | Code ready? | Certified? |
 |------|------|-------------|------------|
 | 1 | 1.1 Demo keys / startup | Yes | Assumed (active dev) |
-| 1 | 1.2 `pytest tests/` | **Yes** | 194/194 green; isolation fixed |
+| 1 | 1.2 `pytest tests/` | **Yes** | 224/224 green |
 | 1 | 1.3 Config profile print | Yes | — |
 | 1 | 1.4 ~30 min soak + Ctrl+C | Yes | Not signed in README checklist |
 | 1 | 1.5 Circuit breaker live (A + B) | Yes | Not signed |
@@ -721,7 +723,7 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | 4 | Weekly blotter / session reports | Yes (`blotter_report.py`, `session_report.py`) | Not run on schedule |
 | 4 | Prod keys in `.env`, stay on demo | — | Unknown |
 | 4 | Prod dry-run (immediate Ctrl+C) | Yes | Not recorded |
-| 5 | Prod micro-pilot per strategy | Yes (`scripts/run_*_prod.ps1`) | **Do not start** until Week 4 complete |
+| 5 | Prod micro-pilot per strategy | Yes (`scripts/run_*_prod.ps1`) | **Partial** — green_up prod run 2026-05-30; re-certify after lifecycle fixes |
 
 ### Built since roadmap was written (beyond original scope)
 
@@ -760,6 +762,29 @@ Major reliability work landed in commits `69e104f` (price targets / green-up ref
 
 - **`PortfolioMonitor.session_realised_pnl_cents` was a placeholder.** `refresh()` previously computed realised P&L as `sum(int(f.get("is_taker", 0)) for f in fills)` — taker flags, **not** dollars — so "Session realised P&L" in the portfolio report / session table / dashboard was meaningless. **Fixed:** `realized_pnl_cents_from_fills()` now does weighted-average-cost matching per `(ticker, side)` over `/portfolio/fills`, booking `contracts_closed × (sell_price − avg_cost)` on each closing sell. Sells beyond the tracked long (opening buy predates the fills window) are ignored rather than assumed free, so the figure is conservative. Settlement payouts (hold-to-expiry) remain on the `SettlementWatcher` → blotter / equity-snapshot path and are intentionally excluded. Covered by `tests/test_portfolio_pnl.py` (10 cases). The circuit breaker was never affected (it keys off `portfolio_value_cents`).
 
+### Trade lifecycle & blotter reconciliation — FIXED (2026-05-30/31)
+
+Commits `d4dfa5f` (green_up + platform hygiene) and `22b2b49` (high_prob parity). Motivated by a **production green_up session** on `KXNBAGAME-26MAY30SASOKC-SAS` (entry 1 YES @ 61¢, stop @ 43¢) that exposed fill-label and blotter accounting bugs.
+
+**Fill recognition (`green_up`, `high_prob`)**
+- **Stop/exit fills are side-agnostic** — Kalshi may report contra-side labels (`side: "no"` on a YES stop sell); strategies match by `order_id` and apply the fill regardless.
+- **Green-up reprice guard** — `MAX_STOP_CANCEL_FAILURES` caps cancel-404 loops when a stop already filled but the strategy missed the event.
+- **High_prob** — `EXIT_PENDING` uses the same pattern via `_apply_exit_fill()`; `main.py` falls back to `close_trade()` if the blotter closed the entry leg but strategy state lagged.
+
+**Blotter P&L (`main.py`, `metrics/blotter.py`)**
+- Exit/stop fills call **`close_leg`** on the open **entry** leg (realised P&L), not `record_fill` for a phantom opposing leg.
+- **Hedged parents** → `mark_trade_hedged()` → status **`hedged`** until `SettlementWatcher` settles both legs (no premature `close_trade` with `net_pnl=0`).
+- **Stop path** → entry leg closed at stop price → parent **`closed`** with realised loss.
+
+**Hygiene & ops**
+- **`tests/conftest.py`** — pytest redirects `KALSHI_*_DB_PATH` and log paths to a temp sandbox (fixes test pollution of prod log/DB and phantom `RISK_BREACH` events).
+- **`risk/alert_manager.py`** — skip `POSITION_STOP` / `PROFIT_TARGET` when blotter shows **zero bot-owned contracts** on that ticker.
+- **`discovery/live_market.py`** — runtime `is_tick_live()` uses WS book/tape freshness only; REST `updated_time` recency is a **discovery** filter (fixes false “market not live” blocks on active in-play markets).
+- **`scripts/cleanup_stale_trades.py`** — dry-run/apply reconcile for pre-fix stuck parents and phantom legs (used on prod DB 2026-05-31).
+- **Prod log** — `kalshi_bot_prod.jsonl` archived (~66k lines) and reset for clean post-fix telemetry.
+
+**Tests added:** green_up stop fill side mismatch, hedge `mark_trade_hedged`, high_prob contra-side exit, fill-reconciliation end-to-end, alert scoping, live-market runtime gate.
+
 ### Session P&L display reconciled with kill switch — FIXED (2026-05-30)
 
 - **The live monitor's "Session" figure did not match the metric the kill switch trips on.** The session table / dashboard showed `session_realised_pnl_cents` (realised-only, from closing fills), while the circuit breaker's session-loss limit (check #2) trips on the change in **total mark-to-market equity** (`portfolio_value_cents − _session_start_equity`, which includes *unrealised* P&L). In a production run the monitor displayed `Session $0.00` the whole time while a held position bled unrealised P&L, then the breaker fired `session loss limit exceeded session_pnl=-522 limit=-500` — confusing because the two numbers measure different things. **Fixed:** `PortfolioMonitor` now tracks a session-start *equity* baseline and exposes `PortfolioSnapshot.session_total_pnl_cents` (= realised + unrealised since the monitor started). The live monitor's "Session" and the dashboard now display this total; the circuit breaker adopts the same baseline on first `sync_from_portfolio()` so its session-loss metric is **definitionally identical** to the displayed figure (single source of truth). Trip logic is unchanged. Covered by two new cases in `tests/test_circuit_breaker_sync.py` (baseline adoption + trips on unrealised-only session loss).
@@ -773,41 +798,44 @@ Major reliability work landed in commits `69e104f` (price targets / green-up ref
 | Manual `trade.py` → blotter sync | Deferred (workaround exists) |
 | Auto-flatten on shutdown (optional flag) | Deferred (by design — positions survive Ctrl+C) |
 | Native green_up resting take-profit | Deferred — `--gu-hedge-style resting` covers the hedge leg; a true "+X¢ TP" still uses the `high_prob` low-band workaround |
+| Stale open-trade maintenance | **Done** — `scripts/cleanup_stale_trades.py` |
+| Test/prod log+DB isolation in pytest | **Done** — `tests/conftest.py` |
 | REST fill reconciliation (WS safety net) | **Done** — `trading/fill_reconciler.py` |
 
-### Production readiness gaps (priority order, updated 2026-05-29)
+### Production readiness gaps (priority order, updated 2026-05-31)
 
 **P0 — must fix before real money**
 
-1. Complete Week 1–4 demo certification (README checklist all checked) — *still the primary blocker; all code paths exist but no signed sessions*
-2. ~~Fix full `pytest` suite~~ — **DONE** (194/194 green; isolation fixed)
-3. Live circuit breaker Tests A + B on demo with session notes
-4. Blotter ↔ exchange reconciliation on bot-driven orders for each strategy you will run in prod — *now easier to verify with REST fill reconciliation + `PortfolioMonitor`*
-5. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier (now feeds the high-prob fee-adjusted ROI gate)
+1. Complete Week 1–4 demo certification (README checklist all checked) — *still the primary blocker; lifecycle fixes landed but signed demo sessions still needed*
+2. ~~Fix full `pytest` suite~~ — **DONE** (224/224 green)
+3. ~~Trade lifecycle / blotter exit P&L~~ — **DONE** (2026-05-30/31; re-run prod micro-pilot to sign off)
+4. Live circuit breaker Tests A + B on demo with session notes
+5. Blotter ↔ exchange reconciliation on bot-driven orders for each strategy you will run in prod
+6. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier (now feeds the high-prob fee-adjusted ROI gate)
 
 **P1 — before unattended / 24×7 prod**
 
-6. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl` — *exercise the WS watchdog + REST fallback + fill reconciliation under real disconnects*
-7. ~~Fix `PortfolioMonitor` session-realised-P&L placeholder~~ — **DONE** (2026-05-29; `realized_pnl_cents_from_fills` + `tests/test_portfolio_pnl.py`)
-8. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
-9. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
-10. **External** alerting sink for `risk_breach` / `kill switch` / repeated WS disconnect / `AlertManager` CRITICAL — *structured alerts now exist in code, but delivery is still JSONL + stderr only; add a webhook/email/Slack/PagerDuty transport*
-11. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
-12. Tune the new resilience knobs for prod and document chosen values: `KALSHI_WS_MAX_SILENCE_SECONDS`, `KALSHI_WS_STALE_ESCALATE_POLLS`, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`, `KALSHI_FILL_RECONCILE_SECONDS`
+7. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl` — *exercise the WS watchdog + REST fallback + fill reconciliation under real disconnects*
+8. ~~Fix `PortfolioMonitor` session-realised-P&L placeholder~~ — **DONE** (2026-05-29; `realized_pnl_cents_from_fills` + `tests/test_portfolio_pnl.py`)
+9. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
+10. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
+11. **External** alerting sink for `risk_breach` / `kill switch` / repeated WS disconnect / `AlertManager` CRITICAL — *structured alerts now exist in code, but delivery is still JSONL + stderr only; add a webhook/email/Slack/PagerDuty transport*
+12. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
+13. Tune the new resilience knobs for prod and document chosen values: `KALSHI_WS_MAX_SILENCE_SECONDS`, `KALSHI_WS_STALE_ESCALATE_POLLS`, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`, `KALSHI_FILL_RECONCILE_SECONDS`
 
 **P2 — operational maturity**
 
-13. CI pipeline (`pytest` on push) — **no `.github/workflows` today**; now high-value and low-effort since the suite is fully green (aligns with project CI/CD standards)
-14. Secrets outside flat `.env` (vault / host env) for prod keys
-15. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter + metrics durability
-16. Runbook for orphan orders, partial arb legs, manual flatten, and forced-reconnect storms
-17. Python 3.11+ on runtime host (README requirement; dev machine may be 3.10)
+14. CI pipeline (`pytest` on push) — **no `.github/workflows` today**; now high-value and low-effort since the suite is fully green (aligns with project CI/CD standards)
+15. Secrets outside flat `.env` (vault / host env) for prod keys
+16. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter + metrics durability
+17. Runbook for orphan orders, partial arb legs, manual flatten, and forced-reconnect storms
+18. Python 3.11+ on runtime host (README requirement; dev machine may be 3.10)
 
 **P3 — nice to have**
 
-18. Docker / container health checks
-19. Full fill-funnel metrics and dashboard hardening (build on `MetricsStore`)
-20. Manual trade → blotter sync for mixed manual/bot workflows
+19. Docker / container health checks
+20. Full fill-funnel metrics and dashboard hardening (build on `MetricsStore`)
+21. Manual trade → blotter sync for mixed manual/bot workflows
 
 ---
 
