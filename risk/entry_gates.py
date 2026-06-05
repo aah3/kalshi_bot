@@ -22,6 +22,32 @@ def minutes_to_close(
     return None
 
 
+def check_stop_loss_allowed(
+    market: MarketSummary | None,
+    threshold_minutes: float,
+) -> tuple[bool, str]:
+    """
+    Return (True, "") when a stop-loss order may be submitted, else (False, reason).
+
+    Suppresses the stop when more than ``threshold_minutes`` remain before the
+    market closes, giving the position time to rebound mid-event.  The check is
+    a no-op when:
+      - threshold_minutes <= 0  (feature disabled)
+      - market is None or minutes_to_close is unknown  (fail-open — allow stop)
+    """
+    if threshold_minutes <= 0:
+        return True, ""
+    if market is None or market.minutes_to_close is None:
+        return True, ""
+    if market.minutes_to_close > threshold_minutes:
+        return (
+            False,
+            f"time remaining {market.minutes_to_close:.1f}m "
+            f"> threshold {threshold_minutes:.0f}m — hold position",
+        )
+    return True, ""
+
+
 def check_entry_allowed(
     *,
     phase: str,

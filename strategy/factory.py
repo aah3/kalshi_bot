@@ -28,8 +28,15 @@ from strategy.high_prob_strategy import (
     parse_take_profit_style,
 )
 from strategy.kelly_strategy import KellyStrategy
+from strategy.mean_reversion_strategy import (
+    MeanReversionStrategy,
+    PostFillMode as MRPostFillMode,
+    parse_exit_target,
+    parse_mr_stop_loss_cents,
+    parse_trade_direction,
+)
 
-VALID_STRATEGIES = ("kelly", "green_up", "arb", "high_prob")
+VALID_STRATEGIES = ("kelly", "green_up", "arb", "high_prob", "mean_reversion")
 
 
 def _parse_model_probs(raw: str | None) -> dict[str, float]:
@@ -108,6 +115,25 @@ def build_strategy(
     gu_no_entry_max: bool = False,
     gu_hedge_style: str | None = None,
     hp_exit_mode: str | None = None,
+    mr_lookback: int | None = None,
+    mr_entry_deviation: int | None = None,
+    mr_take_profit_offset: int | None = None,
+    mr_stop_loss_cents: int | None = None,
+    mr_min_volatility: float | None = None,
+    mr_entry_max: int | None = None,
+    mr_entry_min: int | None = None,
+    mr_short_min_yes_ask: int | None = None,
+    mr_short_max_yes_ask: int | None = None,
+    mr_stake_cents: int | None = None,
+    mr_max_spread: int | None = None,
+    mr_trade_direction: str | None = None,
+    mr_exit_target: str | None = None,
+    mr_entry_mode: str | None = None,
+    mr_exit_mode: str | None = None,
+    mr_post_fill: str | None = None,
+    mr_max_cycles: int | None = None,
+    mr_limit_offset: int | None = None,
+    mr_min_samples: int | None = None,
 ) -> BaseStrategy:
     """
     Build a strategy instance by name.
@@ -123,6 +149,7 @@ def build_strategy(
         stop_loss:      Green-up stop in cents per contract (YES bid drop from entry).
         comp_pairs:     Arb only — complementary ticker pairs.
         hp_*:           High-probability strategy tunables.
+        mr_*:           Mean-reversion strategy tunables.
     """
     key = name.strip().lower()
     if key not in VALID_STRATEGIES:
@@ -218,6 +245,112 @@ def build_strategy(
         if model_probs:
             for ticker, prob in model_probs.items():
                 strat.set_model_probability(ticker, prob)
+        for ticker in tickers:
+            strat.add_watch_ticker(ticker)
+        return strat
+
+    if key == "mean_reversion":
+        entry_key = (
+            mr_entry_mode or os.getenv("KALSHI_MR_ENTRY_MODE", "passive")
+        ).lower()
+        exit_key = (
+            mr_exit_mode or os.getenv("KALSHI_MR_EXIT_MODE", "passive")
+        ).lower()
+        post_key = (
+            mr_post_fill or os.getenv("KALSHI_MR_POST_FILL", config.MR_POST_FILL)
+        ).lower()
+        post_map = {
+            "hold":                MRPostFillMode.HOLD_TO_SETTLEMENT,
+            "resting_take_profit": MRPostFillMode.RESTING_TAKE_PROFIT,
+            "resting_stop":        MRPostFillMode.RESTING_STOP_LOSS,
+            "tp_and_stop":         MRPostFillMode.TAKE_PROFIT_AND_STOP,
+        }
+        direction_key = (
+            mr_trade_direction or os.getenv("KALSHI_MR_TRADE_DIRECTION", config.MR_TRADE_DIRECTION)
+        ).lower()
+        exit_target_key = (
+            mr_exit_target or os.getenv("KALSHI_MR_EXIT_TARGET", config.MR_EXIT_TARGET)
+        ).lower()
+        stop_loss_cents_raw = (
+            mr_stop_loss_cents
+            if mr_stop_loss_cents is not None
+            else os.getenv("KALSHI_MR_STOP_LOSS_CENTS")
+        )
+        strat = MeanReversionStrategy(
+            lookback_ticks=(
+                mr_lookback
+                if mr_lookback is not None
+                else _env_int("KALSHI_MR_LOOKBACK_TICKS", config.MR_LOOKBACK_TICKS)
+            ),
+            min_samples=(
+                mr_min_samples
+                if mr_min_samples is not None
+                else _env_int("KALSHI_MR_MIN_SAMPLES", config.MR_MIN_SAMPLES)
+            ),
+            entry_deviation_cents=(
+                mr_entry_deviation
+                if mr_entry_deviation is not None
+                else _env_int("KALSHI_MR_ENTRY_DEVIATION", config.MR_ENTRY_DEVIATION_CENTS)
+            ),
+            take_profit_offset_cents=(
+                mr_take_profit_offset
+                if mr_take_profit_offset is not None
+                else _env_int("KALSHI_MR_TAKE_PROFIT_OFFSET", config.MR_TAKE_PROFIT_OFFSET)
+            ),
+            exit_target=parse_exit_target(exit_target_key),
+            stop_loss_cents=parse_mr_stop_loss_cents(
+                stop_loss_cents_raw if stop_loss_cents_raw is not None else config.MR_STOP_LOSS_CENTS
+            ),
+            min_volatility_cents=(
+                mr_min_volatility
+                if mr_min_volatility is not None
+                else _env_float("KALSHI_MR_MIN_VOLATILITY", config.MR_MIN_VOLATILITY_CENTS)
+            ),
+            entry_max_price=(
+                mr_entry_max
+                if mr_entry_max is not None
+                else _env_int("KALSHI_MR_ENTRY_MAX", config.MR_ENTRY_MAX_PRICE)
+            ),
+            entry_min_price=(
+                mr_entry_min
+                if mr_entry_min is not None
+                else _env_int("KALSHI_MR_ENTRY_MIN", config.MR_ENTRY_MIN_PRICE)
+            ),
+            short_min_yes_ask=(
+                mr_short_min_yes_ask
+                if mr_short_min_yes_ask is not None
+                else _env_int("KALSHI_MR_SHORT_MIN_YES_ASK", config.MR_SHORT_MIN_YES_ASK)
+            ),
+            short_max_yes_ask=(
+                mr_short_max_yes_ask
+                if mr_short_max_yes_ask is not None
+                else _env_int("KALSHI_MR_SHORT_MAX_YES_ASK", config.MR_SHORT_MAX_YES_ASK)
+            ),
+            max_spread_cents=(
+                mr_max_spread
+                if mr_max_spread is not None
+                else _env_int("KALSHI_MR_MAX_SPREAD", config.MR_MAX_SPREAD_CENTS)
+            ),
+            stake_cents=(
+                mr_stake_cents
+                if mr_stake_cents is not None
+                else _env_int("KALSHI_MR_STAKE_CENTS", config.MR_STAKE_CENTS)
+            ),
+            trade_direction=parse_trade_direction(direction_key),
+            entry_price_mode=price_mode_map.get(entry_key, EntryPriceMode.PASSIVE),
+            exit_price_mode=price_mode_map.get(exit_key, EntryPriceMode.PASSIVE),
+            limit_offset_cents=(
+                mr_limit_offset
+                if mr_limit_offset is not None
+                else _env_int("KALSHI_MR_LIMIT_OFFSET", config.MR_LIMIT_OFFSET)
+            ),
+            post_fill_mode=post_map.get(post_key, MRPostFillMode.TAKE_PROFIT_AND_STOP),
+            max_cycles_per_ticker=(
+                mr_max_cycles
+                if mr_max_cycles is not None
+                else _env_int("KALSHI_MR_MAX_CYCLES_PER_TICKER", 0)
+            ),
+        )
         for ticker in tickers:
             strat.add_watch_ticker(ticker)
         return strat

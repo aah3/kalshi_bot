@@ -9,6 +9,7 @@ from __future__ import annotations
 from strategy.base_strategy import BaseStrategy
 from strategy.green_up_strategy import GreenUpStrategy, PositionState as GUState
 from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+from strategy.mean_reversion_strategy import MeanReversionStrategy, PositionState as MRState
 
 
 def count_open_positions(
@@ -41,6 +42,18 @@ def count_open_positions(
             HPState.WATCHING,
             HPState.ENTERED,
             HPState.EXIT_PENDING,
+        }
+        return sum(
+            1
+            for ticker, p in strategy._positions.items()
+            if ticker != exclude_ticker and p.state in open_states
+        )
+
+    if isinstance(strategy, MeanReversionStrategy):
+        open_states = {
+            MRState.WATCHING,
+            MRState.ENTERED,
+            MRState.EXIT_PENDING,
         }
         return sum(
             1

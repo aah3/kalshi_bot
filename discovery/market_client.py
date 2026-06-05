@@ -970,7 +970,12 @@ class MarketClient:
             open_interest=_metric_int("open_interest", "open_interest_fp"),
             liquidity=_metric_int("liquidity", "liquidity_dollars"),
             status=market_status,
-            close_time=_dt(raw.get("close_time") or raw.get("expiration_time")),
+            close_time=_dt(
+                raw.get("close_time")
+                or raw.get("expected_expiration_time")
+                or raw.get("occurrence_datetime")
+                or raw.get("expiration_time")
+            ),
             updated_at=_dt(raw.get("updated_time")),
             result=raw.get("result"),
         )

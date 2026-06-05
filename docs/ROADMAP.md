@@ -1,6 +1,6 @@
 # Development roadmap — demo certification → production micro-pilot
 
-Goal: a **reliable demo environment for all four strategies** (`kelly`, `green_up`, `high_prob`, `arb`), then production testing at **$1 max per market** (`KALSHI_PROD_MAX_POSITION_CENTS=100`). New features ship only on top of a working, certified baseline.
+Goal: a **reliable demo environment for all five strategies** (`kelly`, `green_up`, `high_prob`, `mean_reversion`, `arb`), then production testing at **$1 max per market** (`KALSHI_PROD_MAX_POSITION_CENTS=100`). New features ship only on top of a working, certified baseline.
 
 Switch environments by changing **one variable**: `KALSHI_ENV=demo` or `KALSHI_ENV=production`. Risk limits, database, and log files follow automatically (see [Environment profiles](#environment-profiles)).
 
@@ -122,7 +122,7 @@ python tools/screen.py browse --category Sports --min-volume 10 --full-scan
 # Platform soak with explicit tickers (Week 1 goal: stay up + clean shutdown, not P&L):
 $env:KALSHI_TICKERS="KXMENWORLDCUP-26-EC,KXMENWORLDCUP-26-NO,KXMENWORLDCUP-26-CIV,KXMENWORLDCUP-26"
 $enf:KALSHI_TICKERS="KXMLBTOTAL-26MAY231420HOUCHC-6"
-python main.py --tickers $env:KALSHI_TICKERS --strategy high_prob --hp-entry-mode passive --monitor-interval 30
+python main.py --tickers $env:KALSHI_TICKERS --strategy high_prob --hp-entry-mode passive --monitor-interval 30 --quiet
 
 # If discover-only succeeded, you can use discovery for the soak instead:
 python main.py --discover --discover-category Sports --strategy high_prob --discover-top 2 --hp-entry-mode passive --monitor-interval 30
@@ -292,7 +292,7 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 3. Execute:
 
    ```bash
-   python tools/trade.py sell --ticker YOUR-TICKER --side yes --count 1 --market --yes
+   python tools/trade.py sell --ticker KXMENWORLDCUP-26-SE --side yes --count 1 --market --yes
    # Or flatten entire leg:
    python tools/trade.py close --ticker YOUR-TICKER --yes
    ```
@@ -326,7 +326,17 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 
 **Week 2 deliverable:** Two sections in `testing.txt` (or this doc) with exact commands + 3 session notes each.
 
-**Week 2 testing depth:** Use the [End-to-end strategy testing](#end-to-end-automated-strategy-testing) playbook below for `green_up`; adapt the same phases for `high_prob` (entry → optional TP/stop → hold/settle).
+**Week 2 testing depth:** Use the [End-to-end strategy testing](#end-to-end-automated-strategy-testing) playbook below for `green_up`; adapt the same phases for `high_prob` (entry → optional TP/stop → hold/settle) and `mean_reversion` (entry → resting TP/stop → round-trip close).
+
+#### Mean reversion
+
+| Step | Command (example) | Expected output | If it fails |
+|------|-------------------|-----------------|-------------|
+| 2.8 | `main.py --discover --discover-category Sports --strategy mean_reversion --discover-only` | Mid-range YES (15–85¢), screener-ranked | Widen `--discover-activity-hours`; check min vol 500 |
+| 2.9 | Run 45–60 min, `--mr-trade-direction both --mr-post-fill tp_and_stop` | `watching→entered→exit_pending→closed` cycles on volatile tickers | Flat book → no entry (volatility filter); use live Sports |
+| 2.10 | Post-session | Blotter `closed` parents with entry + exit legs | Same exit-fill hardening as `high_prob` |
+
+**Note:** `mean_reversion` needs enough ticks to build rolling mean/volatility — prefer active in-play markets over stale books.
 
 ---
 
@@ -349,7 +359,7 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 | 3.4 | Define `--comp-pairs T1:T2` or category discover | Arb signals in log | Demo may have **no** arb — document as OK |
 | 3.5 | 2 sessions | Both legs fill or explicit skip logged | Partial leg → manual close; reduce size |
 
-**Week 3 deliverable:** Four strategy runbooks complete; demo certification sign-off.
+**Week 3 deliverable:** Five strategy runbooks complete; demo certification sign-off.
 
 ---
 
@@ -378,6 +388,7 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 | 5.1 | `.env`: `KALSHI_ENV=production`, `KALSHI_PROD_MAX_POSITION_CENTS=100`, `KALSHI_PROD_MAX_CONCURRENT_POSITIONS=1` | Startup: `PRODUCTION`, max position $1.00 | Revert to `demo` |
 | 5.2a | **high_prob:** 1 Politics/Sports ticker, 1 session | ≤ $1 per market; blotter + UI match | See Week 2 high_prob runbook |
 | 5.2b | **green_up:** 1 in-play Sports ticker, 1 session | ≤ $1 entry leg; hedge/stop still allowed | See green_up Phase A; use `market` entry if needed |
+| 5.2c | **mean_reversion:** 1 volatile Sports ticker, 1 session | ≤ $1 per round-trip; TP/stop exits | See Week 2 mean_reversion runbook; `--mr-post-fill tp_and_stop` |
 | 5.3 | One week **per strategy** (alternate days or weeks) | Daily loss &lt; `KALSHI_PROD_DAILY_LOSS_LIMIT_CENTS` | Revert to demo; post-mortem |
 | 5.4 | Optional: kelly / arb at same $1 cap | Same checks | Do not raise cap until both 5.2a and 5.2b are stable |
 
@@ -570,17 +581,17 @@ python main.py --strategy green_up --tickers YOUR-TICKER \
 | `market` | IOC market at touch | Fastest fill |
 | `limit_offset` | `bid + offset` cents | `-2` → bid−2¢; `+1` → bid+1¢ (may IOC if above bid) |
 
-### Take-profit: green_up vs high_prob
+### Take-profit: green_up vs high_prob vs mean_reversion
 
 They are **not** the same mechanism today:
 
-| | **green_up** | **high_prob** |
-|---|-------------|---------------|
-| Entry zone | Cheap YES (e.g. ask ≤ 25¢) | High YES (85–97¢) |
-| “Take profit” | Buy **NO** when YES bid ≥ hedge trigger (formulas: full_green / stake_back / partial) | Resting **sell YES** at entry + offset or % (`--hp-post-fill resting_take_profit`) |
-| Implied “entry prob” | `hedge_trigger` as fair value for Kelly edge, not a model P(YES) | Market implied P from YES ask |
+| | **green_up** | **high_prob** | **mean_reversion** |
+|---|-------------|---------------|---------------------|
+| Entry zone | Cheap YES (e.g. ask ≤ 25¢) | High YES (85–97¢) | Mid-range oscillators; dip or spike vs rolling mean |
+| “Take profit” | Buy **NO** when YES bid ≥ hedge trigger (formulas: full_green / stake_back / partial) | Resting **sell YES** at entry + offset or % (`--hp-post-fill resting_take_profit`) | Resting **sell YES** (long) or **sell NO** (short) toward mean / offset (`--mr-post-fill`) |
+| Implied “fair” | `hedge_trigger` as fair value for Kelly edge, not a model P(YES) | Market implied P from YES ask | Rolling mid-price mean over `--mr-lookback` ticks |
 
-**If you want high_prob-style resting TP on a cheap contract:** you can run `high_prob` with a **low** band, e.g. `--hp-min-yes-ask 10 --hp-max-yes-ask 30`, plus `--hp-post-fill resting_take_profit`. That is a different strategy path than green_up hedging. A native green_up resting-TP mode is not implemented yet (backlog).
+**If you want high_prob-style resting TP on a cheap contract:** you can run `high_prob` with a **low** band, e.g. `--hp-min-yes-ask 10 --hp-max-yes-ask 30`, plus `--hp-post-fill resting_take_profit`. That is a different strategy path than green_up hedging. **`mean_reversion`** is the native path for round-trip volatility capture (buy dip → sell on revert, or fade spike via buy-NO). A native green_up resting-TP mode is not implemented yet (backlog).
 
 ### Max cycles per ticker (round-trips)
 
@@ -609,6 +620,7 @@ They are **not** the same mechanism today:
 |----------|--------------|-------------------------|
 | `green_up` | Hedge (NO) or stop | Yes, while market live |
 | `high_prob` | Resting TP / stop / hold | Yes, with post-fill modes |
+| `mean_reversion` | Resting TP / stop toward rolling mean | Yes, with `--mr-max-cycles` |
 | `kelly` | Hold / manual | Re-enters when edge returns |
 | `arb` | Both legs immediate | Pair-dependent |
 
@@ -785,6 +797,19 @@ Commits `d4dfa5f` (green_up + platform hygiene) and `22b2b49` (high_prob parity)
 
 **Tests added:** green_up stop fill side mismatch, hedge `mark_trade_hedged`, high_prob contra-side exit, fill-reconciliation end-to-end, alert scoping, live-market runtime gate.
 
+### Mean reversion strategy — ADDED (2026-06)
+
+New **`mean_reversion`** strategy for round-trip volatility capture in oscillating markets:
+
+- **`strategy/mean_reversion_strategy.py`** — rolling mid-price mean, long (buy YES dip) and short (buy NO spike) legs, resting TP toward mean/offset, stop on continued adverse move, volatility floor.
+- **Discovery preset** — mid-range YES (15–85¢), screener-ranked, high volume, recently updated (`discovery/discovery_presets.py`).
+- **Screener** — `_score_mean_reversion()` rewards mid-range price, tight spread, and volume (`discovery/screener.py`).
+- **Execution** — `resolve_no_sell` / `resolve_no_sell_exit` in `strategy/execution_price.py` for short-leg exits.
+- **CLI / env** — `--mr-*` flags and `KALSHI_MR_*` defaults in `config.py`; wired through `main.py`, `factory.py`, `position_limits.py`, `tools/replay.py`.
+- **Tests** — `tests/test_mean_reversion_strategy.py` (entry, short, TP, stop, cycle).
+
+**Certification status:** implemented and unit-tested; demo/prod micro-pilot runbook in Week 2 (steps 2.8–2.10) — not yet signed off.
+
 ### Session P&L display reconciled with kill switch — FIXED (2026-05-30)
 
 - **The live monitor's "Session" figure did not match the metric the kill switch trips on.** The session table / dashboard showed `session_realised_pnl_cents` (realised-only, from closing fills), while the circuit breaker's session-loss limit (check #2) trips on the change in **total mark-to-market equity** (`portfolio_value_cents − _session_start_equity`, which includes *unrealised* P&L). In a production run the monitor displayed `Session $0.00` the whole time while a held position bled unrealised P&L, then the breaker fired `session loss limit exceeded session_pnl=-522 limit=-500` — confusing because the two numbers measure different things. **Fixed:** `PortfolioMonitor` now tracks a session-start *equity* baseline and exposes `PortfolioSnapshot.session_total_pnl_cents` (= realised + unrealised since the monitor started). The live monitor's "Session" and the dashboard now display this total; the circuit breaker adopts the same baseline on first `sync_from_portfolio()` so its session-loss metric is **definitionally identical** to the displayed figure (single source of truth). Trip logic is unchanged. Covered by two new cases in `tests/test_circuit_breaker_sync.py` (baseline adoption + trips on unrealised-only session loss).
@@ -797,7 +822,7 @@ Commits `d4dfa5f` (green_up + platform hygiene) and `22b2b49` (high_prob parity)
 | Blotter CLI `--resolution` / unified search | Deferred |
 | Manual `trade.py` → blotter sync | Deferred (workaround exists) |
 | Auto-flatten on shutdown (optional flag) | Deferred (by design — positions survive Ctrl+C) |
-| Native green_up resting take-profit | Deferred — `--gu-hedge-style resting` covers the hedge leg; a true "+X¢ TP" still uses the `high_prob` low-band workaround |
+| Native green_up resting take-profit | Deferred — `--gu-hedge-style resting` covers the hedge leg; use **`mean_reversion`** or `high_prob` low-band for round-trip TP |
 | Stale open-trade maintenance | **Done** — `scripts/cleanup_stale_trades.py` |
 | Test/prod log+DB isolation in pytest | **Done** — `tests/conftest.py` |
 | REST fill reconciliation (WS safety net) | **Done** — `trading/fill_reconciler.py` |

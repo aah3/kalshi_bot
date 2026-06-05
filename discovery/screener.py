@@ -78,6 +78,9 @@ SCREENER_STRATEGY_ALIASES: dict[str, str] = {
     "kelly":     "kelly",
     "high_prob": "high_prob",
     "highprob":  "high_prob",
+    "mean_reversion": "mean_reversion",
+    "meanrev":   "mean_reversion",
+    "mr":        "mean_reversion",
     "arb":       "arb",
     "arbitrage": "arb",
 }
@@ -94,6 +97,12 @@ HP_MIN_YES_ASK: int = 85
 HP_MAX_YES_ASK: int = 97
 HP_MIN_ROI_PCT: float = getattr(config, "HP_MIN_ROI_PCT", 2.0)
 
+# Mean-reversion entry window (cents) — mid-range oscillators
+MR_MIN_YES_ASK: int = getattr(config, "MR_ENTRY_MIN_PRICE", 10)
+MR_MAX_YES_ASK: int = getattr(config, "MR_SHORT_MAX_YES_ASK", 90)
+MR_IDEAL_MIN: int = 25
+MR_IDEAL_MAX: int = 75
+
 # Arbitrage detection
 ARB_SUM_THRESHOLD: int = 98    # flag if sum of YES asks in event < this
 
@@ -104,6 +113,7 @@ class StrategyFit(str, Enum):
     KELLY      = "kelly"
     GREEN_UP   = "green_up"
     HIGH_PROB  = "high_prob"
+    MEAN_REVERSION = "mean_reversion"
     ARB_COMP   = "arb_complementary"
     ARB_SET    = "arb_exhaustive_set"
     ARB_DOM    = "arb_dominance"
@@ -400,6 +410,7 @@ class MarketScreener:
                 (self._score_kelly,     StrategyFit.KELLY),
                 (self._score_green_up,  StrategyFit.GREEN_UP),
                 (self._score_high_prob, StrategyFit.HIGH_PROB),
+                (self._score_mean_reversion, StrategyFit.MEAN_REVERSION),
                 (self._score_arb_comp,  StrategyFit.ARB_COMP),
             ]:
                 score, reasons = scorer_fn(market, book)
@@ -675,6 +686,78 @@ class MarketScreener:
 
         return round(min(score, 1.0), 3), reasons
 
+    def _score_mean_reversion(
+        self, market: MarketSummary, book: OrderBookSnapshot | None
+    ) -> tuple[float, list[str]]:
+        """
+        Score a market for mean-reversion strategy fit.
+
+        Rewards:
+          - YES ask in the mid-range (room to oscillate both directions)
+          - High 24h volume and recent activity (volatility proxy)
+          - Tight spread (easier round-trips)
+          - Enough time before close for multiple swings
+        """
+        reasons: list[str] = []
+        score = 0.0
+
+        vol_fail = self._volume_gate(market)
+        if vol_fail:
+            return vol_fail
+
+        yes_ask = market.yes_ask
+        if yes_ask is None:
+            return 0.0, ["No ask price"]
+
+        if yes_ask < MR_MIN_YES_ASK:
+            return 0.0, [f"YES ask {yes_ask}c below mean-rev floor ({MR_MIN_YES_ASK}c)"]
+        if yes_ask > MR_MAX_YES_ASK:
+            return 0.0, [f"YES ask {yes_ask}c above mean-rev cap ({MR_MAX_YES_ASK}c)"]
+
+        if MR_IDEAL_MIN <= yes_ask <= MR_IDEAL_MAX:
+            band_score = 0.35
+            reasons.append(
+                f"YES ask {yes_ask}c — ideal mid-range for mean reversion"
+            )
+        else:
+            band_score = 0.18
+            reasons.append(f"YES ask {yes_ask}c — tradeable mid-range")
+        score += band_score
+
+        if market.spread <= 4:
+            score += 0.25
+            reasons.append(f"Spread {market.spread}c — tight")
+        elif market.spread <= MAX_SPREAD_CENTS:
+            score += 0.12
+            reasons.append(f"Spread {market.spread}c — acceptable")
+        else:
+            return 0.0, [f"Spread {market.spread}c too wide"]
+
+        if market.volume_24h >= 5_000:
+            score += 0.30
+            reasons.append(f"Volume 24h: {market.volume_24h:,} — high activity")
+        elif market.volume_24h >= 1_000:
+            score += 0.20
+            reasons.append(f"Volume 24h: {market.volume_24h:,} — active")
+        elif market.volume_24h >= SCREENER_MIN_VOLUME_24H:
+            score += 0.08
+            reasons.append(f"Volume 24h: {market.volume_24h:,} — meets floor")
+        else:
+            return 0.0, [f"Volume 24h {market.volume_24h} below mean-rev minimum"]
+
+        mins = market.minutes_to_close
+        if mins is not None and mins < MIN_MINUTES_TO_CLOSE:
+            return 0.0, [f"Closing in {mins:.0f}m — too soon"]
+        if mins is None or mins >= 60:
+            score += 0.10
+            reasons.append(
+                f"Closes in {mins/60:.0f}h — time for swings"
+                if mins is not None
+                else "No expiry — long-dated oscillator"
+            )
+
+        return round(min(score, 1.0), 3), reasons
+
     def _score_arb_comp(
         self, market: MarketSummary, book: OrderBookSnapshot | None
     ) -> tuple[float, list[str]]:
@@ -902,6 +985,8 @@ def score_for_strategy(
         score, _ = scorer._score_kelly(market, book)
     elif key == "high_prob":
         score, _ = scorer._score_high_prob(market, book)
+    elif key == "mean_reversion":
+        score, _ = scorer._score_mean_reversion(market, book)
     elif key == "arb":
         score, _ = scorer._score_arb_comp(market, book)
     else:

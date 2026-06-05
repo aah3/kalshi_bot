@@ -81,6 +81,18 @@ STRATEGY_DISCOVERY_PRESETS: dict[str, DiscoveryPreset] = {
         rank_by="volume",
         full_scan=True,
     ),
+    "mean_reversion": DiscoveryPreset(
+        name="mean_reversion",
+        description="Mid-range YES, high volume, screener-ranked oscillators",
+        top_n=10,
+        min_volume_24h=500,
+        min_yes_ask=15,
+        max_yes_ask=85,
+        max_spread=10,
+        rank_by="screener",
+        activity_hours=4.0,
+        max_minutes_to_close=480.0,
+    ),
 }
 
 

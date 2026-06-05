@@ -116,6 +116,55 @@ def resolve_no_buy(
     return price, "limit", tif
 
 
+def resolve_no_sell(
+    mode: EntryPriceMode,
+    best_bid: int,
+    best_ask: int,
+    limit_offset: int = 0,
+) -> tuple[int, str, str]:
+    """Sell NO: returns (no_price_cents, order_type, time_in_force)."""
+    no_bid = 100 - best_ask
+    no_ask = 100 - best_bid
+
+    if mode in (EntryPriceMode.PASSIVE, EntryPriceMode.LIMIT_AT_ASK):
+        return no_ask, "limit", "gtc"
+    if mode in (EntryPriceMode.CROSS_SPREAD, EntryPriceMode.LIMIT_AT_BID):
+        return no_bid, "limit", "ioc"
+    if mode == EntryPriceMode.MARKET:
+        return no_bid, "market", "ioc"
+    if mode == EntryPriceMode.LIMIT_AT_MID:
+        return (no_bid + no_ask) // 2, "limit", "gtc"
+    price = max(1, min(99, no_ask - limit_offset))
+    tif = "gtc" if price >= no_ask else "ioc"
+    return price, "limit", tif
+
+
+def resolve_no_sell_exit(
+    mode: EntryPriceMode,
+    best_bid: int,
+    best_ask: int,
+    limit_offset: int = 0,
+) -> tuple[int, str, str]:
+    """
+    Exit a NO long (take-profit / stop-loss sell).
+
+    Rests as GTC except for market exits (IOC).
+    """
+    no_bid = 100 - best_ask
+    no_ask = 100 - best_bid
+
+    if mode == EntryPriceMode.MARKET:
+        return no_bid, "market", "ioc"
+    if mode in (EntryPriceMode.CROSS_SPREAD, EntryPriceMode.LIMIT_AT_BID):
+        return no_bid, "limit", "gtc"
+    if mode in (EntryPriceMode.PASSIVE, EntryPriceMode.LIMIT_AT_ASK):
+        return no_ask, "limit", "gtc"
+    if mode == EntryPriceMode.LIMIT_AT_MID:
+        return (no_bid + no_ask) // 2, "limit", "gtc"
+    price = max(1, min(99, no_ask - limit_offset))
+    return price, "limit", "gtc"
+
+
 def execution_meta(
     *,
     order_type: str,

@@ -171,12 +171,44 @@ HP_TAKE_PROFIT_PCT: float | None = (
 )
 HP_STOP_LOSS_PCT: float   = float(os.getenv("KALSHI_HP_STOP_LOSS", "0.12"))
 
+# ─── Mean-reversion strategy ───────────────────────────────────────────────────
+
+MR_LOOKBACK_TICKS: int = int(os.getenv("KALSHI_MR_LOOKBACK_TICKS", "20"))
+MR_MIN_SAMPLES: int = int(os.getenv("KALSHI_MR_MIN_SAMPLES", "10"))
+MR_ENTRY_DEVIATION_CENTS: int = int(os.getenv("KALSHI_MR_ENTRY_DEVIATION", "5"))
+MR_TAKE_PROFIT_OFFSET: int = int(os.getenv("KALSHI_MR_TAKE_PROFIT_OFFSET", "5"))
+MR_STOP_LOSS_CENTS: int = int(os.getenv("KALSHI_MR_STOP_LOSS_CENTS", "10"))
+MR_MIN_VOLATILITY_CENTS: float = float(os.getenv("KALSHI_MR_MIN_VOLATILITY", "4.0"))
+MR_ENTRY_MAX_PRICE: int = int(os.getenv("KALSHI_MR_ENTRY_MAX", "45"))
+MR_ENTRY_MIN_PRICE: int = int(os.getenv("KALSHI_MR_ENTRY_MIN", "10"))
+MR_SHORT_MIN_YES_ASK: int = int(os.getenv("KALSHI_MR_SHORT_MIN_YES_ASK", "55"))
+MR_SHORT_MAX_YES_ASK: int = int(os.getenv("KALSHI_MR_SHORT_MAX_YES_ASK", "90"))
+MR_MAX_SPREAD_CENTS: int = int(
+    os.getenv("KALSHI_MR_MAX_SPREAD", os.getenv("KALSHI_HP_MAX_SPREAD", "8"))
+)
+_mr_stake_default = min(5_000, MAX_POSITION_CENTS)
+MR_STAKE_CENTS: int = min(
+    int(os.getenv("KALSHI_MR_STAKE_CENTS", str(_mr_stake_default))),
+    MAX_POSITION_CENTS,
+)
+MR_LIMIT_OFFSET: int = int(os.getenv("KALSHI_MR_LIMIT_OFFSET", "0"))
+MR_TRADE_DIRECTION: str = os.getenv("KALSHI_MR_TRADE_DIRECTION", "both")
+MR_EXIT_TARGET: str = os.getenv("KALSHI_MR_EXIT_TARGET", "max")
+MR_POST_FILL: str = os.getenv("KALSHI_MR_POST_FILL", "tp_and_stop")
+
 # Pre-trade checks (enforced in main.py via risk.entry_gates)
 MIN_ACCOUNT_BALANCE_CENTS: int = int(os.getenv("KALSHI_MIN_BALANCE_CENTS", "5000"))
 MIN_MINUTES_TO_EXPIRY: float   = float(os.getenv("KALSHI_MIN_MINUTES_TO_EXPIRY", "10"))
 BLOCK_ENTRIES_ON_LOW_BALANCE: bool = os.getenv(
     "KALSHI_BLOCK_LOW_BALANCE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
+
+# Stop-loss time gate: suppress stop orders when more than this many minutes
+# remain before close (gives the position room to rebound mid-event).
+# Set to 0 to disable — stop fires immediately regardless of time remaining.
+STOP_LOSS_CLOSE_WINDOW_MINUTES: float = float(
+    os.getenv("KALSHI_STOP_LOSS_CLOSE_WINDOW_MINUTES", "5.0")
+)
 
 DEFAULT_STRATEGY: str = os.getenv("KALSHI_DEFAULT_STRATEGY", "high_prob")
 ORDER_SUBMIT_MAX_RETRIES: int = int(os.getenv("KALSHI_ORDER_MAX_RETRIES", "3"))

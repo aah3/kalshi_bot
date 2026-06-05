@@ -43,7 +43,7 @@ from metrics.metrics_store import MetricsStore
 from metrics.settlement import SettlementWatcher
 from risk.alert_manager import AlertManager
 from risk.circuit_breaker import CircuitBreaker
-from risk.entry_gates import check_entry_allowed
+from risk.entry_gates import check_entry_allowed, check_stop_loss_allowed
 from discovery.discovery_presets import (
     STRATEGY_DISCOVERY_PRESETS,
     apply_preset,
@@ -128,20 +128,30 @@ def _rollback_pending_entry(ticker: str) -> None:
             pos.state = PositionState.SCANNING
 
     from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+    from strategy.mean_reversion_strategy import (
+        MeanReversionStrategy,
+        PositionState as MRState,
+    )
 
     if isinstance(_strategy, HighProbStrategy):
         pos = _strategy.get_position(ticker)
         if pos and pos.state == HPState.WATCHING:
             pos.state = HPState.SCANNING
 
+    if isinstance(_strategy, MeanReversionStrategy):
+        pos = _strategy.get_position(ticker)
+        if pos and pos.state == MRState.WATCHING:
+            pos.state = MRState.SCANNING
+
 
 def _rollback_pending_exit(ticker: str, phase: str) -> None:
-    """If a high-prob TP/stop order was not accepted, allow retry on the next tick."""
+    """If a round-trip TP/stop order was not accepted, allow retry on the next tick."""
     if not _strategy:
         return
     from strategy.high_prob_strategy import HighProbStrategy
+    from strategy.mean_reversion_strategy import MeanReversionStrategy
 
-    if isinstance(_strategy, HighProbStrategy):
+    if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
         _strategy.rollback_exit(ticker, phase)
 
 
@@ -153,6 +163,59 @@ def _rollback_pending_stop(ticker: str) -> None:
 
     if isinstance(_strategy, GreenUpStrategy):
         _strategy.rollback_stop(ticker)
+
+
+def _restore_suppressed_stop(ticker: str, meta: dict) -> None:
+    """
+    Restore position state when a stop-loss is suppressed by the time gate.
+
+    Both green_up and high_prob pre-emptively clear resting order IDs (hedge /
+    take-profit) when building the stop signal so that cancel_order_id can be
+    included.  If we suppress the stop without submitting, those IDs would be
+    lost and the corresponding resting orders would become orphans on the
+    exchange.  This helper restores them from the signal meta so the position
+    returns to exactly the state it was in before the stop fired.
+    """
+    if not _strategy:
+        return
+
+    cancel_id = meta.get("cancel_order_id")
+
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState as GUState
+
+    if isinstance(_strategy, GreenUpStrategy):
+        pos = _strategy.get_position(ticker)
+        if pos and pos.state == GUState.STOPPING and not pos.stop_order_id:
+            if cancel_id:
+                # Was in HEDGING (resting hedge on book) — restore hedge order.
+                pos.hedge_order_id = cancel_id
+                pos.state = GUState.HEDGING
+            else:
+                pos.state = GUState.ENTERED
+            pos.stop_limit_price = 0
+            pos.stop_cancel_failures = 0
+        return
+
+    from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+    from strategy.mean_reversion_strategy import (
+        MeanReversionStrategy,
+        PositionState as MRState,
+    )
+
+    if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
+        pos = _strategy.get_position(ticker)
+        exit_pending = HPState.EXIT_PENDING if isinstance(_strategy, HighProbStrategy) else MRState.EXIT_PENDING
+        if pos and pos.state == exit_pending:
+            if cancel_id:
+                pos.tp_order_id = cancel_id
+                pos.tp_order_sent = True
+                pos.state = exit_pending
+            else:
+                pos.state = (
+                    HPState.ENTERED if isinstance(_strategy, HighProbStrategy) else MRState.ENTERED
+                )
+            pos.stop_order_sent = False
+            pos.stop_order_id = ""
 
 
 def _rollback_pending_hedge(ticker: str) -> None:
@@ -289,6 +352,23 @@ async def on_tick(tick: dict[str, Any]) -> None:
             _rollback_pending_entry(signal_obj.ticker)
             return
 
+    # Stop-loss time gate: hold the position when there is still time to rebound.
+    if phase == "stop_loss":
+        from discovery.market_registry import get_market as _get_mkt
+        _sl_ok, _sl_reason = check_stop_loss_allowed(
+            _get_mkt(signal_obj.ticker),
+            config.STOP_LOSS_CLOSE_WINDOW_MINUTES,
+        )
+        if not _sl_ok:
+            logger.info(
+                "Suppressing stop-loss — time remaining",
+                ticker=signal_obj.ticker,
+                reason=_sl_reason,
+                threshold_minutes=config.STOP_LOSS_CLOSE_WINDOW_MINUTES,
+            )
+            _restore_suppressed_stop(signal_obj.ticker, meta)
+            return
+
     # Record signal intent (for fill-rate tracking)
     _store.record_signal({
         "ticker":      signal_obj.ticker,
@@ -315,8 +395,9 @@ async def on_tick(tick: dict[str, Any]) -> None:
             _rollback_pending_hedge(signal_obj.ticker)
         elif phase in ("exit", "stop_loss"):
             from strategy.high_prob_strategy import HighProbStrategy
+            from strategy.mean_reversion_strategy import MeanReversionStrategy
 
-            if isinstance(_strategy, HighProbStrategy):
+            if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
                 _rollback_pending_exit(signal_obj.ticker, phase)
             elif phase == "stop_loss":
                 _rollback_pending_stop(signal_obj.ticker)
@@ -349,8 +430,9 @@ async def on_tick(tick: dict[str, Any]) -> None:
                 _rollback_pending_hedge(ticker)
             elif phase in ("exit", "stop_loss"):
                 from strategy.high_prob_strategy import HighProbStrategy
+                from strategy.mean_reversion_strategy import MeanReversionStrategy
 
-                if isinstance(_strategy, HighProbStrategy):
+                if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
                     _rollback_pending_exit(ticker, phase)
                 elif phase == "stop_loss":
                     _rollback_pending_stop(ticker)
@@ -365,8 +447,9 @@ async def on_tick(tick: dict[str, Any]) -> None:
             _rollback_pending_hedge(ticker)
         elif phase in ("exit", "stop_loss"):
             from strategy.high_prob_strategy import HighProbStrategy
+            from strategy.mean_reversion_strategy import MeanReversionStrategy
 
-            if isinstance(_strategy, HighProbStrategy):
+            if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
                 _rollback_pending_exit(ticker, phase)
             elif phase == "stop_loss":
                 _rollback_pending_stop(ticker)
@@ -385,18 +468,20 @@ async def on_tick(tick: dict[str, Any]) -> None:
     if phase == "stop_loss":
         from strategy.green_up_strategy import GreenUpStrategy
         from strategy.high_prob_strategy import HighProbStrategy
+        from strategy.mean_reversion_strategy import MeanReversionStrategy
 
         if isinstance(_strategy, GreenUpStrategy):
             _strategy.register_stop_order(
                 ticker, order_id, signal_obj.limit_price
             )
-        elif isinstance(_strategy, HighProbStrategy):
+        elif isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
             _strategy.register_stop_order(ticker, order_id)
 
     if phase == "exit":
         from strategy.high_prob_strategy import HighProbStrategy
+        from strategy.mean_reversion_strategy import MeanReversionStrategy
 
-        if isinstance(_strategy, HighProbStrategy):
+        if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
             _strategy.register_tp_order(
                 ticker, order_id, signal_obj.limit_price
             )
@@ -580,14 +665,16 @@ def on_fill_received(fill: dict[str, Any]) -> None:
     if _strategy and _blotter and ticker:
         from strategy.green_up_strategy import GreenUpStrategy, PositionState
         from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+        from strategy.mean_reversion_strategy import (
+            MeanReversionStrategy,
+            PositionState as MRState,
+        )
 
         if isinstance(_strategy, GreenUpStrategy):
             pos = _strategy.get_position(ticker)
             if pos and pos.state == PositionState.HEDGED:
                 trade_id = _active_trades.pop(ticker, None)
                 if trade_id:
-                    # Both legs filled — profit locked but not realised until
-                    # settlement. Do not close_trade (that rolled up net_pnl=0).
                     _blotter.mark_trade_hedged(
                         trade_id,
                         locked_profit_cents=pos.locked_profit_cents,
@@ -605,8 +692,17 @@ def on_fill_received(fill: dict[str, Any]) -> None:
                 if trade_id:
                     _blotter.close_trade(trade_id, notes=pos.state.value)
             elif exit_entry_closed and ticker in _active_trades:
-                # Entry leg closed in blotter but strategy missed the fill
-                # label (contra-side / missing action) — still roll up parent.
+                trade_id = _active_trades.pop(ticker, None)
+                if trade_id:
+                    _blotter.close_trade(trade_id, notes="exit")
+
+        if isinstance(_strategy, MeanReversionStrategy):
+            pos = _strategy.get_position(ticker)
+            if pos and pos.state == MRState.CLOSED:
+                trade_id = _active_trades.pop(ticker, None)
+                if trade_id:
+                    _blotter.close_trade(trade_id, notes=pos.state.value)
+            elif exit_entry_closed and ticker in _active_trades:
                 trade_id = _active_trades.pop(ticker, None)
                 if trade_id:
                     _blotter.close_trade(trade_id, notes="exit")
@@ -946,6 +1042,139 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "High-prob: max completed entry→exit cycles per ticker (0=unlimited). "
             "Env KALSHI_HP_MAX_CYCLES_PER_TICKER"
         ),
+    )
+    parser.add_argument(
+        "--mr-lookback",
+        type=int,
+        default=None,
+        metavar="TICKS",
+        help="Mean-rev: rolling mid-price window (env KALSHI_MR_LOOKBACK_TICKS, default 20)",
+    )
+    parser.add_argument(
+        "--mr-min-samples",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Mean-rev: minimum ticks before entries (env KALSHI_MR_MIN_SAMPLES, default 10)",
+    )
+    parser.add_argument(
+        "--mr-entry-deviation",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev: enter when mid deviates this far from mean (default 5)",
+    )
+    parser.add_argument(
+        "--mr-take-profit-offset",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev: minimum take-profit offset from entry (default 5)",
+    )
+    parser.add_argument(
+        "--mr-stop-loss-cents",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev: stop if price moves against entry by N cents (default 10)",
+    )
+    parser.add_argument(
+        "--mr-min-volatility",
+        type=float,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev: require rolling std dev >= N cents (default 4)",
+    )
+    parser.add_argument(
+        "--mr-entry-max",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev long: max YES ask for dip entries (default 45)",
+    )
+    parser.add_argument(
+        "--mr-entry-min",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev long: min YES ask (default 10)",
+    )
+    parser.add_argument(
+        "--mr-short-min-yes-ask",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev short: min YES ask to fade spikes (default 55)",
+    )
+    parser.add_argument(
+        "--mr-short-max-yes-ask",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev short: max YES ask to fade (default 90)",
+    )
+    parser.add_argument(
+        "--mr-stake-cents",
+        type=int,
+        default=None,
+        help="Mean-rev: fixed stake per entry in cents",
+    )
+    parser.add_argument(
+        "--mr-max-spread",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev: skip entry when spread exceeds N cents",
+    )
+    parser.add_argument(
+        "--mr-trade-direction",
+        default=None,
+        choices=["long", "short", "both"],
+        help="Mean-rev: long dips, short spikes, or both (default both)",
+    )
+    parser.add_argument(
+        "--mr-exit-target",
+        default=None,
+        choices=["mean", "offset", "max"],
+        help="Mean-rev: TP at rolling mean, fixed offset, or max of both",
+    )
+    parser.add_argument(
+        "--mr-entry-mode",
+        default=None,
+        choices=[
+            "passive", "cross_spread", "market",
+            "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+        ],
+        help="Mean-rev: entry order pricing (default passive)",
+    )
+    parser.add_argument(
+        "--mr-exit-mode",
+        default=None,
+        choices=[
+            "passive", "cross_spread", "market",
+            "limit_at_ask", "limit_at_bid", "limit_at_mid", "limit_offset",
+        ],
+        help="Mean-rev: exit order pricing (default passive)",
+    )
+    parser.add_argument(
+        "--mr-post-fill",
+        default=None,
+        choices=["hold", "resting_take_profit", "resting_stop", "tp_and_stop"],
+        help="Mean-rev: post-fill exit behaviour (default tp_and_stop)",
+    )
+    parser.add_argument(
+        "--mr-max-cycles",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Mean-rev: max round-trips per ticker (0=unlimited)",
+    )
+    parser.add_argument(
+        "--mr-limit-offset",
+        type=int,
+        default=None,
+        metavar="CENTS",
+        help="Mean-rev: limit_offset mode adjustment (env KALSHI_MR_LIMIT_OFFSET)",
     )
     parser.add_argument(
         "--monitor-interval",
@@ -1445,6 +1674,25 @@ async def main(args: argparse.Namespace | None = None) -> None:
             hp_tp_style=args.hp_tp_style,
             hp_max_cycles=args.hp_max_cycles,
             hp_exit_mode=args.hp_exit_mode,
+            mr_lookback=args.mr_lookback,
+            mr_min_samples=args.mr_min_samples,
+            mr_entry_deviation=args.mr_entry_deviation,
+            mr_take_profit_offset=args.mr_take_profit_offset,
+            mr_stop_loss_cents=args.mr_stop_loss_cents,
+            mr_min_volatility=args.mr_min_volatility,
+            mr_entry_max=args.mr_entry_max,
+            mr_entry_min=args.mr_entry_min,
+            mr_short_min_yes_ask=args.mr_short_min_yes_ask,
+            mr_short_max_yes_ask=args.mr_short_max_yes_ask,
+            mr_stake_cents=args.mr_stake_cents,
+            mr_max_spread=args.mr_max_spread,
+            mr_trade_direction=args.mr_trade_direction,
+            mr_exit_target=args.mr_exit_target,
+            mr_entry_mode=args.mr_entry_mode,
+            mr_exit_mode=args.mr_exit_mode,
+            mr_post_fill=args.mr_post_fill,
+            mr_max_cycles=args.mr_max_cycles,
+            mr_limit_offset=args.mr_limit_offset,
         )
     except ValueError as exc:
         logger.error(str(exc))

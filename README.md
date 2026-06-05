@@ -1,10 +1,10 @@
 # Kalshi Prediction Market Trading Bot
 
-Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports four pluggable strategies (`kelly`, `green_up`, `high_prob`, `arb`), **strategy-aligned market discovery** with live in-play filters, pre-trade **entry gates**, portfolio-synced **circuit breaker**, a live terminal monitor, manual order tools (`tools/trade.py`, `tools/orderbook.py`), offline replay, production PowerShell runners, and a persistent trade blotter (queryable by date, category, ticker, strategy, and resolution) with performance analytics and settlement reconciliation.
+Production-grade automated trading system for [Kalshi](https://kalshi.com) binary prediction markets. Supports five pluggable strategies (`kelly`, `green_up`, `high_prob`, `mean_reversion`, `arb`), **strategy-aligned market discovery** with live in-play filters, pre-trade **entry gates**, portfolio-synced **circuit breaker**, a live terminal monitor, manual order tools (`tools/trade.py`, `tools/orderbook.py`), offline replay, production PowerShell runners, and a persistent trade blotter (queryable by date, category, ticker, strategy, and resolution) with performance analytics and settlement reconciliation.
 
 ### Recent updates
 
-- **Trade lifecycle & blotter P&L (2026-05-30/31)** — exit/stop fills **close the entry leg** with realised P&L (no phantom opposing legs); green_up hedged parents stay `hedged` until settlement (`mark_trade_hedged`); stop/exit fills finalize even when Kalshi reports contra-side labels (`side: "no"`). Same fill handling for `high_prob`. Maintenance: `scripts/cleanup_stale_trades.py`.
+- **Trade lifecycle & blotter P&L (2026-05-30/31)** — exit/stop fills **close the entry leg** with realised P&L (no phantom opposing legs); green_up hedged parents stay `hedged` until settlement (`mark_trade_hedged`); stop/exit fills finalize even when Kalshi reports contra-side labels (`side: "no"`). Same fill handling for `high_prob` and `mean_reversion`. Maintenance: `scripts/cleanup_stale_trades.py`.
 - **Test/prod isolation** — `pytest` redirects logs and DB to a temp sandbox so the suite cannot append to `kalshi_bot_prod.jsonl` / `kalshi_bot_prod.db`.
 - **Position alerts** — `AlertManager` skips stop/profit alerts on exchange positions the bot does not own (no CRITICAL noise on manual holdings).
 - **Runtime live gates** — per-tick entry checks use WebSocket book/tape freshness; REST `updated_time` staleness applies at discovery only (fixes false “market not live” blocks on active in-play markets).
@@ -15,6 +15,7 @@ Production-grade automated trading system for [Kalshi](https://kalshi.com) binar
 - **Concurrent position cap** — `--max-concurrent-positions` limits simultaneous entry legs (hedges/stops still run)
 - **Green-up** — multi-ticker parallel watch, hedge modes (`full_green` / `stake_back` / `partial`), configurable entry/exit pricing, resting hedge/stop with safe reprice guards, max cycles per ticker
 - **High-probability** — fee-adjusted ROI gating, post-fill take-profit / stop modes, fixed or Kelly-capped stake; exit fills hardened like green_up
+- **Mean reversion** — rolling mid-price mean, buy dips / fade spikes (long YES or short via buy-NO), resting TP toward mean with stop; volatility floor for oscillating markets
 - **Resilience** — WS liveness watchdog, REST book fallback + reconnect escalation, REST fill reconciliation (`KALSHI_FILL_RECONCILE_SECONDS`)
 - **Prod scripts** — `scripts/run_green_up_prod.ps1`, `scripts/run_high_prob_prod.ps1`, `scripts/compare_prod_sessions.ps1` (isolated DB/logs for A/B)
 - **Blotter queries** — filter trades/legs by strategy, category, date, resolution; export CSV
@@ -113,6 +114,7 @@ Default category when discovering: **Trending** (override with `--discover-categ
 | **Kelly** | `--strategy kelly` | Model edge vs market | `kelly` — liquid, tight spread | Any category where you supply `P(YES)` |
 | **Green Up** | `--strategy green_up` | In-play underdog → hedge | `green_up` — cheap YES, active, closing soon | Live Sports / fast-moving lines |
 | **High probability** | `--strategy high_prob` | High implied win rate, fee-aware ROI | `high_prob` — YES 85–97¢, rank by net ROI | Politics, macro, “likely” outcomes |
+| **Mean reversion** | `--strategy mean_reversion` | Fade swings around rolling mean | `mean_reversion` — mid-range YES, high vol, screener | Volatile Sports / in-play oscillators |
 | **Arbitrage** | `--strategy arb` | Structural mispricing | `arb` — top volume, full category scan | Paired / related contracts |
 
 All strategies share:
@@ -132,6 +134,7 @@ When `--discover` is set, `discovery/discovery_presets.py` overlays defaults for
 |--------|----------|-----------------|--------|
 | `high_prob` | `high_prob` | YES ask 85–97¢, spread ≤8¢, min vol 200 | **fee_adjusted_roi** |
 | `green_up` | `green_up` | YES ask ≤35¢, min vol 500, updated ≤2h, close ≤6h | **screener** (green_up fit) |
+| `mean_reversion` | `mean_reversion` | YES ask 15–85¢, min vol 500, updated ≤4h, close ≤8h | **screener** (mean_rev fit) |
 | `kelly` | `kelly` | Spread ≤10¢, min vol 100 | **volume** |
 | `arb` | `arb` | Top 25, min vol 50, full category scan | **volume** |
 
@@ -417,6 +420,50 @@ Production script: `scripts/run_high_prob_prod.ps1` (fixed $1 stake, isolated pr
 
 ---
 
+### Mean reversion (`--strategy mean_reversion`)
+
+**Idea:** track a **rolling mid-price mean** per ticker and fade short-term deviations — buy YES when price dips below the mean, or buy NO when price spikes above it (short YES exposure). Best suited to **volatile, oscillating** markets; a minimum rolling volatility filter skips flat books.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mr-lookback` | 20 | Rolling window size (ticks) |
+| `--mr-min-samples` | 10 | Minimum ticks before entries |
+| `--mr-entry-deviation` | 5 | Enter when mid deviates N¢ from mean |
+| `--mr-min-volatility` | 4.0 | Min rolling std dev (¢) to trade |
+| `--mr-entry-max` / `--mr-entry-min` | 45 / 10 | Long entry YES ask band (green_up-style cap) |
+| `--mr-short-min-yes-ask` / `--mr-short-max-yes-ask` | 55 / 90 | Short (fade) YES ask band |
+| `--mr-stake-cents` | min(5000, cap) | Fixed stake per entry |
+| `--mr-trade-direction` | `both` | `long`, `short`, or `both` |
+| `--mr-exit-target` | `max` | TP at `mean`, `offset`, or max of both |
+| `--mr-take-profit-offset` | 5 | Minimum TP offset from entry (¢) |
+| `--mr-stop-loss-cents` | 10 | Stop if move continues against entry |
+| `--mr-entry-mode` / `--mr-exit-mode` | `passive` | Limit/market pricing |
+| `--mr-post-fill` | `tp_and_stop` | `hold`, resting TP, stop, or both |
+| `--mr-max-spread` | 8 | Skip entry when spread exceeds N¢ |
+| `--mr-max-cycles` | 0 | Max completed round-trips per ticker |
+
+**Long leg:** buy YES on dip → resting sell YES at mean reversion target. **Short leg:** buy NO on spike → resting sell NO when YES reverts. Exit wiring matches `high_prob` (TP/stop registration, blotter close on round-trip).
+
+**Examples:**
+
+```bash
+# Preview volatile mid-range Sports markets
+python main.py --discover --discover-category Sports --strategy mean_reversion --discover-only
+
+# Long-only dips, passive entry, TP + stop
+python main.py --discover --discover-category Sports --strategy mean_reversion \
+  --mr-trade-direction long --mr-entry-deviation 6 \
+  --mr-post-fill tp_and_stop --max-concurrent-positions 2 --monitor-interval 30
+
+# Fade spikes only (buy NO on rally)
+python main.py --discover --discover-category Sports --strategy mean_reversion \
+  --mr-trade-direction short --mr-entry-deviation 5 --mr-stop-loss-cents 12
+```
+
+Env vars: `KALSHI_MR_*` (see `config.py` and `.env.example`).
+
+---
+
 ### Arbitrage (`--strategy arb`)
 
 Scans for **complementary pairs**, exhaustive sets, and dominance relationships. Register pairs with `--comp-pairs TICKER_A:TICKER_B` or `KALSHI_ARB_PAIRS`.
@@ -430,9 +477,9 @@ Discovery preset pulls **top 25 by volume** with `--discover-full-scan` for broa
 
 ---
 
-### Order pricing reference (green_up + high_prob)
+### Order pricing reference (green_up, high_prob, mean_reversion)
 
-Shared modes from `strategy/execution_price.py`:
+Shared modes from `strategy/execution_price.py` (YES buy/sell/exit and NO buy/sell/exit):
 
 | Mode | Typical use |
 |------|-------------|
@@ -540,7 +587,7 @@ python tools/screen.py screen --category Politics
 python tools/screen.py browse --ticker SOME-TICKER
 ```
 
-The screener scores each market for Kelly, Green Up, **high_prob**, and arbitrage fit. For Sports, use `tags` → `sports-filters` → `series` before `browse` or `discover` (see [Sports and tag drill-down](#sports-and-tag-drill-down)).
+The screener scores each market for Kelly, Green Up, **high_prob**, **mean_reversion**, and arbitrage fit. For Sports, use `tags` → `sports-filters` → `series` before `browse` or `discover` (see [Sports and tag drill-down](#sports-and-tag-drill-down)).
 
 ### 2. Preview discovery, then run (demo)
 
@@ -555,6 +602,10 @@ python main.py --discover --discover-category Sports --strategy green_up \
 # High-probability example
 python main.py --discover --discover-category Politics --strategy high_prob \
   --hp-entry-mode limit_at_bid --hp-post-fill resting_take_profit
+
+# Mean reversion — volatile mid-range markets
+python main.py --discover --discover-category Sports --strategy mean_reversion \
+  --mr-trade-direction both --mr-post-fill tp_and_stop
 
 # Kelly — requires model probabilities
 python main.py --strategy kelly --tickers TICKER-A --model-prob TICKER-A:0.62
@@ -691,6 +742,9 @@ python tools/replay.py replay --input data/session.jsonl --strategy green_up \
   --entry-max 30 --hedge-trigger 70
 
 python tools/replay.py replay --input data/session.jsonl --strategy high_prob
+
+python tools/replay.py replay --input data/session.jsonl --strategy mean_reversion \
+  --mr-trade-direction long --mr-entry-deviation 5
 ```
 
 ---

@@ -263,8 +263,16 @@ class ReplayEngine:
                 hp_exit_mode=self._strat_kwargs.get("hp_exit_mode"),
             )
 
+        elif name == "mean_reversion":
+            from strategy.factory import build_strategy
+            tickers = self._strat_kwargs.get("tickers", [])
+            return build_strategy("mean_reversion", tickers)
+
         else:
-            raise ValueError(f"Unknown strategy: {name}. Choose: kelly, green_up, arb, high_prob")
+            raise ValueError(
+                f"Unknown strategy: {name}. "
+                "Choose: kelly, green_up, arb, high_prob, mean_reversion"
+            )
 
     def _build_circuit_breaker(self):
         """Dummy async kill switch for replay (never actually kills anything)."""
@@ -705,7 +713,7 @@ p_rec.add_argument("--duration", type=int, default=0,
 p_rep = sub.add_parser("replay", help="Replay recorded file through strategy stack")
 p_rep.add_argument("--input",    required=True, help="Input .jsonl file path")
 p_rep.add_argument("--strategy", required=True,
-                   choices=["kelly", "green_up", "arb", "high_prob"])
+                   choices=["kelly", "green_up", "arb", "high_prob", "mean_reversion"])
 p_rep.add_argument("--speed",    type=float, default=50.0,
                    help="Playback speed multiplier (0=max, default 50×)")
 p_rep.add_argument("--model-prob", nargs="*", metavar="TICKER:PROB",
