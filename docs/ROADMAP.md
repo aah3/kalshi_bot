@@ -770,6 +770,29 @@ Major reliability work landed in commits `69e104f` (price targets / green-up ref
 - **Shared execution pricing** (`strategy/execution_price.py`) — unified `passive` / `cross_spread` / `market` / `limit_offset` resolution for YES buy, YES sell, YES exit, and NO buy legs across both strategies.
 - All new CLI flags are wired in `main.py` (`--gu-hedge-style`, `--gu-limit-offset`, `--gu-max-spread`, `--gu-no-entry-max`, `--hedge-offset`, `--hp-exit-mode`, `--hp-take-profit-pct`, `--hp-stop-loss-cents`, `--hp-tp-style`).
 
+### Green-up in-play execution — FIXED (2026-06-06)
+
+Motivated by a **production green_up session** on `KXNBAGAME-26JUN05NYKSAS-NYK` (cycle 1 hedged correctly; cycle 2 re-entered at 63¢, stop suppressed by wrong `minutes_to_close`, 1¢ hedge IOC unfilled on a one-sided book).
+
+**Game close time (`discovery/game_close.py`, `discovery/market_registry.py`)**
+- Parses `*GAME-*` ticker dates and applies **effective `minutes_to_close`** when API settlement is far in the future but the market is actively trading.
+- In-play windows report ≤ 5 minutes to close so `check_stop_loss_allowed()` / `KALSHI_STOP_LOSS_CLOSE_WINDOW_MINUTES` allow mid-event stops instead of holding through dips.
+
+**Hedge trigger cap (`strategy/price_targets.py`)**
+- Relative hedge triggers cap at **95¢** (`KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP`, default 95) instead of 99¢.
+- Skips entries when `entry + offset` would exceed the cap; keeps complement NO legs off 1¢ one-sided resolution books.
+
+**One-sided books (`strategy/book_normalize.py`, `strategy/green_up_strategy.py`)**
+- Hedge/stop paths synthesize a missing ask from the bid; entry still requires a real two-sided book.
+
+**Auto take-profit (`risk/alert_actions.py`, `--auto-take-profit`)**
+- Optional cross-spread YES sell when `PROFIT_TARGET` fires; bot-ownership scoped; skips green-up legs in `hedging` / `hedged` / `stopping`.
+
+**Shutdown hygiene (`main.py`)**
+- `try/finally` always closes shared aiohttp sessions and `ExecutionManager`; ingestor `TimeoutError` during Ctrl+C no longer leaves unclosed sessions.
+
+Tests: `tests/test_game_close.py`, `tests/test_book_normalize.py`, updated `tests/test_price_targets.py`, `tests/test_green_up_execution.py`.
+
 ### Correctness gap found in this audit — FIXED (2026-05-29)
 
 - **`PortfolioMonitor.session_realised_pnl_cents` was a placeholder.** `refresh()` previously computed realised P&L as `sum(int(f.get("is_taker", 0)) for f in fills)` — taker flags, **not** dollars — so "Session realised P&L" in the portfolio report / session table / dashboard was meaningless. **Fixed:** `realized_pnl_cents_from_fills()` now does weighted-average-cost matching per `(ticker, side)` over `/portfolio/fills`, booking `contracts_closed × (sell_price − avg_cost)` on each closing sell. Sells beyond the tracked long (opening buy predates the fills window) are ignored rather than assumed free, so the figure is conservative. Settlement payouts (hold-to-expiry) remain on the `SettlementWatcher` → blotter / equity-snapshot path and are intentionally excluded. Covered by `tests/test_portfolio_pnl.py` (10 cases). The circuit breaker was never affected (it keys off `portfolio_value_cents`).

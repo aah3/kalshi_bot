@@ -4,6 +4,7 @@ Production-grade automated trading system for [Kalshi](https://kalshi.com) binar
 
 ### Recent updates
 
+- **Green-up execution (2026-06-06)** — game markets use **effective `minutes_to_close`** in the market registry (`discovery/game_close.py`) so stop-loss is not suppressed by far-future settlement times; relative hedge triggers cap at **95¢** (`KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP`) to keep NO legs executable; hedge/stop logic works on **one-sided books** (bid-only near resolution); optional **`--auto-take-profit`** submits cross-spread YES sells on `PROFIT_TARGET` alerts; shutdown always closes aiohttp sessions even if the ingestor task errors.
 - **Trade lifecycle & blotter P&L (2026-05-30/31)** — exit/stop fills **close the entry leg** with realised P&L (no phantom opposing legs); green_up hedged parents stay `hedged` until settlement (`mark_trade_hedged`); stop/exit fills finalize even when Kalshi reports contra-side labels (`side: "no"`). Same fill handling for `high_prob` and `mean_reversion`. Maintenance: `scripts/cleanup_stale_trades.py`.
 - **Test/prod isolation** — `pytest` redirects logs and DB to a temp sandbox so the suite cannot append to `kalshi_bot_prod.jsonl` / `kalshi_bot_prod.db`.
 - **Position alerts** — `AlertManager` skips stop/profit alerts on exchange positions the bot does not own (no CRITICAL noise on manual holdings).
@@ -276,7 +277,7 @@ Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Us
 | `--entry-max` | 25¢ | Max YES **ask** to enter (optional underdog filter) |
 | `--gu-no-entry-max` | off | Disable entry cap — enter at current book prices |
 | `--hedge-trigger` | 68¢ | **Absolute** mode: hedge when YES **bid** ≥ this |
-| `--hedge-offset` | — | **Relative** mode: hedge when YES bid ≥ entry + N¢ (overrides `--hedge-trigger`) |
+| `--hedge-offset` | — | **Relative** mode: hedge when YES bid ≥ entry + N¢ (overrides `--hedge-trigger`; capped at **95¢** by default) |
 | `--gu-hedge-style` | `trigger` | `trigger` = wait for bid; `resting` = GTC buy-NO at trigger right after entry fill |
 | `--hedge-mode` | `full_green` | `full_green` \| `stake_back` \| `partial` |
 | `--stop-loss` | 10 | Stop when YES bid falls **N cents** below entry (max loss ≈ N¢/contract) |
@@ -286,6 +287,7 @@ Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Us
 | `--gu-limit-offset` | 0 | With `limit_offset`: cents from bid (e.g. `-2`) |
 | `--gu-max-cycles` | 0 | Max completed entry→exit cycles per ticker (`0` = unlimited) |
 | `--max-concurrent-positions` | 0 | Cap simultaneous entry legs (`0` = unlimited) |
+| `--auto-take-profit` | off | On `PROFIT_TARGET` alerts, sell bot-owned YES at cross-spread (skips hedged green-up legs) |
 
 **Hedge trigger modes:**
 
@@ -293,6 +295,12 @@ Kelly does not hedge automatically — one-shot YES/NO entries based on edge. Us
 |------|------|----------|
 | Absolute | `--hedge-trigger 68` | Same YES bid threshold every cycle (session-wide) |
 | Relative | `--hedge-offset 26` | Per fill: hedge at entry + 26¢ (adapts each cycle) |
+
+Relative triggers are capped at **95¢** (`KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP`, default 95) so the complement NO leg stays off 1¢ one-sided books. Entries are skipped when `entry + offset` would exceed that cap.
+
+**Game markets & stop-loss:** Sports `*GAME-*` tickers often report a far-future API `close_time` (settlement) while the match is live. `discovery/game_close.py` adjusts `minutes_to_close` in the market registry during in-play windows so `KALSHI_STOP_LOSS_CLOSE_WINDOW_MINUTES` (default 5) allows stops mid-event instead of wrongly holding through dips.
+
+**One-sided books:** Near resolution, YES favourites may show bid only (no ask). Entry still requires a two-sided book; **hedge and stop** paths synthesize a complement ask from the bid so `evaluate()` does not stall.
 
 **Hedge execution styles** (`--gu-hedge-style`):
 
@@ -935,6 +943,10 @@ kalshi_bot/
 | `MAX_DRAWDOWN_PCT` | 0.10 | Kill switch drawdown |
 | `DAILY_LOSS_LIMIT_CENTS` | demo: 50,000 / prod: 500 | Daily stop (`KALSHI_DEMO_*` / `KALSHI_PROD_*`) |
 | `POSITION_STOP_LOSS_PCT` | 0.40 | Alert when unrealised loss ≥ 40% of cost |
+| `PROFIT_TARGET_PCT` | 0.60 | Alert when unrealised gain ≥ 60% of cost |
+| `HEDGE_TRIGGER_CAP_CENTS` | 95 | Green-up: max YES bid hedge trigger (keeps NO leg executable) |
+| `AUTO_TAKE_PROFIT_ON_ALERT` | false | Same as `--auto-take-profit` when env set |
+| `STOP_LOSS_CLOSE_WINDOW_MINUTES` | 5 | Suppress stops when more than N minutes remain before close (`0` = always allow) |
 | `KALSHI_DB_PATH` | demo/prod paths | Blotter DB (`KALSHI_DEMO_DB_PATH` / `KALSHI_PROD_DB_PATH`) |
 | `KALSHI_MONITOR_INTERVAL` | 15 | Live table refresh (seconds); `0` = off |
 | `KALSHI_MAX_CONCURRENT_POSITIONS` | `0` | Cap entry legs per strategy (`0` = unlimited) |
@@ -967,12 +979,15 @@ KALSHI_GREEN_UP_STOP_LOSS=10
 KALSHI_GREEN_UP_MAX_SPREAD=8
 KALSHI_GREEN_UP_ENTRY_MODE=passive
 KALSHI_GREEN_UP_EXIT_MODE=passive
+KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP=95
+KALSHI_AUTO_TAKE_PROFIT=false
+KALSHI_STOP_LOSS_CLOSE_WINDOW_MINUTES=5
 KALSHI_MAX_CONCURRENT_POSITIONS=5
 KALSHI_LIVE_ONLY=true
 KALSHI_LIVE_MAX_MINUTES_TO_CLOSE=360
 ```
 
-CLI flags (`--entry-max`, `--gu-no-entry-max`, `--hedge-trigger`, `--hedge-offset`, `--gu-hedge-style`, `--hedge-mode`, `--stop-loss`, `--gu-max-spread`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--discover-max-minutes-to-close`) override these at runtime.
+CLI flags (`--entry-max`, `--gu-no-entry-max`, `--hedge-trigger`, `--hedge-offset`, `--gu-hedge-style`, `--hedge-mode`, `--stop-loss`, `--gu-max-spread`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--auto-take-profit`, `--discover-max-minutes-to-close`) override these at runtime.
 
 ### High-probability environment variables
 

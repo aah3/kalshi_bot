@@ -462,45 +462,58 @@ class GreenUpStrategy(BaseStrategy):
             2. Hedge trigger on active (ENTERED) positions
             3. New entry opportunity (WATCHING / no position)
         """
+        from strategy.book_normalize import normalize_tick_sides
+
         ticker   = tick.get("ticker", "")
         best_bid = tick.get("best_bid")
         best_ask = tick.get("best_ask")
-        if not ticker or best_bid is None or best_ask is None:
+        if not ticker or best_bid is None:
             return None
 
         pos = self._positions.get(ticker)
+        entry_path = (
+            pos is None
+            or pos.state in (PositionState.SCANNING, PositionState.WATCHING)
+            or pos.state in (PositionState.HEDGED, PositionState.STOPPED)
+        )
+        if entry_path and best_ask is None:
+            return None
+
+        work_tick = tick if entry_path else normalize_tick_sides(tick)
+        if work_tick is None:
+            return None
 
         if pos and pos.state in (PositionState.HEDGED, PositionState.STOPPED):
             if self._try_begin_new_cycle(pos):
-                return self._check_entry(ticker, tick)
+                return self._check_entry(ticker, work_tick)
             return None
 
         if pos and pos.state == PositionState.HEDGING:
             if self._hedge_style == HedgeStyle.RESTING:
-                stop_sig = self._check_stop_loss(pos, tick)
+                stop_sig = self._check_stop_loss(pos, work_tick)
                 if stop_sig:
                     return stop_sig
             return None
 
         if pos and pos.state == PositionState.STOPPING:
-            return self._manage_resting_stop(pos, tick)
+            return self._manage_resting_stop(pos, work_tick)
 
         if pos and pos.state == PositionState.ENTERED:
-            stop_sig = self._check_stop_loss(pos, tick)
+            stop_sig = self._check_stop_loss(pos, work_tick)
             if stop_sig:
                 return stop_sig
 
             if self._hedge_style == HedgeStyle.RESTING:
-                resting_sig = self._emit_resting_hedge(pos, tick)
+                resting_sig = self._emit_resting_hedge(pos, work_tick)
                 if resting_sig:
                     return resting_sig
             else:
-                hedge_sig = self._check_hedge_trigger(pos, tick)
+                hedge_sig = self._check_hedge_trigger(pos, work_tick)
                 if hedge_sig:
                     return hedge_sig
 
         if pos is None or pos.state == PositionState.SCANNING:
-            return self._check_entry(ticker, tick)
+            return self._check_entry(ticker, work_tick)
 
         if pos.state == PositionState.WATCHING:
             return None
@@ -780,8 +793,11 @@ class GreenUpStrategy(BaseStrategy):
         )
 
         trigger_price = self.hedge_trigger_for_entry(limit_price)
+        from strategy.price_targets import hedge_trigger_cap_cents
+
+        cap = hedge_trigger_cap_cents()
         if self._hedge_offset_cents is not None:
-            if limit_price + self._hedge_offset_cents > 99:
+            if limit_price + self._hedge_offset_cents > cap:
                 return None
         elif trigger_price <= limit_price:
             return None

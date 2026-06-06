@@ -837,3 +837,25 @@ def test_reprice_logs_info_not_warning(monkeypatch):
     )
     assert not any(name == "warning" for name, _, _ in rec.calls)
 
+
+def test_evaluate_hedges_when_ask_missing_on_entered_position():
+    """One-sided favourite books (bid only) must still fire hedge/stop logic."""
+    strat = GreenUpStrategy(
+        hedge_offset_cents=35,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T-OS")
+    pos = strat.get_position("T-OS")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 63
+    pos.entry_stake_cents = 63
+    pos.entry_contracts = 1
+    pos.hedge_trigger_price = 95
+
+    sig = strat.evaluate(
+        {"ticker": "T-OS", "best_bid": 96, "best_ask": None, "spread": None}
+    )
+    assert sig is not None
+    assert sig.side.value == "no"
+    assert sig.meta.get("phase") == "hedge"
+

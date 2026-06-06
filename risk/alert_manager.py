@@ -119,8 +119,13 @@ class AlertManager:
         value: monotonic timestamp of last fire
     """
 
-    def __init__(self, blotter: Blotter | None = None) -> None:
+    def __init__(
+        self,
+        blotter: Blotter | None = None,
+        on_alert=None,
+    ) -> None:
         self._blotter  = blotter
+        self._on_alert = on_alert
         self._cooldown: dict[tuple, float] = {}   # (AlertType, key) -> last_fired_at
         self._open_orders: dict[str, float] = {}  # order_id -> submission timestamp
 
@@ -143,6 +148,15 @@ class AlertManager:
                 alerts   = await self.evaluate(snapshot)
                 for alert in alerts:
                     alert.log()
+                    if self._on_alert is not None:
+                        try:
+                            await self._on_alert(alert)
+                        except Exception as exc:
+                            logger.error(
+                                f"AlertManager on_alert handler failed: {exc}",
+                                alert_type=alert.alert_type.value,
+                                ticker=alert.ticker,
+                            )
             except asyncio.CancelledError:
                 logger.info("AlertManager cancelled")
                 return

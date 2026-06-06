@@ -98,6 +98,7 @@ _circuit_breaker:    CircuitBreaker    | None = None
 _strategy:           BaseStrategy      | None = None
 _store:              MetricsStore      | None = None
 _shutdown_event = asyncio.Event()
+_auto_take_profit: bool = False
 
 # Active trade tracking: ticker -> parent_trade_id
 # Maps each market to its currently open logical trade so every fill
@@ -1198,6 +1199,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Same as KALSHI_LOG_CONSOLE=false"
         ),
     )
+    parser.add_argument(
+        "--auto-take-profit",
+        action="store_true",
+        help=(
+            "On PROFIT_TARGET alerts, submit a cross-spread YES sell for bot-owned "
+            "contracts (env KALSHI_AUTO_TAKE_PROFIT)"
+        ),
+    )
 
     # Auto-discovery: top N tickers in a category matching filters
     parser.add_argument(
@@ -1592,11 +1601,31 @@ async def _resolve_tickers(args: argparse.Namespace) -> list[str]:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def _on_alert(alert) -> None:
+    """Optional automated response to portfolio alerts."""
+    if not _auto_take_profit:
+        return
+    from risk.alert_actions import handle_auto_take_profit
+
+    if _execution is None or _strategy is None:
+        return
+    await handle_auto_take_profit(
+        alert,
+        execution=_execution,
+        strategy=_strategy,
+        blotter=_blotter,
+        ingestor=_ingestor,
+        circuit_breaker=_circuit_breaker,
+        alert_manager=_alert_manager,
+    )
+
+
 async def main(args: argparse.Namespace | None = None) -> None:
     global _ingestor, _execution, _strategy, _circuit_breaker
     global _store, _blotter, _settlement_watcher
     global _portfolio_monitor, _alert_manager, _session_monitor
     global _max_concurrent_positions, _live_rules, _portfolio_snapshot
+    global _auto_take_profit
 
     if args is None:
         args = parse_args()
@@ -1619,6 +1648,9 @@ async def main(args: argparse.Namespace | None = None) -> None:
         args.max_concurrent_positions
         if args.max_concurrent_positions is not None
         else config.MAX_CONCURRENT_POSITIONS
+    )
+    _auto_take_profit = bool(
+        getattr(args, "auto_take_profit", False) or config.AUTO_TAKE_PROFIT_ON_ALERT
     )
 
     tickers = await _resolve_tickers(args)
@@ -1719,7 +1751,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
         rate_limiter=rate_limiter,
     )
 
-    _alert_manager = AlertManager(blotter=_blotter)
+    _alert_manager = AlertManager(blotter=_blotter, on_alert=_on_alert)
 
     _ingestor = MarketIngestor(
         tickers=tickers,
@@ -1741,6 +1773,14 @@ async def main(args: argparse.Namespace | None = None) -> None:
     )
     _portfolio_monitor._session = shared_session
     _settlement_watcher._session = shared_session
+
+    ingestor_task = None
+    settlement_task = None
+    alert_task = None
+    risk_sync_task = None
+    book_fallback_task = None
+    fill_reconcile_task = None
+    monitor_task = None
 
     auth_ok, auth_msg = await verify_portfolio_credentials(
         credentials, rate_limiter, shared_session
@@ -1848,6 +1888,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
         ws_book_rest_fallback_seconds=config.WS_BOOK_REST_FALLBACK_SECONDS,
         ws_book_rest_fallback_poll_seconds=config.WS_BOOK_REST_FALLBACK_POLL_SECONDS,
         max_concurrent_positions=_max_concurrent_positions,
+        auto_take_profit_on_alert=_auto_take_profit,
         live_trading_only=_live_rules.enabled if _live_rules else False,
         live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
         live_max_minutes_to_close=_live_rules.max_minutes_to_close if _live_rules else None,
@@ -1868,6 +1909,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
                 exit_price_mode=_strategy._exit_price_mode.value,
                 max_cycles_per_ticker=_strategy._max_cycles_per_ticker,
                 limit_offset_cents=_strategy._limit_offset,
+                hedge_trigger_cap_cents=config.HEDGE_TRIGGER_CAP_CENTS,
             )
     logger.info("Kalshi trading bot started", **startup_kw)
 
@@ -1884,99 +1926,104 @@ async def main(args: argparse.Namespace | None = None) -> None:
         )
 
     # ── Run until shutdown event ──────────────────────────────────────────────
-    await _shutdown_event.wait()
-
-    # ── Graceful shutdown ─────────────────────────────────────────────────────
-    open_blotter = _blotter.open_positions_summary()
-    logger.shutdown(
-        open_blotter_trade_ids=[p["trade_id"] for p in open_blotter],
-        open_exchange_orders=list(_execution.open_orders.keys()),
-        active_alerts=_alert_manager.active_alert_summary(),
-    )
-
-    # Stop ingestor first (no new ticks)
-    await _ingestor.stop()
-    ingestor_task.cancel()
     try:
-        await ingestor_task
-    except asyncio.CancelledError:
-        pass
+        await _shutdown_event.wait()
 
-    # Stop session monitor
-    if _session_monitor:
-        _session_monitor.stop()
-    if monitor_task:
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
+        # ── Graceful shutdown ─────────────────────────────────────────────────
+        open_blotter = _blotter.open_positions_summary()
+        logger.shutdown(
+            open_blotter_trade_ids=[p["trade_id"] for p in open_blotter],
+            open_exchange_orders=list(_execution.open_orders.keys()),
+            active_alerts=_alert_manager.active_alert_summary(),
+        )
 
-    # Stop alert manager, portfolio risk sync, REST book fallback, and reconciler
-    alert_task.cancel()
-    risk_sync_task.cancel()
-    if book_fallback_task:
-        book_fallback_task.cancel()
-    if fill_reconcile_task:
-        fill_reconcile_task.cancel()
-    try:
-        await alert_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await risk_sync_task
-    except asyncio.CancelledError:
-        pass
-    if book_fallback_task:
-        try:
-            await book_fallback_task
-        except asyncio.CancelledError:
-            pass
-    if fill_reconcile_task:
-        try:
-            await fill_reconcile_task
-        except asyncio.CancelledError:
-            pass
+        # Stop ingestor first (no new ticks)
+        await _ingestor.stop()
+        if ingestor_task:
+            ingestor_task.cancel()
+            try:
+                await ingestor_task
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception) as exc:
+                logger.warning(
+                    "Ingestor task ended during shutdown",
+                    error=str(exc),
+                )
 
-    # Stop settlement watcher
-    await _settlement_watcher.stop()
-    settlement_task.cancel()
-    try:
-        await settlement_task
-    except asyncio.CancelledError:
-        pass
+        # Stop session monitor
+        if _session_monitor:
+            _session_monitor.stop()
+        if monitor_task:
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
-    # Cancel all resting exchange orders + close HTTP session
-    await _execution.stop()
+        # Stop alert manager, portfolio risk sync, REST book fallback, and reconciler
+        for task in (
+            alert_task,
+            risk_sync_task,
+            book_fallback_task,
+            fill_reconcile_task,
+        ):
+            if task:
+                task.cancel()
+        for task in (
+            alert_task,
+            risk_sync_task,
+            book_fallback_task,
+            fill_reconcile_task,
+        ):
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-    # Final settlement check — catch any resolutions that occurred during shutdown
-    logger.info("Running final settlement check...")
-    async with aiohttp.ClientSession() as final_sess:
-        _settlement_watcher._session = final_sess
-        settled_now = await _settlement_watcher.check_now()
-        if settled_now:
-            logger.info(
-                f"Final settlement check resolved {len(settled_now)} position(s)",
-                settled=[r.ticker for r in settled_now],
-            )
+        # Stop settlement watcher
+        await _settlement_watcher.stop()
+        if settlement_task:
+            settlement_task.cancel()
+            try:
+                await settlement_task
+            except asyncio.CancelledError:
+                pass
 
-    # Close shared session
-    await shared_session.close()
+        # Final settlement check — catch any resolutions that occurred during shutdown
+        logger.info("Running final settlement check...")
+        async with aiohttp.ClientSession() as final_sess:
+            _settlement_watcher._session = final_sess
+            settled_now = await _settlement_watcher.check_now()
+            if settled_now:
+                logger.info(
+                    f"Final settlement check resolved {len(settled_now)} position(s)",
+                    settled=[r.ticker for r in settled_now],
+                )
 
-    # Session summary from blotter
-    closed  = _blotter.query_trades(status="closed",  days=1)
-    settled = _blotter.query_trades(status="settled", days=1)
-    session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled)
+        # Session summary from blotter
+        closed  = _blotter.query_trades(status="closed",  days=1)
+        settled = _blotter.query_trades(status="settled", days=1)
+        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled)
 
-    final_metrics = calculator.all_metrics()
-    logger.info("Final session metrics", **final_metrics)
-    logger.info(
-        "Session complete",
-        trades_closed=len(closed),
-        trades_settled=len(settled),
-        session_net_pnl_usd=round(session_pnl / 100, 2),
-    )
-    logger.info("Shutdown complete")
+        final_metrics = calculator.all_metrics()
+        logger.info("Final session metrics", **final_metrics)
+        logger.info(
+            "Session complete",
+            trades_closed=len(closed),
+            trades_settled=len(settled),
+            session_net_pnl_usd=round(session_pnl / 100, 2),
+        )
+        logger.info("Shutdown complete")
+    finally:
+        if _execution:
+            try:
+                await _execution.stop()
+            except Exception as exc:
+                logger.warning("ExecutionManager stop failed during cleanup", error=str(exc))
+        if shared_session and not shared_session.closed:
+            await shared_session.close()
+        _portfolio_monitor._session = None
+        _settlement_watcher._session = None
 
 
 if __name__ == "__main__":

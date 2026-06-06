@@ -290,6 +290,14 @@ LIVE_MAX_TRADE_STALE_MINUTES: float | None = (
 
 PROFIT_TARGET_PCT: float        = 0.60
 POSITION_STOP_LOSS_PCT: float   = 0.40
+# Green-up: max YES bid hedge trigger (cents). Keeps NO leg off 1¢ one-sided books.
+HEDGE_TRIGGER_CAP_CENTS: int = int(
+    os.getenv("KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP", "95")
+)
+# When True, PROFIT_TARGET alerts submit a cross-spread exit for bot-owned YES legs.
+AUTO_TAKE_PROFIT_ON_ALERT: bool = os.getenv(
+    "KALSHI_AUTO_TAKE_PROFIT", ""
+).strip().lower() in ("1", "true", "yes", "on")
 
 # ─── Execution ────────────────────────────────────────────────────────────────
 

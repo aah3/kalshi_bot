@@ -16,8 +16,9 @@ from strategy.price_targets import (
 def test_hedge_trigger_price_adds_offset_and_caps():
     assert hedge_trigger_price(25, 26) == 51
     assert hedge_trigger_price(18, 26) == 44
-    assert hedge_trigger_price(80, 26) == 99
+    assert hedge_trigger_price(80, 26) == 95
     assert hedge_trigger_price(0, 26) == 0
+    assert hedge_trigger_price(70, 35, cap_cents=95) == 95
 
 
 def test_stop_loss_trigger_price_matches_green_up_behavior():
