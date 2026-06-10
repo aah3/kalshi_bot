@@ -14,8 +14,8 @@ def normalize_tick_sides(tick: dict[str, Any]) -> dict[str, Any] | None:
     """
     Return a copy of ``tick`` with a synthetic complement when one side is missing.
 
-    Requires at least ``best_bid``. Used for hedge/stop evaluation on ENTERED
-    positions; entry paths should still require a real two-sided book.
+    Requires at least ``best_bid``. Used for exit/stop (and hedge) evaluation on
+    ENTERED positions; entry paths should still require a real two-sided book.
     """
     ticker = tick.get("ticker", "")
     best_bid = tick.get("best_bid")

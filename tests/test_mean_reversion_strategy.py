@@ -57,6 +57,10 @@ def _tick(bid: int, ask: int, ticker: str = "TEST-MKT") -> dict:
     }
 
 
+def _tick_one_sided(bid: int, ticker: str = "TEST-MKT") -> dict:
+    return {"ticker": ticker, "best_bid": bid, "best_ask": None}
+
+
 def _warmup(strat: MeanReversionStrategy, ticker: str, prices: list[int]) -> None:
     """Seed rolling mid-price history without emitting entry signals."""
     for mid in prices:
@@ -186,6 +190,58 @@ class TestMeanReversionExit:
         stop_sig = strat.evaluate(_tick(12, 14))
         assert stop_sig is not None
         assert stop_sig.meta["phase"] == "stop_loss"
+
+
+class TestOneSidedBook:
+    def test_entry_requires_two_sided_book(self):
+        strat = MeanReversionStrategy(
+            lookback_ticks=10,
+            min_samples=8,
+            entry_deviation_cents=5,
+            min_volatility_cents=3.0,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        _warmup(strat, "TEST-MKT", [35, 38, 36, 34, 37, 35, 33, 36, 34, 22])
+        assert strat.evaluate(_tick_one_sided(20)) is None
+
+    def test_stop_loss_on_one_sided_book(self):
+        strat = MeanReversionStrategy(
+            lookback_ticks=10,
+            min_samples=8,
+            entry_deviation_cents=5,
+            min_volatility_cents=3.0,
+            stop_loss_cents=8,
+            trade_direction=TradeDirection.LONG,
+            post_fill_mode=PostFillMode.RESTING_STOP_LOSS,
+            exit_price_mode=EntryPriceMode.PASSIVE,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        _warmup(strat, "TEST-MKT", [35, 38, 36, 34, 37, 35, 33, 36, 34, 22])
+        strat.evaluate(_tick(20, 22))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 22,
+            "size_cents": 5000,
+            "order_id": "entry-1",
+        })
+        stop_sig = strat.evaluate(_tick_one_sided(12))
+        assert stop_sig is not None
+        assert stop_sig.meta["phase"] == "stop_loss"
+
+    def test_one_sided_tick_does_not_pollute_rolling_mid(self):
+        strat = MeanReversionStrategy(
+            lookback_ticks=10,
+            min_samples=8,
+            entry_deviation_cents=5,
+            min_volatility_cents=3.0,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        _warmup(strat, "TEST-MKT", [35, 38, 36, 34, 37, 35, 33, 36, 34, 22])
+        before = len(strat._price_history.get("TEST-MKT", []))
+        strat.evaluate(_tick_one_sided(20))
+        after = len(strat._price_history.get("TEST-MKT", []))
+        assert after == before
 
 
 class TestMeanReversionCycle:

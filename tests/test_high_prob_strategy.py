@@ -73,6 +73,59 @@ def _tick(bid: int, ask: int, ticker: str = "TEST-MKT") -> dict:
     }
 
 
+def _tick_one_sided(bid: int, ticker: str = "TEST-MKT") -> dict:
+    return {"ticker": ticker, "best_bid": bid, "best_ask": None}
+
+
+class TestOneSidedBook:
+    def test_entry_requires_two_sided_book(self):
+        strat = HighProbStrategy(min_yes_ask=85, min_roi_pct=0.0)
+        strat.add_watch_ticker("TEST-MKT")
+        assert strat.evaluate(_tick_one_sided(88)) is None
+
+    def test_stop_loss_on_one_sided_book(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            post_fill_mode=PostFillMode.RESTING_STOP_LOSS,
+            stop_loss_cents=10,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "ord-1",
+        })
+        stop_sig = strat.evaluate(_tick_one_sided(79))
+        assert stop_sig is not None
+        assert stop_sig.meta["phase"] == "stop_loss"
+
+    def test_resting_tp_on_one_sided_book(self):
+        strat = HighProbStrategy(
+            min_yes_ask=85,
+            min_roi_pct=0.0,
+            post_fill_mode=PostFillMode.RESTING_TAKE_PROFIT,
+            take_profit_offset_cents=3,
+            tp_style=TakeProfitStyle.FIXED,
+        )
+        strat.add_watch_ticker("TEST-MKT")
+        strat.evaluate(_tick(88, 90))
+        strat.on_fill({
+            "ticker": "TEST-MKT",
+            "side": "yes",
+            "price": 90,
+            "size_cents": 5_000,
+            "order_id": "ord-2",
+        })
+        exit_sig = strat.evaluate(_tick_one_sided(91))
+        assert exit_sig is not None
+        assert exit_sig.meta["phase"] == "exit"
+        assert exit_sig.limit_price == 93
+
+
 class TestTakeProfitMath:
     def test_vig_proxy_half_spread(self):
         assert vig_proxy_cents(4) == 2

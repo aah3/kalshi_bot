@@ -72,6 +72,26 @@ Before any production run, every strategy must pass:
 
 ---
 
+## Where we are (2026-06-09)
+
+**Code is ahead of certification.** Platform plumbing, strategy hardening, and the new `mean_reversion` strategy are implemented and unit-tested. The blocker to production is **signed live demo sessions**, not missing features.
+
+| Area | Status | Next action |
+|------|--------|-------------|
+| Automated tests | **248/248 green** | Keep green before each live run |
+| Platform (Week 1) | Code done; **not signed** | Complete steps 1.4–1.6 below |
+| `high_prob` + `green_up` (Week 2) | Hardened; **partial live** | 3 demo sessions each with session template |
+| `mean_reversion` (Week 2) | **Shipped + unit-tested**; **zero live sessions** | Discovery → demo round-trip (steps 2.8–2.10) |
+| `kelly` + `arb` (Week 3) | Code done | 2 demo sessions each after Week 2 |
+| Demo soak (Week 4) | Not started | Daily 1–2 hr runs after Week 2–3 |
+| Prod micro-pilot (Week 5+) | **Partial** — one `green_up` prod run (2026-05-30) | Re-certify all strategies at $1 cap |
+
+**Immediate priority order:** Week 1 sign-off → Week 2 (`high_prob`, `green_up`, `mean_reversion`) → Week 3 → Week 4 soak → Week 5 prod micro-pilot per strategy.
+
+See [Next steps — execute in order](#next-steps--execute-in-order-2026-06-09) for commands and pass/fail criteria.
+
+---
+
 ## How to read this plan
 
 - **“Run bot 30 min”** means leave `main.py` connected to Kalshi demo for ~30 minutes, then stop it — not a special mode or timer flag.
@@ -121,7 +141,7 @@ python tools/screen.py browse --category Sports --min-volume 10 --full-scan
 
 # Platform soak with explicit tickers (Week 1 goal: stay up + clean shutdown, not P&L):
 $env:KALSHI_TICKERS="KXMENWORLDCUP-26-EC,KXMENWORLDCUP-26-NO,KXMENWORLDCUP-26-CIV,KXMENWORLDCUP-26"
-$enf:KALSHI_TICKERS="KXMLBTOTAL-26MAY231420HOUCHC-6"
+$env:KALSHI_TICKERS="KXMLBTOTAL-26MAY231420HOUCHC-6"
 python main.py --tickers $env:KALSHI_TICKERS --strategy high_prob --hp-entry-mode passive --monitor-interval 30 --quiet
 
 # If discover-only succeeded, you can use discovery for the soak instead:
@@ -324,8 +344,6 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 | 2.6 | Through hedge or stop | **Hedge:** parent `hedged`, entry + `hedge` legs open until settlement. **Stop:** entry leg **closed** at stop fill price, parent `closed`, realised P&L on entry leg | Tune `--hedge-trigger`, `--gu-exit-mode cross_spread`; if parent stuck `open`, run `scripts/cleanup_stale_trades.py` |
 | 2.7 | Flatten manually if needed | `trade.py close` works | Sell uses bid floor; portfolio shows side |
 
-**Week 2 deliverable:** Two sections in `testing.txt` (or this doc) with exact commands + 3 session notes each.
-
 **Week 2 testing depth:** Use the [End-to-end strategy testing](#end-to-end-automated-strategy-testing) playbook below for `green_up`; adapt the same phases for `high_prob` (entry → optional TP/stop → hold/settle) and `mean_reversion` (entry → resting TP/stop → round-trip close).
 
 #### Mean reversion
@@ -337,6 +355,44 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 | 2.10 | Post-session | Blotter `closed` parents with entry + exit legs | Same exit-fill hardening as `high_prob` |
 
 **Note:** `mean_reversion` needs enough ticks to build rolling mean/volatility — prefer active in-play markets over stale books.
+
+**Week 2 deliverable (updated):** Three sections in `testing.md` (or session logs here) with exact commands + **3 signed demo sessions each** for `high_prob`, `green_up`, and `mean_reversion`.
+
+#### Mean reversion — demo certification runbook (Phase A)
+
+**Goal:** One full round-trip (entry → resting TP or stop → blotter `closed`) on one volatile in-play ticker.
+
+| Step | Action | Success criteria |
+|------|--------|------------------|
+| MR-A.1 | Env check | `python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS)"` → `demo` + expected limits |
+| MR-A.2 | Discovery | `python main.py --discover --discover-category Sports --strategy mean_reversion --discover-only` → ≥1 ticker in 15–85¢ band, screener-ranked; if zero, widen `--discover-activity-hours` or use `screen.py browse` |
+| MR-A.3 | Pick ticker | Active in-play Sports market with tight spread (≤ `--mr-max-spread` 8¢) and visible price swings |
+| MR-A.4 | Warm-up run | Run 10–15 min with `--discover-only` equivalent tick count OR explicit ticker; monitor must show `scanning` → `watching` after `--mr-min-samples` ticks |
+| MR-A.5 | Certification session | See command block below; use `cross_spread` entry if passive does not fill in 20 min |
+| MR-A.6 | Observe cycle | Log/monitor: `ORDER_SENT` entry → fill → `ENTERED` → `EXIT_PENDING` → exit/stop fill → `CLOSED` |
+| MR-A.7 | Reconcile | `blotter.py detail` shows entry + exit legs; entry leg has `realized_pnl_cents`; `trade.py portfolio` matches exchange |
+| MR-A.8 | Repeat ×3 | Three sessions on different days/tickers; fill [Session template](#session-template-copy-per-run) each time |
+
+**Certification command** (single ticker, aggressive fills):
+
+```bash
+python main.py --strategy mean_reversion --tickers YOUR-TICKER \
+  --mr-trade-direction long \
+  --mr-post-fill tp_and_stop \
+  --mr-entry-mode cross_spread \
+  --mr-exit-mode cross_spread \
+  --mr-lookback 15 --mr-min-samples 10 \
+  --mr-entry-deviation 4 --mr-min-volatility 3 \
+  --mr-take-profit-offset 5 --mr-stop-loss-cents 8 \
+  --max-concurrent-positions 1 \
+  --monitor-interval 15
+```
+
+**Pass:** Parent trade status `closed` with realised P&L on entry leg; no orphan resting orders after Ctrl+C; no `traceback` / `ERROR` spam in `kalshi_bot_demo.jsonl`.
+
+**Short-leg variant** (optional second session): `--mr-trade-direction short` on a ticker with YES ask 55–90¢ and spike above rolling mean.
+
+**Prod micro-pilot** (Week 5.2c only after MR-A.8): cap stake at 100¢ — use `--mr-stake-cents 100` or `KALSHI_MR_STAKE_CENTS=100`; create `scripts/run_mean_reversion_prod.ps1` mirroring `run_high_prob_prod.ps1`.
 
 ---
 
@@ -685,13 +741,14 @@ python tools/blotter.py detail --trade-id T-0001
 | Entry pricing | **Passive at bid** in prod; `limit_offset` with negative cents for bid−x; `market`/`cross_spread` for certification fills |
 | Per-game repeat | **Unlimited** by default (`--gu-max-cycles 0`); set `--gu-max-cycles N` to cap round-trips per ticker |
 | Circuit breaker | Test **both** drawdown % (Test A) and session loss cents (Test B) in demo — see [Step 1.5](#step-15--circuit-breaker-review-and-live-test) |
-| Prod micro-pilot | **Each strategy separately** at `KALSHI_PROD_MAX_POSITION_CENTS=100`: `high_prob` then `green_up` (Week 5.2a / 5.2b) |
+| Prod micro-pilot | **Each strategy separately** at `KALSHI_PROD_MAX_POSITION_CENTS=100`: `high_prob` → `green_up` → `mean_reversion` (Week 5.2a–c) |
+| Mean reversion | Native round-trip TP/stop path | Demo certify before prod; see [MR-A runbook](#mean-reversion--demo-certification-runbook-phase-a) |
 
 ---
 
-## Implementation status (2026-05-31)
+## Implementation status (2026-06-09)
 
-Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off. Supersedes the 2026-05-29 snapshot.
+Snapshot of **code shipped** vs **live certification** vs **production ops**. Code being present does not mean the roadmap step is signed off. Supersedes the 2026-05-31 snapshot.
 
 ### Summary
 
@@ -699,12 +756,12 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 |-------|----------------|-------------------|
 | Environment profiles | Done | Verify each session with `python -c "import config; …"` |
 | Week 1 — platform baseline | Done | **In progress** — soak, circuit breaker, manual sell not formally signed |
-| Week 2 — `high_prob` + `green_up` | Done (hardened) | **Partial** — `testing.md` has commands; **one prod green_up micro-run** (2026-05-30) exercised entry→stop; post-run bugs fixed; no 3× demo sign-off per strategy |
+| Week 2 — `high_prob` + `green_up` + `mean_reversion` | Done (hardened) | **Partial** — `testing.md` has `high_prob`/`green_up` commands; **one prod green_up micro-run** (2026-05-30); **`mean_reversion` has zero live sessions** |
 | Week 3 — `kelly` + `arb` | Done | **Not started** — no documented demo sessions |
 | Week 4 — demo soak + prod dry-run | Tooling done | **Not started** — no 2-week soak; prod dry-run not recorded |
-| Week 5+ — prod micro-pilot | Scripts ready | **Partial** — green_up prod session logged; awaiting clean re-run after lifecycle fixes |
+| Week 5+ — prod micro-pilot | Scripts for `high_prob`, `green_up` | **Partial** — green_up prod session logged; **`run_mean_reversion_prod.ps1` not yet created** |
 
-**Automated tests:** `224/224` pass (`python -m pytest tests/ -q`). Net since 2026-05-29 snapshot: +30 tests covering stop/exit fill reconciliation, hedge accounting, high_prob exit fills, alert scoping, live-market runtime gates, and stale-trade cleanup.
+**Automated tests:** `248/248` pass (`python -m pytest tests/ -q`). Net since 2026-05-31 snapshot: +24 tests — `mean_reversion` strategy suite, expanded `high_prob` / `book_normalize` / `game_close` coverage.
 
 ### Definition of done (demo) — status
 
@@ -715,27 +772,28 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | 3 | Live gates | Implemented | Default on; `--no-live-only` used in many `testing.md` runs |
 | 4 | SIGINT shutdown | Implemented | `main.py` cancel-all + settlement check; needs signed live run |
 | 5 | Circuit breaker | Implemented | Unit tests + portfolio sync; live Tests A/B not recorded in checklist |
-| 6 | Automated tests | **Done** | `224/224` green in full suite |
+| 6 | Automated tests | **Done** | `248/248` green in full suite |
 
 ### Week-by-week certification progress
 
 | Week | Step | Code ready? | Certified? |
 |------|------|-------------|------------|
 | 1 | 1.1 Demo keys / startup | Yes | Assumed (active dev) |
-| 1 | 1.2 `pytest tests/` | **Yes** | 224/224 green |
+| 1 | 1.2 `pytest tests/` | **Yes** | 248/248 green |
 | 1 | 1.3 Config profile print | Yes | — |
 | 1 | 1.4 ~30 min soak + Ctrl+C | Yes | Not signed in README checklist |
 | 1 | 1.5 Circuit breaker live (A + B) | Yes | Not signed |
 | 1 | 1.6 Manual sell / flatten | Yes (`tools/trade.py`) | Not signed |
 | 2 | `high_prob` 3 sessions | Yes | Commands in `testing.md`; no session template sign-off |
 | 2 | `green_up` 3 sessions | Yes | Same |
+| 2 | `mean_reversion` 3 sessions | **Yes** (new) | Unit-tested only; see [MR-A runbook](#mean-reversion--demo-certification-runbook-phase-a) |
 | 3 | `kelly` 2 sessions | Yes | Screener + `--model-prob`; no runbook sign-off |
 | 3 | `arb` 2 sessions | Yes | Demo may show zero arb (expected) |
 | 4 | Daily 1–2 hr soak | — | Not started |
 | 4 | Weekly blotter / session reports | Yes (`blotter_report.py`, `session_report.py`) | Not run on schedule |
 | 4 | Prod keys in `.env`, stay on demo | — | Unknown |
 | 4 | Prod dry-run (immediate Ctrl+C) | Yes | Not recorded |
-| 5 | Prod micro-pilot per strategy | Yes (`scripts/run_*_prod.ps1`) | **Partial** — green_up prod run 2026-05-30; re-certify after lifecycle fixes |
+| 5 | Prod micro-pilot per strategy | Partial (`run_high_prob_prod.ps1`, `run_green_up_prod.ps1`) | **Partial** — green_up prod run 2026-05-30; `mean_reversion` prod script pending |
 
 ### Built since roadmap was written (beyond original scope)
 
@@ -824,14 +882,24 @@ Commits `d4dfa5f` (green_up + platform hygiene) and `22b2b49` (high_prob parity)
 
 New **`mean_reversion`** strategy for round-trip volatility capture in oscillating markets:
 
-- **`strategy/mean_reversion_strategy.py`** — rolling mid-price mean, long (buy YES dip) and short (buy NO spike) legs, resting TP toward mean/offset, stop on continued adverse move, volatility floor.
+- **`strategy/mean_reversion_strategy.py`** — rolling mid-price mean, long (buy YES dip) and short (buy NO spike) legs, resting TP toward mean/offset, stop on continued adverse move, volatility floor, `summary()` for monitor table.
 - **Discovery preset** — mid-range YES (15–85¢), screener-ranked, high volume, recently updated (`discovery/discovery_presets.py`).
 - **Screener** — `_score_mean_reversion()` rewards mid-range price, tight spread, and volume (`discovery/screener.py`).
-- **Execution** — `resolve_no_sell` / `resolve_no_sell_exit` in `strategy/execution_price.py` for short-leg exits.
+- **Execution** — `resolve_no_sell` / `resolve_no_sell_exit` in `strategy/execution_price.py`; shares `book_normalize.py` one-sided exit handling with `green_up` / `high_prob`.
+- **Blotter lifecycle** — `main.py` `on_fill_received` closes parents on `MRState.CLOSED` and exit fills (same pattern as `high_prob`).
 - **CLI / env** — `--mr-*` flags and `KALSHI_MR_*` defaults in `config.py`; wired through `main.py`, `factory.py`, `position_limits.py`, `tools/replay.py`.
-- **Tests** — `tests/test_mean_reversion_strategy.py` (entry, short, TP, stop, cycle).
+- **Tests** — `tests/test_mean_reversion_strategy.py` (long entry, short entry, resting TP, stop, one-sided book, cycle reset).
 
-**Certification status:** implemented and unit-tested; demo/prod micro-pilot runbook in Week 2 (steps 2.8–2.10) — not yet signed off.
+**Certification status:** implemented and unit-tested; **zero live demo sessions**. Demo runbook: [MR-A](#mean-reversion--demo-certification-runbook-phase-a). Prod script `scripts/run_mean_reversion_prod.ps1` not yet created.
+
+**Pre-live gaps (non-blocking for demo, fix before unattended prod):**
+
+| Gap | Impact | Fix |
+|-----|--------|-----|
+| No `run_mean_reversion_prod.ps1` | Manual prod commands error-prone | Copy `run_high_prob_prod.ps1` pattern with `KALSHI_MR_STAKE_CENTS=100` |
+| `session_table.py` has no MR action hints | Monitor shows state but generic action column | Add `_mr_action_hint()` (TP/stop/mean distance) — optional for certification |
+| No `test_fill_reconciliation` case for mean_reversion | Exit fill path less proven than `high_prob` | Add e2e blotter test mirroring `test_high_prob_exit_fill_closes_entry_leg_with_realised_pnl` |
+| `testing.md` has no mean_reversion section | Runbook scattered | Add commands from MR-A runbook after first live session |
 
 ### Session P&L display reconciled with kill switch — FIXED (2026-05-30)
 
@@ -850,40 +918,134 @@ New **`mean_reversion`** strategy for round-trip volatility capture in oscillati
 | Test/prod log+DB isolation in pytest | **Done** — `tests/conftest.py` |
 | REST fill reconciliation (WS safety net) | **Done** — `trading/fill_reconciler.py` |
 
-### Production readiness gaps (priority order, updated 2026-05-31)
+### Production readiness gaps (priority order, updated 2026-06-09)
 
 **P0 — must fix before real money**
 
-1. Complete Week 1–4 demo certification (README checklist all checked) — *still the primary blocker; lifecycle fixes landed but signed demo sessions still needed*
-2. ~~Fix full `pytest` suite~~ — **DONE** (224/224 green)
+1. Complete Week 1–4 demo certification (README checklist all checked) — *still the primary blocker*
+2. ~~Fix full `pytest` suite~~ — **DONE** (248/248 green)
 3. ~~Trade lifecycle / blotter exit P&L~~ — **DONE** (2026-05-30/31; re-run prod micro-pilot to sign off)
 4. Live circuit breaker Tests A + B on demo with session notes
-5. Blotter ↔ exchange reconciliation on bot-driven orders for each strategy you will run in prod
-6. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier (now feeds the high-prob fee-adjusted ROI gate)
+5. Blotter ↔ exchange reconciliation on bot-driven orders for **each strategy you will run in prod** (`high_prob`, `green_up`, `mean_reversion` minimum)
+6. **`mean_reversion` demo certification** — 3 signed sessions per [MR-A runbook](#mean-reversion--demo-certification-runbook-phase-a) before prod micro-pilot
+7. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier (feeds high-prob ROI gate)
 
 **P1 — before unattended / 24×7 prod**
 
-7. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl` — *exercise the WS watchdog + REST fallback + fill reconciliation under real disconnects*
-8. ~~Fix `PortfolioMonitor` session-realised-P&L placeholder~~ — **DONE** (2026-05-29; `realized_pnl_cents_from_fills` + `tests/test_portfolio_pnl.py`)
-9. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
-10. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
-11. **External** alerting sink for `risk_breach` / `kill switch` / repeated WS disconnect / `AlertManager` CRITICAL — *structured alerts now exist in code, but delivery is still JSONL + stderr only; add a webhook/email/Slack/PagerDuty transport*
-12. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
-13. Tune the new resilience knobs for prod and document chosen values: `KALSHI_WS_MAX_SILENCE_SECONDS`, `KALSHI_WS_STALE_ESCALATE_POLLS`, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`, `KALSHI_FILL_RECONCILE_SECONDS`
+8. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl`
+9. ~~Fix `PortfolioMonitor` session-realised-P&L placeholder~~ — **DONE**
+10. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
+11. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
+12. **External** alerting sink for `risk_breach` / `kill switch` / WS disconnect / `AlertManager` CRITICAL
+13. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
+14. Tune resilience knobs and document values: `KALSHI_WS_MAX_SILENCE_SECONDS`, `KALSHI_WS_STALE_ESCALATE_POLLS`, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`, `KALSHI_FILL_RECONCILE_SECONDS`
+15. Create `scripts/run_mean_reversion_prod.ps1` (isolated prod DB/log like other prod scripts)
+16. Add `test_fill_reconciliation` case for `mean_reversion` exit fills (parity with `high_prob`)
 
 **P2 — operational maturity**
 
-14. CI pipeline (`pytest` on push) — **no `.github/workflows` today**; now high-value and low-effort since the suite is fully green (aligns with project CI/CD standards)
-15. Secrets outside flat `.env` (vault / host env) for prod keys
-16. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter + metrics durability
-17. Runbook for orphan orders, partial arb legs, manual flatten, and forced-reconnect storms
-18. Python 3.11+ on runtime host (README requirement; dev machine may be 3.10)
+17. CI pipeline (`pytest` on push) — no `.github/workflows` today
+18. Secrets outside flat `.env` for prod keys
+19. SQLite backup or Postgres (`KALSHI_POSTGRES_URL`) for blotter + metrics durability
+20. Runbook for orphan orders, partial arb legs, manual flatten, and forced-reconnect storms
+21. Python 3.11+ on runtime host
+22. `session_table.py` mean-reversion action hints (TP distance, rolling mean)
 
 **P3 — nice to have**
 
-19. Docker / container health checks
-20. Full fill-funnel metrics and dashboard hardening (build on `MetricsStore`)
-21. Manual trade → blotter sync for mixed manual/bot workflows
+23. Docker / container health checks
+24. Full fill-funnel metrics and dashboard hardening (build on `MetricsStore`)
+25. Manual trade → blotter sync for mixed manual/bot workflows
+
+---
+
+## Next steps — execute in order (2026-06-09)
+
+Work top-to-bottom. Do not start Week 5 prod until every **Success criteria** row for Weeks 1–4 is checked.
+
+### Block 1 — Week 1 platform sign-off (1–2 days)
+
+| # | Step | How to execute | Success criteria |
+|---|------|----------------|------------------|
+| 1 | Tests green | `python -m pytest tests/ -v` | 248 passed, 0 failed |
+| 2 | Config profile | `python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"` | `demo`, `10000`, `kalshi_bot_demo.db` (or your demo overrides) |
+| 3 | 30 min soak | [Step 1.4](#step-14--run-bot-30-minutes-graceful-shutdown) with explicit tickers + `--strategy high_prob` | Process runs 30 min; Ctrl+C → exit 0; log has `shutdown`; `python tools/trade.py orders` empty |
+| 4 | Circuit breaker A | [Test A](#test-a--percent-drawdown-max_drawdown_pct) — `KALSHI_DEMO_MAX_DRAWDOWN_PCT=0.01` | Log: `max drawdown exceeded`, `kill switch`; orders cancelled; restore `0.10` after |
+| 5 | Circuit breaker B | [Test B](#test-b--session-loss-limit-daily_loss_limit_cents) — `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS=500` | Log: `session loss limit exceeded`, `kill switch`; restore normal limit after |
+| 6 | Manual sell | [Step 1.6](#step-16--manual-sell--flatten-test) | `trade.py sell` or `close` reduces position; portfolio matches |
+
+**Block 1 done when:** README [Production checklist](../README.md#production-checklist) items for pytest, SIGINT shutdown, and circuit breaker are checked.
+
+### Block 2 — Week 2 strategy certification (1–2 weeks)
+
+Run **three signed sessions** per strategy using the [Session template](#session-template-copy-per-run). Each session must complete at least one bot-driven trade cycle (not discover-only).
+
+| Strategy | Runbook | Minimum success per session |
+|----------|---------|----------------------------|
+| `high_prob` | [Week 2 steps 2.1–2.4](#week-2--certify-high_prob-and-green_up) | Entry fill → TP/stop/hold path documented; blotter legs match exchange |
+| `green_up` | [Phase A](#phase-a--single-ticker-controlled-entry-certification) | Entry → hedge **or** stop; parent `hedged` or `closed` with correct P&L |
+| `mean_reversion` | [MR-A runbook](#mean-reversion--demo-certification-runbook-phase-a) | Entry → exit/stop → parent `closed`; realised P&L on entry leg |
+
+**Commands to start each strategy discovery:**
+
+```bash
+python main.py --discover --discover-category Politics --strategy high_prob --discover-only
+python main.py --discover --discover-category Sports --strategy green_up --discover-only
+python main.py --discover --discover-category Sports --strategy mean_reversion --discover-only
+```
+
+**Block 2 done when:** 9 session logs exist (3 × 3 strategies); no orphan orders after any Ctrl+C; grep `kalshi_bot_demo.jsonl` for session dates shows no unhandled `traceback`.
+
+### Block 3 — Week 3 kelly + arb (3–5 days)
+
+| # | Step | Command | Success criteria |
+|---|------|---------|------------------|
+| 1 | Kelly tickers | `python tools/screen.py screen --category Sports --top 5` | 2 liquid tickers with spread ≤ 5¢ |
+| 2 | Kelly session ×2 | `python main.py --strategy kelly --tickers T1,T2 --model-prob T1:0.62,T2:0.55` | Orders only when edge ≥ gate; blotter entry legs ≤ `MAX_POSITION_CENTS` |
+| 3 | Arb session ×2 | `python main.py --strategy arb --comp-pairs T1:T2` or category discover | Both legs fill **or** explicit skip logged; document zero-arb days as OK |
+
+### Block 4 — Week 4 soak + prod prep (2 weeks)
+
+| # | Step | Action | Success criteria |
+|---|------|--------|------------------|
+| 1 | Daily demo runs | 1–2 hr/day, rotate all 5 strategies | No ERROR/traceback spam in `kalshi_bot_demo.jsonl` |
+| 2 | Weekly reports | `python tools/blotter_report.py performance --days 7` | Per-strategy P&L summary readable |
+| 3 | Prod keys loaded | Prod keys in `.env`, `KALSHI_ENV=demo` | Keys present; demo still active |
+| 4 | Prod dry-run | `KALSHI_ENV=production` → start bot → **immediate Ctrl+C** | Console: `PRODUCTION MODE`; prod DB/log paths; clean shutdown; revert to `demo` |
+
+**Block 4 done when:** README checklist "Two+ weeks demo trading without unhandled exceptions" is checked.
+
+### Block 5 — Production micro-pilot ($1 cap)
+
+**Prerequisite:** Blocks 1–4 complete. Certify strategies **one at a time**; do not combine on first prod week.
+
+| Order | Strategy | Script / command | Success criteria |
+|-------|----------|------------------|------------------|
+| 1 | `high_prob` | `.\scripts\run_high_prob_prod.ps1` | ≤ $1 stake; blotter + Kalshi UI match; daily loss &lt; $5 |
+| 2 | `green_up` | `.\scripts\run_green_up_prod.ps1` | ≤ $1 entry leg; hedge/stop works; re-run after 2026-05-30 fixes |
+| 3 | `mean_reversion` | Create then run `run_mean_reversion_prod.ps1` | ≤ $1 round-trip; TP/stop exit; parent `closed` with P&L |
+| 4 | `kelly` / `arb` | Manual prod commands at 100¢ cap | Optional; only after 1–3 stable |
+
+**Prod env (all micro-pilot runs):**
+
+```env
+KALSHI_ENV=production
+KALSHI_PROD_MAX_POSITION_CENTS=100
+KALSHI_PROD_MAX_CONCURRENT_POSITIONS=1
+KALSHI_PROD_DAILY_LOSS_LIMIT_CENTS=500
+```
+
+**Block 5 done when:** One clean prod session per strategy with session template filled; no kill switch trips from config mistakes; post-session `blotter.py detail` reconciles with `trade.py portfolio`.
+
+### Code tasks before unattended prod (can parallelize with Block 2)
+
+| Task | Owner | Done when |
+|------|-------|-----------|
+| `scripts/run_mean_reversion_prod.ps1` | Dev | Mirrors `run_high_prob_prod.ps1`; isolated `kalshi_bot_prod_mean_rev.db` |
+| `tests/test_fill_reconciliation.py` mean_reversion case | Dev | Exit fill closes entry leg with `realized_pnl_cents` |
+| `testing.md` mean_reversion section | Dev | MR-A commands + first live session notes |
+| `.github/workflows/ci.yml` | Dev | `pytest` on push; badge in README optional |
+| External alert webhook | Dev/Ops | `risk_breach` and `kill switch` reach phone/Slack within 60s |
 
 ---
 

@@ -5,6 +5,7 @@ Production-grade automated trading system for [Kalshi](https://kalshi.com) binar
 ### Recent updates
 
 - **Green-up execution (2026-06-06)** — game markets use **effective `minutes_to_close`** in the market registry (`discovery/game_close.py`) so stop-loss is not suppressed by far-future settlement times; relative hedge triggers cap at **95¢** (`KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP`) to keep NO legs executable; hedge/stop logic works on **one-sided books** (bid-only near resolution); optional **`--auto-take-profit`** submits cross-spread YES sells on `PROFIT_TARGET` alerts; shutdown always closes aiohttp sessions even if the ingestor task errors.
+- **One-sided book parity (2026-06-06)** — `high_prob` and `mean_reversion` use the same `strategy/book_normalize.py` helper as `green_up`: entries still require a two-sided book, but resting TP/stop exits work when only the bid is present (see [One-sided order books](#one-sided-order-books)).
 - **Trade lifecycle & blotter P&L (2026-05-30/31)** — exit/stop fills **close the entry leg** with realised P&L (no phantom opposing legs); green_up hedged parents stay `hedged` until settlement (`mark_trade_hedged`); stop/exit fills finalize even when Kalshi reports contra-side labels (`side: "no"`). Same fill handling for `high_prob` and `mean_reversion`. Maintenance: `scripts/cleanup_stale_trades.py`.
 - **Test/prod isolation** — `pytest` redirects logs and DB to a temp sandbox so the suite cannot append to `kalshi_bot_prod.jsonl` / `kalshi_bot_prod.db`.
 - **Position alerts** — `AlertManager` skips stop/profit alerts on exchange positions the bot does not own (no CRITICAL noise on manual holdings).
@@ -300,7 +301,7 @@ Relative triggers are capped at **95¢** (`KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP`, d
 
 **Game markets & stop-loss:** Sports `*GAME-*` tickers often report a far-future API `close_time` (settlement) while the match is live. `discovery/game_close.py` adjusts `minutes_to_close` in the market registry during in-play windows so `KALSHI_STOP_LOSS_CLOSE_WINDOW_MINUTES` (default 5) allows stops mid-event instead of wrongly holding through dips.
 
-**One-sided books:** Near resolution, YES favourites may show bid only (no ask). Entry still requires a two-sided book; **hedge and stop** paths synthesize a complement ask from the bid so `evaluate()` does not stall.
+**One-sided books:** Hedge and stop paths use [one-sided order book normalization](#one-sided-order-books). Green-up also caps relative hedge triggers at **95¢** (above) so complement NO legs stay executable.
 
 **Hedge execution styles** (`--gu-hedge-style`):
 
@@ -386,6 +387,8 @@ Entry gates (min/max band, ROI, spread) apply to the **limit price** you will ac
 
 **Re-entry:** after an exit fill the ticker returns to `scanning` and may enter again when the book qualifies, up to `--hp-max-cycles` (same pattern as green_up).
 
+**One-sided books:** When `--hp-post-fill` is not `hold`, resting take-profit and stop-loss still run on bid-only books via [one-sided order book normalization](#one-sided-order-books). New entries and re-entries after `closed` still require bid and ask.
+
 **Entry / exit modes:**
 
 | Mode | Buy YES | Sell YES |
@@ -452,6 +455,8 @@ Production script: `scripts/run_high_prob_prod.ps1` (fixed $1 stake, isolated pr
 
 **Long leg:** buy YES on dip → resting sell YES at mean reversion target. **Short leg:** buy NO on spike → resting sell NO when YES reverts. Exit wiring matches `high_prob` (TP/stop registration, blotter close on round-trip).
 
+**One-sided books:** Same [normalization](#one-sided-order-books) as `high_prob` for resting TP/stop on long and short legs. Rolling mid-price history records **two-sided ticks only**, so bid-only snapshots do not skew entry statistics.
+
 **Examples:**
 
 ```bash
@@ -482,6 +487,25 @@ python main.py --discover --discover-category Sports --strategy arb \
 ```
 
 Discovery preset pulls **top 25 by volume** with `--discover-full-scan` for broader coverage. Arb is the most category-scan intensive mode — watch rate limits (`429` backoff is automatic).
+
+---
+
+### One-sided order books
+
+Near resolution, heavy favourites often show **bid only** (no YES ask). `strategy/book_normalize.py` keeps exit logic from stalling:
+
+| Phase | Behavior |
+|-------|----------|
+| Entry / re-entry | Requires a real two-sided book (`best_bid` and `best_ask`) |
+| Active position | Synthesizes `best_ask` from `best_bid` (`min(99, bid + 1)`, or `99` when bid ≥ 99) for pricing |
+
+| Strategy | Normalized exit paths |
+|----------|----------------------|
+| `green_up` | Hedge trigger, resting hedge, stop-loss |
+| `high_prob` | Resting take-profit, stop-loss (`--hp-post-fill` ≠ `hold`) |
+| `mean_reversion` | Resting TP/stop on long (sell YES) and short (sell NO) legs |
+
+`mean_reversion` only appends to rolling mid history on two-sided ticks. `green_up` additionally caps relative hedge triggers at **95¢** (`KALSHI_GREEN_UP_HEDGE_TRIGGER_CAP`) so complement NO orders avoid 1¢ one-sided books.
 
 ---
 
@@ -872,13 +896,13 @@ Common issues when running the bot or `tools/trade.py`. Check structured logs in
 ## Production checklist
 
 - [ ] Two+ weeks demo trading without unhandled exceptions
-- [ ] `python -m pytest tests/ -v` all green (**224/224** as of 2026-05-31)
+- [x] `python -m pytest tests/ -v` all green (**248/248** as of 2026-06-09)
 - [ ] Kelly calibration ratio 0.85–1.10 (30+ settled trades per strategy)
-- [ ] Clean SIGINT shutdown (orders cancelled)
+- [x] Clean SIGINT shutdown (orders cancelled)
 - [ ] Circuit breaker tested in demo (`MAX_DRAWDOWN_PCT=0.01`) — uses live portfolio sync every `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS`
 - [ ] Pre-trade gates verified: low balance and `KALSHI_MIN_MINUTES_TO_EXPIRY` block new entries
 - [ ] Blotter legs match exchange fills; exit/stop closes entry leg with realised P&L; hedged parents show `hedged` until settlement
-- [ ] At least one signed **green_up** and **high_prob** demo session with full entry → exit/hedge/stop cycle (see [ROADMAP Week 2](docs/ROADMAP.md#week-2--certify-high_prob-and-green_up))
+- [ ] At least one signed **green_up**, **high_prob**, and **mean_reversion** demo session with full entry → exit/hedge/stop cycle (see [ROADMAP Week 2](docs/ROADMAP.md#week-2--certify-high_prob-and-green_up) and [mean reversion MR-A](docs/ROADMAP.md#mean-reversion--demo-certification-runbook-phase-a))
 - [ ] `config.py` reviewed: `MAX_POSITION_CENTS`, `DAILY_LOSS_LIMIT_CENTS`, fees
 - [ ] `KALSHI_ENV=production` not set in shell profiles by accident
 
@@ -896,10 +920,12 @@ kalshi_bot/
 │   ├── base_strategy.py          Signal interface
 │   ├── factory.py                build_strategy() by name
 │   ├── execution_price.py        Passive / cross_spread / market pricing
+│   ├── book_normalize.py         One-sided book ask synthesis for exit paths
 │   ├── position_limits.py        Concurrent open-position counting
 │   ├── kelly_strategy.py         Fractional Kelly + edge-to-vig
 │   ├── green_up_strategy.py      Back underdog YES / hedge NO
 │   ├── high_prob_strategy.py     High P(YES), fee-aware ROI, exit modes
+│   ├── mean_reversion_strategy.py Rolling-mean fade entries, long/short legs
 │   └── arbitrage_strategy.py     Multi-leg arb
 ├── discovery/
 │   ├── market_client.py          REST: markets, books, tags, sports filters, series

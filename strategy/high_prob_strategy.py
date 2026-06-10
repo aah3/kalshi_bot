@@ -288,32 +288,49 @@ class HighProbStrategy(BaseStrategy):
         self._model_probs[ticker] = prob
 
     def evaluate(self, tick: dict[str, Any]) -> Signal | None:
+        from strategy.book_normalize import normalize_tick_sides
+
         ticker = tick.get("ticker", "")
         best_bid = tick.get("best_bid")
         best_ask = tick.get("best_ask")
         spread = tick.get("spread")
 
-        if not ticker or best_bid is None or best_ask is None:
+        if not ticker or best_bid is None:
             return None
 
         if self._watch_tickers and ticker not in self._watch_tickers:
             return None
 
         pos = self._positions.get(ticker)
+        entry_path = (
+            pos is None
+            or pos.state in (PositionState.SCANNING, PositionState.WATCHING)
+            or pos.state == PositionState.CLOSED
+        )
+        if entry_path and best_ask is None:
+            return None
+
+        work_tick = tick if entry_path else normalize_tick_sides(tick)
+        if work_tick is None:
+            return None
+
+        best_bid = work_tick.get("best_bid")
+        best_ask = work_tick.get("best_ask")
+        spread = work_tick.get("spread") if spread is None else spread
 
         if pos and pos.state == PositionState.CLOSED:
             if self._try_begin_new_cycle(pos):
-                return self._check_entry(ticker, tick, best_bid, best_ask, spread)
+                return self._check_entry(ticker, work_tick, best_bid, best_ask, spread)
             return None
 
         if pos and pos.state in (PositionState.ENTERED, PositionState.EXIT_PENDING):
-            return self._check_exit(pos, tick)
+            return self._check_exit(pos, work_tick)
 
         if pos and pos.state == PositionState.WATCHING:
             return None
 
         if pos is None or pos.state == PositionState.SCANNING:
-            return self._check_entry(ticker, tick, best_bid, best_ask, spread)
+            return self._check_entry(ticker, work_tick, best_bid, best_ask, spread)
 
         return None
 
@@ -556,7 +573,7 @@ class HighProbStrategy(BaseStrategy):
 
         best_ask = tick.get("best_ask")
         if best_ask is None:
-            return None
+            return None  # caller should pass normalize_tick_sides output
 
         # Resting take-profit: sell YES at target (passive by default)
         if emit_tp and not pos.tp_order_sent:
