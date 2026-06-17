@@ -672,6 +672,22 @@ The monitor falls back to REST order books when the WebSocket book is **empty or
 
 **Fill rate in the monitor** counts signals where the bot’s fill listener saw an exchange fill—not every resting limit or IOC that was sent. Use `tools/trade.py orders` / `portfolio` to reconcile exchange state.
 
+### Session auto-exit (optional)
+
+By default `main.py` runs until you press **Ctrl+C**. Two optional flags trigger the same graceful shutdown path (cancel open orders, stop WebSocket, final settlement check):
+
+| Flag | Shuts down when… |
+|------|------------------|
+| `--exit-on-settle` | Every session ticker is **`settled`** or **`finalized`** on Kalshi **and** no open blotter parents remain on those tickers (runs settlement sync first) |
+| `--exit-when-flat` | Session tickers are **flat**: no resting orders, no in-flight entry legs (`open` / `partially_hedged`), no active strategy states (`watching`, `entered`, `hedging`, `stopping`, …), **and** the market/event window is over (game past estimated end, or market `closed`/`settled`). **Hedged** blotter rows are OK — you are done trading but may still await settlement |
+
+You can pass **both** flags; whichever condition is met first exits. Poll interval matches portfolio risk sync (default **30s**, `KALSHI_PORTFOLIO_RISK_SYNC_SECONDS`). Auto-exit does **not** flatten positions — open legs remain on the exchange until settlement or manual `tools/trade.py sell`.
+
+```bash
+python main.py --tickers TICKER-A --strategy green_up --gu-max-cycles 1 \
+  --exit-when-flat --exit-on-settle --monitor-interval 30
+```
+
 ### 5. Dashboard and session reports
 
 ```bash
@@ -1013,7 +1029,7 @@ KALSHI_LIVE_ONLY=true
 KALSHI_LIVE_MAX_MINUTES_TO_CLOSE=360
 ```
 
-CLI flags (`--entry-max`, `--gu-no-entry-max`, `--hedge-trigger`, `--hedge-offset`, `--gu-hedge-style`, `--hedge-mode`, `--stop-loss`, `--gu-max-spread`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--auto-take-profit`, `--discover-max-minutes-to-close`) override these at runtime.
+CLI flags (`--entry-max`, `--gu-no-entry-max`, `--hedge-trigger`, `--hedge-offset`, `--gu-hedge-style`, `--hedge-mode`, `--stop-loss`, `--gu-max-spread`, `--gu-entry-mode`, `--gu-exit-mode`, `--max-concurrent-positions`, `--no-live-only`, `--auto-take-profit`, `--exit-on-settle`, `--exit-when-flat`, `--discover-max-minutes-to-close`) override these at runtime.
 
 ### High-probability environment variables
 

@@ -86,6 +86,20 @@ def effective_minutes_to_close(market: MarketSummary) -> float | None:
     Non-game markets pass through unchanged. Game markets use a synthetic window
     when API settlement is far in the future but the event is active.
     """
+    status = (market.status or "").strip().lower()
+    if status in ("closed", "settled", "finalized"):
+        return _IN_PLAY_STOP_GATE_MINUTES
+
+    # Dead or resolved book — allow protective exits even when API close is far out.
+    yes_bid = market.yes_bid
+    if yes_bid is not None and yes_bid <= 1:
+        stale = (
+            market.minutes_since_update is None
+            or market.minutes_since_update > 30.0
+        )
+        if stale or status in ("closed", "settled", "finalized"):
+            return _IN_PLAY_STOP_GATE_MINUTES
+
     api_mins = market.minutes_to_close
     if not is_game_ticker(market.ticker):
         return api_mins

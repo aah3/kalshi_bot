@@ -19,6 +19,9 @@ def _game_market(
     volume_24h: int = 100,
     minutes_since_update: float = 15.0,
     api_minutes_to_close: float = 20_000.0,
+    status: str = "open",
+    yes_bid: int | None = 50,
+    yes_ask: int | None = 52,
 ) -> MarketSummary:
     now = datetime.now(timezone.utc)
     close_time = now + timedelta(minutes=api_minutes_to_close)
@@ -29,8 +32,8 @@ def _game_market(
         title="Test game",
         category="Sports",
         series_ticker="KXNBAGAME",
-        yes_bid=50,
-        yes_ask=52,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
         no_bid=48,
         no_ask=50,
         last_price=51,
@@ -38,7 +41,7 @@ def _game_market(
         volume_24h=volume_24h,
         open_interest=100,
         liquidity=5000,
-        status="open",
+        status=status,
         close_time=close_time,
         updated_at=updated_at,
         result=None,
@@ -84,3 +87,18 @@ def test_estimated_game_end_after_game_day():
     start = parse_game_day_start("KXNBAGAME-26JUN05NYKSAS-NYK")
     assert end is not None and start is not None
     assert end > start
+
+
+def test_settled_game_allows_stop_gate():
+    m = _game_market(status="settled", api_minutes_to_close=20_000.0)
+    assert effective_minutes_to_close(m) <= 5.0
+
+
+def test_dead_book_low_bid_allows_stop_gate():
+    m = _game_market(
+        yes_bid=1,
+        yes_ask=99,
+        minutes_since_update=60.0,
+        api_minutes_to_close=20_000.0,
+    )
+    assert effective_minutes_to_close(m) <= 5.0

@@ -469,3 +469,92 @@ def test_high_prob_exit_fill_closes_entry_leg_with_realised_pnl():
             main._active_trades, main._pending_orders,
         ) = saved
 
+
+def test_entry_fill_via_inflight_context_when_pending_not_yet_keyed():
+    """Fill arriving before order_id is registered still books the blotter leg."""
+    import main
+    from metrics.blotter import Blotter
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState
+
+    saved = (
+        main._blotter, main._strategy, main._store, main._execution,
+        main._circuit_breaker, main._alert_manager,
+        dict(main._active_trades), dict(main._pending_orders),
+        dict(main._inflight_submits),
+    )
+    try:
+        ticker = "KXTEST-INFLIGHT"
+        blotter = Blotter(":memory:")
+        strat   = GreenUpStrategy(stop_loss_cents=10)
+        strat.add_watch_ticker(ticker)
+
+        main._blotter         = blotter
+        main._strategy        = strat
+        main._store           = None
+        main._execution       = None
+        main._circuit_breaker = None
+        main._alert_manager   = None
+        main._active_trades   = {}
+        main._pending_orders  = {}
+        main._inflight_submits = {
+            ticker: main._build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=strat.name,
+                side="yes",
+            )
+        }
+        main._processed_fill_ids.clear()
+
+        strat.get_position(ticker).state = PositionState.WATCHING
+        main.on_fill_received({
+            "trade_id": "INF-1", "order_id": "entry-inflight", "ticker": ticker,
+            "side": "yes", "action": "buy", "price": 16, "size_cents": 16,
+            "contracts": 1,
+        })
+
+        assert ticker in main._active_trades
+        legs = blotter.query_legs(parent_trade_id=main._active_trades[ticker])
+        assert len(legs) == 1
+        assert legs[0].contracts == 1
+    finally:
+        (
+            main._blotter, main._strategy, main._store, main._execution,
+            main._circuit_breaker, main._alert_manager,
+            main._active_trades, main._pending_orders, main._inflight_submits,
+        ) = saved
+
+
+def test_restore_active_trades_from_blotter():
+    import main
+    from metrics.blotter import Blotter
+
+    saved = (
+        main._blotter,
+        dict(main._active_trades),
+    )
+    try:
+        blotter = Blotter(":memory:")
+        trade_id = blotter.open_trade(
+            ticker="KXRESUME-1",
+            category="Sports",
+            strategy="green_up_test",
+            trade_type="single",
+        )
+        blotter.record_fill(
+            parent_trade_id=trade_id,
+            order_id="e1",
+            side="yes",
+            trade_type="entry",
+            contracts=1,
+            entry_price=20,
+            strategy="green_up_test",
+        )
+        main._blotter = blotter
+        main._active_trades = {}
+        main._restore_active_trades_from_blotter()
+        assert main._active_trades["KXRESUME-1"] == trade_id
+    finally:
+        main._blotter, main._active_trades = saved
+

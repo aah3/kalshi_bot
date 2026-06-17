@@ -304,10 +304,10 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 2. Preview sell:
 
    ```bash
-   python tools/trade.py preview --ticker YOUR-TICKER --side yes --count 1 --market
+   python tools/trade.py preview --ticker YOUR-TICKER --side yes --count 1 --market --sell
    ```
 
-   Expect: action **SELL**, price at or near **bid** (market sell walks the bid).
+   Expect: action **SELL**, `yes_price` at or near **bid** (market sell uses bid floor).
 
 3. Execute:
 
@@ -320,6 +320,8 @@ Validates `tools/trade.py` and sell pricing independent of strategies.
 4. `python tools/trade.py portfolio` → position reduced or flat.
 
 **Note:** Manual `trade.py` orders are **not** written to the bot blotter. Week 2+ strategy tests should use bot-driven orders for blotter reconciliation.
+
+**Pass record (2026-06-10):** Ticker `KXLIUSAELIMINATIONW-26JUN12-BEA` — buy 1 YES @ market → `sell --market` filled (`yes_price=33`, bid floor) → portfolio flat; repeat buy → `close --yes` filled → portfolio flat. Fractional close (`0.69 NO`) verified earlier same day (`count=0`, `count_fp=0.69`). No `Order rejected` in `kalshi_bot_demo.jsonl` after `kalshi_order_count_fields` fix.
 
 ---
 
@@ -755,7 +757,7 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | Phase | Code / tooling | Live certification |
 |-------|----------------|-------------------|
 | Environment profiles | Done | Verify each session with `python -c "import config; …"` |
-| Week 1 — platform baseline | Done | **In progress** — soak, circuit breaker, manual sell not formally signed |
+| Week 1 — platform baseline | Done | **In progress** — soak, circuit breaker not formally signed; **manual sell signed 2026-06-10** |
 | Week 2 — `high_prob` + `green_up` + `mean_reversion` | Done (hardened) | **Partial** — `testing.md` has `high_prob`/`green_up` commands; **one prod green_up micro-run** (2026-05-30); **`mean_reversion` has zero live sessions** |
 | Week 3 — `kelly` + `arb` | Done | **Not started** — no documented demo sessions |
 | Week 4 — demo soak + prod dry-run | Tooling done | **Not started** — no 2-week soak; prod dry-run not recorded |
@@ -783,7 +785,7 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | 1 | 1.3 Config profile print | Yes | — |
 | 1 | 1.4 ~30 min soak + Ctrl+C | Yes | Not signed in README checklist |
 | 1 | 1.5 Circuit breaker live (A + B) | Yes | Not signed |
-| 1 | 1.6 Manual sell / flatten | Yes (`tools/trade.py`) | Not signed |
+| 1 | 1.6 Manual sell / flatten | Yes (`tools/trade.py`) | **Signed 2026-06-10** — sell + close flatten; fractional `count_fp` |
 | 2 | `high_prob` 3 sessions | Yes | Commands in `testing.md`; no session template sign-off |
 | 2 | `green_up` 3 sessions | Yes | Same |
 | 2 | `mean_reversion` 3 sessions | **Yes** (new) | Unit-tested only; see [MR-A runbook](#mean-reversion--demo-certification-runbook-phase-a) |
@@ -972,7 +974,7 @@ Work top-to-bottom. Do not start Week 5 prod until every **Success criteria** ro
 | 3 | 30 min soak | [Step 1.4](#step-14--run-bot-30-minutes-graceful-shutdown) with explicit tickers + `--strategy high_prob` | Process runs 30 min; Ctrl+C → exit 0; log has `shutdown`; `python tools/trade.py orders` empty |
 | 4 | Circuit breaker A | [Test A](#test-a--percent-drawdown-max_drawdown_pct) — `KALSHI_DEMO_MAX_DRAWDOWN_PCT=0.01` | Log: `max drawdown exceeded`, `kill switch`; orders cancelled; restore `0.10` after |
 | 5 | Circuit breaker B | [Test B](#test-b--session-loss-limit-daily_loss_limit_cents) — `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS=500` | Log: `session loss limit exceeded`, `kill switch`; restore normal limit after |
-| 6 | Manual sell | [Step 1.6](#step-16--manual-sell--flatten-test) | `trade.py sell` or `close` reduces position; portfolio matches |
+| 6 | Manual sell | [Step 1.6](#step-16--manual-sell--flatten-test) | **Done 2026-06-10** — `sell`/`close` flatten; portfolio 0 positions |
 
 **Block 1 done when:** README [Production checklist](../README.md#production-checklist) items for pytest, SIGINT shutdown, and circuit breaker are checked.
 

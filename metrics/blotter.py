@@ -901,7 +901,7 @@ class Blotter:
                 """
                 SELECT trade_id, ticker, market_title, category, strategy,
                        total_contracts, total_cost_cents, total_fees_cents,
-                       num_legs, entry_time
+                       num_legs, entry_time, status
                 FROM parent_trades
                 WHERE status IN ('open', 'hedged', 'partially_hedged')
                 ORDER BY entry_time DESC
@@ -910,7 +910,7 @@ class Blotter:
         return [dict(zip(
             ["trade_id","ticker","market_title","category","strategy",
              "total_contracts","total_cost_cents","total_fees_cents",
-             "num_legs","entry_time"], r
+             "num_legs","entry_time","status"], r
         )) for r in rows]
 
     def best_trades(self, n: int = 10, days: int = 30) -> list[ParentRecord]:

@@ -105,6 +105,7 @@ _auto_take_profit: bool = False
 # is linked to the correct blotter parent row.
 _active_trades: dict[str, str] = {}
 _pending_orders: dict[str, dict[str, Any]] = {}  # order_id -> submit context for blotter
+_inflight_submits: dict[str, dict[str, Any]] = {}  # ticker -> submit ctx (pre-order_id race)
 # Fill ids already applied, so the WebSocket and REST-reconciliation paths never
 # double-count the same fill.
 _processed_fill_ids: set[str] = set()
@@ -361,7 +362,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
             config.STOP_LOSS_CLOSE_WINDOW_MINUTES,
         )
         if not _sl_ok:
-            logger.info(
+            logger.warning(
                 "Suppressing stop-loss — time remaining",
                 ticker=signal_obj.ticker,
                 reason=_sl_reason,
@@ -440,8 +441,18 @@ async def on_tick(tick: dict[str, Any]) -> None:
             return
 
     # Submit order to exchange (blotter records on confirmed WS fill only)
+    submit_ctx = _build_pending_context(
+        ticker=ticker,
+        trade_type=trade_type,
+        meta=meta,
+        strategy=signal_obj.strategy,
+        side=signal_obj.side.value,
+    )
+    _inflight_submits[ticker] = submit_ctx
+
     order = await _execution.submit_order(signal_obj)
     if not order:
+        _inflight_submits.pop(ticker, None)
         if phase in ("entry", "leg_1"):
             _rollback_pending_entry(ticker)
         elif phase == "hedge":
@@ -457,14 +468,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
         return
 
     order_id = order.get("order_id", "")
-    _pending_orders[order_id] = {
-        "ticker":     ticker,
-        "trade_type": trade_type,
-        "meta":       meta,
-        "strategy":   signal_obj.strategy,
-        "category":   meta.get("category", "Unknown"),
-        "side":       signal_obj.side.value,
-    }
+    _pending_orders[order_id] = _inflight_submits.pop(ticker, submit_ctx)
 
     if phase == "stop_loss":
         from strategy.green_up_strategy import GreenUpStrategy
@@ -520,6 +524,162 @@ def _known_order_ids() -> set[str]:
     if _execution:
         ids |= set(_execution.open_orders.keys())
     return ids
+
+
+def _restore_active_trades_from_blotter() -> None:
+    """Map open blotter parent trades back to in-memory ticker → trade_id."""
+    if not _blotter:
+        return
+    for row in _blotter.open_positions_summary():
+        ticker = row.get("ticker")
+        trade_id = row.get("trade_id")
+        if ticker and trade_id:
+            _active_trades[ticker] = trade_id
+
+
+def _build_pending_context(
+    *,
+    ticker: str,
+    trade_type: str,
+    meta: dict[str, Any],
+    strategy: str,
+    side: str,
+) -> dict[str, Any]:
+    return {
+        "ticker":     ticker,
+        "trade_type": trade_type,
+        "meta":       meta,
+        "strategy":   strategy,
+        "category":   meta.get("category", "Unknown"),
+        "side":       side,
+    }
+
+
+def _infer_pending_context(
+    fill: dict[str, Any],
+    order_id: str,
+) -> dict[str, Any] | None:
+    """
+    Reconstruct submit context when a fill arrives before _pending_orders
+    is keyed (async race) or when reconciliation delivers a fill we own.
+    """
+    ticker = fill.get("ticker", "")
+    if not ticker or not _strategy:
+        return None
+
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState as GUState
+
+    if isinstance(_strategy, GreenUpStrategy):
+        pos = _strategy.get_position(ticker)
+        if pos is None:
+            return None
+        side = fill.get("side", "")
+        if pos.state == GUState.WATCHING and side == "yes":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state == GUState.STOPPING:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="stop_loss",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state in (GUState.HEDGING, GUState.ENTERED) and side == "no":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="hedge",
+                meta={},
+                strategy=_strategy.name,
+                side="no",
+            )
+        if pos.stop_order_id and order_id == pos.stop_order_id:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="stop_loss",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.hedge_order_id and order_id == pos.hedge_order_id:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="hedge",
+                meta={},
+                strategy=_strategy.name,
+                side="no",
+            )
+        if pos.entry_order_id and order_id == pos.entry_order_id:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+
+    from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+    from strategy.mean_reversion_strategy import (
+        MeanReversionStrategy,
+        PositionState as MRState,
+    )
+
+    if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
+        pos = _strategy.get_position(ticker)
+        if pos is None:
+            return None
+        exit_pending = HPState.EXIT_PENDING if isinstance(_strategy, HighProbStrategy) else MRState.EXIT_PENDING
+        entered = HPState.ENTERED if isinstance(_strategy, HighProbStrategy) else MRState.ENTERED
+        watching = HPState.WATCHING if isinstance(_strategy, HighProbStrategy) else MRState.WATCHING
+        side = fill.get("side", "")
+        if pos.state == watching and side == "yes":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state == exit_pending:
+            phase = "stop_loss" if getattr(pos, "stop_order_sent", False) else "exit"
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type=phase,
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state == entered and side == "yes":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+
+    return None
+
+
+def _resolve_pending_context(
+    fill: dict[str, Any],
+    order_id: str,
+) -> dict[str, Any] | None:
+    """Look up submit context for a fill from order id, inflight, or strategy."""
+    ticker = fill.get("ticker", "")
+    pending = _pending_orders.get(order_id) if order_id else None
+    if pending:
+        return pending
+    if ticker:
+        pending = _inflight_submits.get(ticker)
+        if pending:
+            return pending
+    return _infer_pending_context(fill, order_id)
 
 
 def _close_entry_leg_on_exit(
@@ -601,7 +761,7 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
     order_id = fill.get("order_id", "")
     ticker   = fill.get("ticker", "")
-    pending  = _pending_orders.get(order_id)
+    pending  = _resolve_pending_context(fill, order_id)
     exit_entry_closed = False
 
     if _strategy:
@@ -712,6 +872,8 @@ def on_fill_received(fill: dict[str, Any]) -> None:
         _execution.record_fill(fill)
         if order_id not in _execution.open_orders:
             _pending_orders.pop(order_id, None)
+        if ticker:
+            _inflight_submits.pop(ticker, None)
 
     if _circuit_breaker:
         _circuit_breaker.record_fill(fill)
@@ -746,6 +908,90 @@ async def _portfolio_risk_sync_loop(interval_seconds: float) -> None:
                     _circuit_breaker.sync_from_portfolio(snap)
         except Exception as exc:
             logger.warning(f"Portfolio risk sync failed: {exc}")
+        try:
+            await asyncio.wait_for(
+                _shutdown_event.wait(),
+                timeout=interval_seconds,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+
+def _collect_strategy_states(session_tickers: list[str]) -> dict[str, str]:
+    """Return ``{ticker: state_value}`` for session tickers with strategy positions."""
+    if not _strategy:
+        return {}
+    states: dict[str, str] = {}
+    for ticker in session_tickers:
+        pos = _strategy.get_position(ticker)
+        if pos is not None:
+            states[ticker] = pos.state.value
+    return states
+
+
+async def _session_exit_loop(
+    session_tickers: list[str],
+    *,
+    exit_on_settle: bool,
+    exit_when_flat: bool,
+    interval_seconds: float,
+) -> None:
+    """Poll session completion conditions and trigger graceful shutdown."""
+    from discovery.market_registry import get_market
+    from trading.session_exit import should_exit_on_settle, should_exit_when_flat
+
+    while not _shutdown_event.is_set():
+        try:
+            if _settlement_watcher and exit_on_settle:
+                await _settlement_watcher.check_now()
+
+            market_statuses: dict[str, dict] = {}
+            if _settlement_watcher and (exit_on_settle or exit_when_flat):
+                market_statuses = await _settlement_watcher.fetch_market_statuses(
+                    session_tickers
+                )
+
+            open_blotter = _blotter.open_positions_summary() if _blotter else []
+            open_orders = _execution.open_orders if _execution else {}
+            strategy_states = _collect_strategy_states(session_tickers)
+            markets = {ticker: get_market(ticker) for ticker in session_tickers}
+
+            if exit_on_settle:
+                reason = should_exit_on_settle(
+                    session_tickers,
+                    market_statuses,
+                    open_blotter,
+                )
+                if reason:
+                    logger.info(
+                        "Session auto-exit (--exit-on-settle)",
+                        reason=reason,
+                    )
+                    logger.shutdown(reason=f"session auto-exit: {reason}")
+                    _shutdown_event.set()
+                    break
+
+            if exit_when_flat:
+                reason = should_exit_when_flat(
+                    session_tickers,
+                    market_statuses,
+                    markets,
+                    open_blotter,
+                    open_orders,
+                    strategy_states,
+                )
+                if reason:
+                    logger.info(
+                        "Session auto-exit (--exit-when-flat)",
+                        reason=reason,
+                    )
+                    logger.shutdown(reason=f"session auto-exit: {reason}")
+                    _shutdown_event.set()
+                    break
+        except Exception as exc:
+            logger.warning(f"Session exit check failed: {exc}")
+
         try:
             await asyncio.wait_for(
                 _shutdown_event.wait(),
@@ -1205,6 +1451,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "On PROFIT_TARGET alerts, submit a cross-spread YES sell for bot-owned "
             "contracts (env KALSHI_AUTO_TAKE_PROFIT)"
+        ),
+    )
+    parser.add_argument(
+        "--exit-on-settle",
+        action="store_true",
+        help=(
+            "Auto-shutdown when every session ticker is settled/finalized on Kalshi "
+            "and no open blotter trades remain on those tickers"
+        ),
+    )
+    parser.add_argument(
+        "--exit-when-flat",
+        action="store_true",
+        help=(
+            "Auto-shutdown when session tickers are flat (no orders, no in-flight "
+            "entry legs or strategy states) and the market/event window is over "
+            "(does not wait for official settlement)"
         ),
     )
 
@@ -1781,6 +2044,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
     book_fallback_task = None
     fill_reconcile_task = None
     monitor_task = None
+    session_exit_task = None
 
     auth_ok, auth_msg = await verify_portfolio_credentials(
         credentials, rate_limiter, shared_session
@@ -1876,6 +2140,17 @@ async def main(args: argparse.Namespace | None = None) -> None:
             _session_monitor.run(), name="session_monitor"
         )
 
+    if args.exit_on_settle or args.exit_when_flat:
+        session_exit_task = asyncio.create_task(
+            _session_exit_loop(
+                tickers,
+                exit_on_settle=bool(args.exit_on_settle),
+                exit_when_flat=bool(args.exit_when_flat),
+                interval_seconds=config.PORTFOLIO_RISK_SYNC_SECONDS,
+            ),
+            name="session_exit",
+        )
+
     startup_kw: dict = dict(
         env=config.ENV,
         strategy=_strategy.name,
@@ -1889,6 +2164,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
         ws_book_rest_fallback_poll_seconds=config.WS_BOOK_REST_FALLBACK_POLL_SECONDS,
         max_concurrent_positions=_max_concurrent_positions,
         auto_take_profit_on_alert=_auto_take_profit,
+        exit_on_settle=bool(args.exit_on_settle),
+        exit_when_flat=bool(args.exit_when_flat),
         live_trading_only=_live_rules.enabled if _live_rules else False,
         live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
         live_max_minutes_to_close=_live_rules.max_minutes_to_close if _live_rules else None,
@@ -1920,9 +2197,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
     # Resume open positions from previous session
     open_pos = _blotter.open_positions_summary()
     if open_pos:
+        _restore_active_trades_from_blotter()
         logger.info(
             f"Resuming with {len(open_pos)} open positions from previous session",
             open_positions=[p["trade_id"] for p in open_pos],
+            active_trade_map=dict(_active_trades),
         )
 
     # ── Run until shutdown event ──────────────────────────────────────────────
@@ -1965,6 +2244,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             risk_sync_task,
             book_fallback_task,
             fill_reconcile_task,
+            session_exit_task,
         ):
             if task:
                 task.cancel()
@@ -1973,6 +2253,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             risk_sync_task,
             book_fallback_task,
             fill_reconcile_task,
+            session_exit_task,
         ):
             if task:
                 try:

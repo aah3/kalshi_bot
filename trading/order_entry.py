@@ -41,6 +41,7 @@ import aiohttp
 
 import config
 from credentials.credential_manager import CredentialManager
+from trading.position_parse import format_contract_qty
 from discovery.market_client import MarketClient, OrderBookSnapshot
 from discovery.orderbook_parse import market_order_yes_price, worst_market_fill_price
 from execution.rate_limiter import BucketType, RateLimiter
@@ -48,6 +49,17 @@ from logging_.structured_logger import logger
 
 
 # ── Order types ───────────────────────────────────────────────────────────────
+
+def kalshi_order_count_fields(contracts: float) -> tuple[int, str]:
+    """
+    Kalshi ``CreateOrderRequest.count`` must be an integer.
+
+    Fractional contract size is carried in ``count_fp`` (e.g. count=0,
+    count_fp=0.69 or count=27, count_fp=27.31).
+    """
+    rounded = round(contracts, 2)
+    return int(rounded), f"{rounded:.2f}"
+
 
 class OrderType(str, Enum):
     MARKET = "market"
@@ -121,7 +133,7 @@ class OrderRequest:
     ticker:       str
     side:         OrderSide
     order_type:   OrderType
-    count:        int              # number of contracts (integer, not cents)
+    count:        float            # number of contracts (fractional via count_fp)
     limit_price:  int | None       # cents (1-99) for limit; None for market
     market_max_price: int | None = None  # optional cap for market (else from book)
     time_in_force: TimeInForce    = TimeInForce.GTC
@@ -141,12 +153,12 @@ class OrderRequest:
         if self.limit_price is None:
             return None
         price = self.limit_price if self.side == OrderSide.YES else 100 - self.limit_price
-        return price * self.count
+        return int(round(price * self.count))
 
     @property
     def max_payout_cents(self) -> int:
         """Maximum payout if position wins: always $1 per contract."""
-        return self.count * 100
+        return int(round(self.count * 100))
 
     def validate(self) -> list[str]:
         """Return a list of validation errors (empty = valid)."""
@@ -179,7 +191,7 @@ class OrderReceipt:
     ticker:           str
     side:             OrderSide
     order_type:       OrderType
-    count:            int
+    count:            float
     limit_price:      int | None
     yes_price:        int | None
     status:           OrderStatus
@@ -193,7 +205,7 @@ class OrderReceipt:
         return (
             f"ORDER {self.order_id[:8]}  "
             f"{self.order_type.value.upper()} {self.side.value.upper()} "
-            f"{self.count} × {self.ticker}  "
+            f"{format_contract_qty(self.count)} × {self.ticker}  "
             f"@ {self.limit_price or 'MKT'}c  "
             f"cost≈{cost_str}  "
             f"max_payout=${self.max_payout_cents/100:.2f}  "
@@ -372,6 +384,12 @@ class OrderEntry:
                     request.action,
                     request.count,
                 )
+            if market_cap is not None and request.action == "sell":
+                if request.side == OrderSide.YES:
+                    est_yes_price = market_cap
+                else:
+                    est_yes_price = 100 - market_cap
+                est_cost_cents = int(round(market_cap * request.count))
 
         implied_roi = None
         if est_cost_cents and est_cost_cents > 0:
@@ -421,14 +439,15 @@ class OrderEntry:
         if request.order_type == OrderType.MARKET and tif == TimeInForce.GTC.value:
             tif = TimeInForce.IOC.value
 
+        count_int, count_fp = kalshi_order_count_fields(request.count)
         body: dict[str, Any] = {
             "ticker":          request.ticker,
             "client_order_id": client_order_id,
             "type":            request.order_type.value,
             "action":          request.action,
             "side":            request.side.value,
-            "count":           request.count,
-            "count_fp":        f"{request.count:.2f}",
+            "count":           count_int,
+            "count_fp":        count_fp,
             "time_in_force":   tif,
         }
 

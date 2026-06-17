@@ -209,6 +209,11 @@ BLOCK_ENTRIES_ON_LOW_BALANCE: bool = os.getenv(
 STOP_LOSS_CLOSE_WINDOW_MINUTES: float = float(
     os.getenv("KALSHI_STOP_LOSS_CLOSE_WINDOW_MINUTES", "5.0")
 )
+# After a stop condition is armed, escalate from resting GTC to IOC market sell
+# when still unfilled (or when bid is at the floor). 0 = escalate immediately.
+STOP_LOSS_ESCALATE_SECONDS: float = float(
+    os.getenv("KALSHI_STOP_LOSS_ESCALATE_SECONDS", "120.0")
+)
 
 DEFAULT_STRATEGY: str = os.getenv("KALSHI_DEFAULT_STRATEGY", "high_prob")
 ORDER_SUBMIT_MAX_RETRIES: int = int(os.getenv("KALSHI_ORDER_MAX_RETRIES", "3"))
