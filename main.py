@@ -99,6 +99,9 @@ _strategy:           BaseStrategy      | None = None
 _store:              MetricsStore      | None = None
 _shutdown_event = asyncio.Event()
 _auto_take_profit: bool = False
+_instance_id: str | None = None
+_universe_manager = None  # orchestration.universe_manager.UniverseManager | None
+_session_tickers: list[str] = []  # mutable watchlist for session exit / monitor
 
 # Active trade tracking: ticker -> parent_trade_id
 # Maps each market to its currently open logical trade so every fill
@@ -285,6 +288,9 @@ async def on_tick(tick: dict[str, Any]) -> None:
     global _portfolio_snapshot
 
     if _circuit_breaker and _circuit_breaker.is_tripped:
+        return
+
+    if _shutdown_event.is_set():
         return
 
     signal_obj = _strategy.evaluate(tick)
@@ -545,12 +551,15 @@ def _build_pending_context(
     strategy: str,
     side: str,
 ) -> dict[str, Any]:
+    enriched = dict(meta) if meta else {}
+    if _instance_id and "instance_id" not in enriched:
+        enriched["instance_id"] = _instance_id
     return {
         "ticker":     ticker,
         "trade_type": trade_type,
-        "meta":       meta,
+        "meta":       enriched,
         "strategy":   strategy,
-        "category":   meta.get("category", "Unknown"),
+        "category":   enriched.get("category", "Unknown"),
         "side":       side,
     }
 
@@ -1032,6 +1041,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"Strategy engine (default: {config.DEFAULT_STRATEGY}, "
             "or KALSHI_STRATEGY env)"
         ),
+    )
+    parser.add_argument(
+        "--instance",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load a StrategyInstance YAML/JSON (sets strategy, universe, risk, "
+            "persistence). Optional --instance-id when PATH is a portfolio file."
+        ),
+    )
+    parser.add_argument(
+        "--instance-id",
+        default=None,
+        metavar="ID",
+        help="Select instance id from a portfolio file used with --instance",
     )
     parser.add_argument(
         "--tickers",
@@ -1888,10 +1912,40 @@ async def main(args: argparse.Namespace | None = None) -> None:
     global _store, _blotter, _settlement_watcher
     global _portfolio_monitor, _alert_manager, _session_monitor
     global _max_concurrent_positions, _live_rules, _portfolio_snapshot
-    global _auto_take_profit
+    global _auto_take_profit, _instance_id, _universe_manager, _session_tickers
 
     if args is None:
         args = parse_args()
+
+    instance = None
+    if getattr(args, "instance", None):
+        from orchestration.strategy_instance import (
+            StrategyInstanceError,
+            load_strategy_instance,
+        )
+        from orchestration.instance_adapter import apply_instance_runtime
+
+        try:
+            instance = load_strategy_instance(
+                args.instance,
+                instance_id=getattr(args, "instance_id", None),
+            )
+        except StrategyInstanceError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+        if not instance.enabled:
+            logger.error("StrategyInstance is disabled", instance_id=instance.id)
+            sys.exit(1)
+        apply_instance_runtime(instance, args)
+        _instance_id = instance.id
+        logger.info(
+            "StrategyInstance loaded",
+            instance_id=instance.id,
+            strategy=instance.strategy,
+            refresh_seconds=instance.universe.refresh_seconds,
+            db_path=config.DB_PATH,
+            log_file=config.LOG_FILE,
+        )
 
     if args.quiet or not config.LOG_CONSOLE:
         logger.set_console_level(logging.WARNING)
@@ -1920,9 +1974,12 @@ async def main(args: argparse.Namespace | None = None) -> None:
     if not tickers:
         logger.error(
             "No tickers configured — set KALSHI_TICKERS, pass --tickers, "
-            f"or use --discover (defaults to {DEFAULT_DISCOVER_CATEGORY})"
+            f"use --discover (defaults to {DEFAULT_DISCOVER_CATEGORY}), "
+            "or pass --instance with a discover/static universe"
         )
         sys.exit(1)
+
+    _session_tickers = list(tickers)
 
     model_probs = _parse_model_probs(
         ",".join(args.model_prob) if args.model_prob else os.getenv("KALSHI_MODEL_PROB")
@@ -2045,6 +2102,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
     fill_reconcile_task = None
     monitor_task = None
     session_exit_task = None
+    universe_task = None
 
     auth_ok, auth_msg = await verify_portfolio_credentials(
         credentials, rate_limiter, shared_session
@@ -2125,7 +2183,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
     )
     if monitor_interval > 0:
         _session_monitor = SessionMonitor(
-            tickers=tickers,
+            tickers=_session_tickers,
             strategy=_strategy,
             ingestor=_ingestor,
             execution=_execution,
@@ -2143,12 +2201,52 @@ async def main(args: argparse.Namespace | None = None) -> None:
     if args.exit_on_settle or args.exit_when_flat:
         session_exit_task = asyncio.create_task(
             _session_exit_loop(
-                tickers,
+                _session_tickers,
                 exit_on_settle=bool(args.exit_on_settle),
                 exit_when_flat=bool(args.exit_when_flat),
                 interval_seconds=config.PORTFOLIO_RISK_SYNC_SECONDS,
             ),
             name="session_exit",
+        )
+
+    if (
+        instance is not None
+        and instance.universe.refresh_seconds
+        and instance.universe.refresh_seconds > 0
+        and instance.universe.mode in ("discover", "hybrid")
+    ):
+        from orchestration.instance_adapter import criteria_from_instance
+        from orchestration.universe_manager import UniverseManager
+
+        criteria = criteria_from_instance(instance)
+
+        async def _discover_fn(crit):
+            return await discover_with_details(credentials, rate_limiter, crit)
+
+        async def _register_fn(new_tickers: list[str]) -> None:
+            await _register_markets_for_tickers(
+                new_tickers, credentials, rate_limiter
+            )
+
+        def _on_watchlist_changed(new_list: list[str]) -> None:
+            _session_tickers[:] = list(new_list)
+
+        _universe_manager = UniverseManager(
+            instance=instance,
+            criteria=criteria,
+            strategy=_strategy,
+            ingestor=_ingestor,
+            watching=list(_session_tickers),
+            discover_fn=_discover_fn,
+            register_fn=_register_fn,
+            blotter=_blotter,
+            execution=_execution,
+            session_monitor=_session_monitor,
+            on_watchlist_changed=_on_watchlist_changed,
+        )
+        universe_task = asyncio.create_task(
+            _universe_manager.run_loop(_shutdown_event),
+            name="universe_refresh",
         )
 
     startup_kw: dict = dict(
@@ -2170,6 +2268,10 @@ async def main(args: argparse.Namespace | None = None) -> None:
         live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
         live_max_minutes_to_close=_live_rules.max_minutes_to_close if _live_rules else None,
     )
+    if _instance_id:
+        startup_kw["instance_id"] = _instance_id
+        if instance is not None:
+            startup_kw["universe_refresh_seconds"] = instance.universe.refresh_seconds
     if args.strategy == "green_up":
         from strategy.green_up_strategy import GreenUpStrategy
 
@@ -2214,6 +2316,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             open_blotter_trade_ids=[p["trade_id"] for p in open_blotter],
             open_exchange_orders=list(_execution.open_orders.keys()),
             active_alerts=_alert_manager.active_alert_summary(),
+            instance_id=_instance_id,
         )
 
         # Stop ingestor first (no new ticks)
@@ -2245,6 +2348,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             book_fallback_task,
             fill_reconcile_task,
             session_exit_task,
+            universe_task,
         ):
             if task:
                 task.cancel()
@@ -2254,6 +2358,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             book_fallback_task,
             fill_reconcile_task,
             session_exit_task,
+            universe_task,
         ):
             if task:
                 try:

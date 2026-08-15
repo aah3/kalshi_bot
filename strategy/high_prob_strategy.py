@@ -232,6 +232,19 @@ class HighProbStrategy(BaseStrategy):
         if ticker not in self._positions:
             self._positions[ticker] = HighProbPosition(ticker=ticker)
 
+    def remove_watch_ticker(self, ticker: str) -> bool:
+        """Drop a flat watch entry (SCANNING / CLOSED only)."""
+        pos = self._positions.get(ticker)
+        if pos is not None and pos.state not in (
+            PositionState.SCANNING,
+            PositionState.CLOSED,
+        ):
+            return False
+        self._watch_tickers.discard(ticker)
+        if ticker in self._positions:
+            del self._positions[ticker]
+        return True
+
     def get_position(self, ticker: str) -> HighProbPosition | None:
         return self._positions.get(ticker)
 

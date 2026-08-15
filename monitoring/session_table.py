@@ -425,6 +425,10 @@ class SessionMonitor:
         self._running = False
         self._market_client = None
 
+    def set_tickers(self, tickers: list[str]) -> None:
+        """Update the monitored ticker list (universe refresh)."""
+        self._tickers = list(tickers)
+
     async def run(self) -> None:
         self._running = True
         logger.info(

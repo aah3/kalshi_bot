@@ -83,6 +83,17 @@ python -m pytest tests/ -v
 
 This is the main workflow: pick a **strategy**, optionally **discover** tickers in a Kalshi category, then run `main.py` with a live WebSocket feed and terminal monitor. The same `--strategy` flag drives both the trading engine and (by default) the discovery preset.
 
+### Continuous instance (all-day sleeve)
+
+For mid-session rediscovery without restarting, load a **StrategyInstance** YAML:
+
+```bash
+python main.py --instance config/instances/gu_sports_underdog.demo.yaml --discover-only
+python main.py --instance config/instances/gu_sports_underdog.demo.yaml
+```
+
+Details: [docs/STRATEGY_INSTANCE.md](docs/STRATEGY_INSTANCE.md).
+
 ### End-to-end workflow
 
 ```mermaid

@@ -76,9 +76,27 @@ Before any production run, every strategy must pass:
 
 **Code is ahead of certification.** Platform plumbing, strategy hardening, and the new `mean_reversion` strategy are implemented and unit-tested. The blocker to production is **signed live demo sessions**, not missing features.
 
+### Changelog — StrategyInstance Phase 1 (2026-07-27)
+
+Continuous single-strategy workers via declarative config (see [STRATEGY_INSTANCE.md](STRATEGY_INSTANCE.md)):
+
+| Change | Detail |
+|--------|--------|
+| `orchestration/` package | Schema/loader, instance→CLI adapter, `UniverseManager` rediscovery loop |
+| `main.py --instance PATH` | Load YAML/JSON; optional `--instance-id` for portfolio files |
+| Mid-session universe refresh | When `universe.refresh_seconds` set; add/drop watch + WS subscribe; never drop protected tickers |
+| Dynamic `MarketIngestor.add_tickers` / `remove_tickers` | Incremental subscribe for adds |
+| `remove_watch_ticker` on GU/HP/MR | Flat states only |
+| `ticker_is_protected` | Strategy state + resting orders + blotter open/hedged |
+| Examples | `config/instances/gu_sports_underdog.demo.yaml`, `hp_sports_favorites.demo.yaml` |
+| Tests | `tests/test_strategy_instance.py` |
+| Dependency | `PyYAML` in `requirements.txt` |
+
+**Not in this change:** multi-process portfolio launcher, shared portfolio risk gate, schedule windows, auto-flatten on shutdown.
+
 | Area | Status | Next action |
 |------|--------|-------------|
-| Automated tests | **248/248 green** | Keep green before each live run |
+| Automated tests | **289/289 green** | Keep green before each live run |
 | Platform (Week 1) | Code done; **not signed** | Complete steps 1.4–1.6 below |
 | `high_prob` + `green_up` (Week 2) | Hardened; **partial live** | 3 demo sessions each with session template |
 | `mean_reversion` (Week 2) | **Shipped + unit-tested**; **zero live sessions** | Discovery → demo round-trip (steps 2.8–2.10) |
@@ -295,6 +313,8 @@ Select-String -Path kalshi_bot_demo.jsonl -Pattern "shutdown|kill switch|traceba
 | 4 | On next sync: `session loss limit exceeded` + kill switch |
 
 Run Test A and Test B in **separate** sessions; restore normal limits between them. Per-contract fees flow into P&L via `FEE_PER_CONTRACT_CENTS`, not a separate breaker.
+
+**Pass record (2026-06-18, production — Test B path):** Unplanned but clean. Command: `green_up` on `KXWCGAME-26JUN17GHAPAN-TIE`, prod profile (`KALSHI_PROD_DAILY_LOSS_LIMIT_CENTS=500`, `$1` max position). Bot ran ~35 min; ticker stayed `scanning` (YES ask 45–46¢ > `--entry-max 38`). No bot `ORDER_SENT` / no new blotter parent — manual Ghana–Panama WC legs (`KXWCGAME-26JUN17GHAPAN-GHA`, totals) marked down during the match. Monitor **Session −$4.86** matched breaker metric; portfolio sync tripped `session loss limit exceeded` (`session_pnl=-521`, `limit=-500`) → `kill switch activated — cancelling all orders and halting` → `graceful shutdown` (`open_blotter_trade_ids: []`, `open_exchange_orders: []`); process exit 0. **Note:** `RISK_BREACH` lines appeared on console (`--quiet`) but were not flushed to `kalshi_bot_prod.jsonl` before exit — grep console or fix log flush on kill-switch path for post-mortems.
 
 #### Step 1.6 — Manual sell / flatten test
 
@@ -773,7 +793,7 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | 2 | Exchange matches bot | **Improved** | Blotter + `trade.py portfolio`; `scripts/cleanup_stale_trades.py` for legacy rows; manual `trade.py` orders still excluded (known gap) |
 | 3 | Live gates | Implemented | Default on; `--no-live-only` used in many `testing.md` runs |
 | 4 | SIGINT shutdown | Implemented | `main.py` cancel-all + settlement check; needs signed live run |
-| 5 | Circuit breaker | Implemented | Unit tests + portfolio sync; live Tests A/B not recorded in checklist |
+| 5 | Circuit breaker | **Improved** | Unit tests + portfolio sync; **Test B (session loss) live-verified prod 2026-06-18** — see [Test B pass record](#test-b--session-loss-limit-daily_loss_limit_cents); formal demo Tests A + B still unsigned |
 | 6 | Automated tests | **Done** | `248/248` green in full suite |
 
 ### Week-by-week certification progress
@@ -784,7 +804,7 @@ Snapshot of **code shipped** vs **live certification** vs **production ops**. Co
 | 1 | 1.2 `pytest tests/` | **Yes** | 248/248 green |
 | 1 | 1.3 Config profile print | Yes | — |
 | 1 | 1.4 ~30 min soak + Ctrl+C | Yes | Not signed in README checklist |
-| 1 | 1.5 Circuit breaker live (A + B) | Yes | Not signed |
+| 1 | 1.5 Circuit breaker live (A + B) | Yes | **Partial** — Test B (session loss → kill switch) **signed prod 2026-06-18**; Test A (drawdown) + formal demo protocol still pending |
 | 1 | 1.6 Manual sell / flatten | Yes (`tools/trade.py`) | **Signed 2026-06-10** — sell + close flatten; fractional `count_fp` |
 | 2 | `high_prob` 3 sessions | Yes | Commands in `testing.md`; no session template sign-off |
 | 2 | `green_up` 3 sessions | Yes | Same |
@@ -927,7 +947,7 @@ New **`mean_reversion`** strategy for round-trip volatility capture in oscillati
 1. Complete Week 1–4 demo certification (README checklist all checked) — *still the primary blocker*
 2. ~~Fix full `pytest` suite~~ — **DONE** (248/248 green)
 3. ~~Trade lifecycle / blotter exit P&L~~ — **DONE** (2026-05-30/31; re-run prod micro-pilot to sign off)
-4. Live circuit breaker Tests A + B on demo with session notes
+4. ~~Live circuit breaker Test B~~ — **prod signed 2026-06-18**; still need **demo** Test B + **Test A** (drawdown) with session notes
 5. Blotter ↔ exchange reconciliation on bot-driven orders for **each strategy you will run in prod** (`high_prob`, `green_up`, `mean_reversion` minimum)
 6. **`mean_reversion` demo certification** — 3 signed sessions per [MR-A runbook](#mean-reversion--demo-certification-runbook-phase-a) before prod micro-pilot
 7. Confirm `KALSHI_FEE_PER_CONTRACT_CENTS` matches your Kalshi fee tier (feeds high-prob ROI gate)
@@ -935,9 +955,11 @@ New **`mean_reversion`** strategy for round-trip volatility capture in oscillati
 **P1 — before unattended / 24×7 prod**
 
 8. Two-week demo soak without ERROR spam in `kalshi_bot_demo.jsonl`
+8b. **StrategyInstance demo soak** — run `gu_sports_underdog.demo.yaml` ≥1–2h; confirm rediscovery adds/drops in log (`Universe: added/dropped tickers`) — see [STRATEGY_INSTANCE.md](STRATEGY_INSTANCE.md)
 9. ~~Fix `PortfolioMonitor` session-realised-P&L placeholder~~ — **DONE**
 10. Kelly calibration ratio 0.85–1.10 (30+ settled trades) if running `kelly`
 11. Process supervisor (systemd, Windows Service, or PM2) with auto-restart
+11b. Phase 2: portfolio launcher for N StrategyInstance workers (not built yet)
 12. **External** alerting sink for `risk_breach` / `kill switch` / WS disconnect / `AlertManager` CRITICAL
 13. Prod dry-run logged: `KALSHI_ENV=production`, immediate Ctrl+C, verify prod DB/log paths
 14. Tune resilience knobs and document values: `KALSHI_WS_MAX_SILENCE_SECONDS`, `KALSHI_WS_STALE_ESCALATE_POLLS`, `KALSHI_WS_BOOK_REST_FALLBACK_SECONDS`, `KALSHI_FILL_RECONCILE_SECONDS`
@@ -973,7 +995,7 @@ Work top-to-bottom. Do not start Week 5 prod until every **Success criteria** ro
 | 2 | Config profile | `python -c "import config; print(config.ENV, config.MAX_POSITION_CENTS, config.DB_PATH)"` | `demo`, `10000`, `kalshi_bot_demo.db` (or your demo overrides) |
 | 3 | 30 min soak | [Step 1.4](#step-14--run-bot-30-minutes-graceful-shutdown) with explicit tickers + `--strategy high_prob` | Process runs 30 min; Ctrl+C → exit 0; log has `shutdown`; `python tools/trade.py orders` empty |
 | 4 | Circuit breaker A | [Test A](#test-a--percent-drawdown-max_drawdown_pct) — `KALSHI_DEMO_MAX_DRAWDOWN_PCT=0.01` | Log: `max drawdown exceeded`, `kill switch`; orders cancelled; restore `0.10` after |
-| 5 | Circuit breaker B | [Test B](#test-b--session-loss-limit-daily_loss_limit_cents) — `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS=500` | Log: `session loss limit exceeded`, `kill switch`; restore normal limit after |
+| 5 | Circuit breaker B | [Test B](#test-b--session-loss-limit-daily_loss_limit_cents) — `KALSHI_DEMO_DAILY_LOSS_LIMIT_CENTS=500` | Log: `session loss limit exceeded`, `kill switch`; restore normal limit after. **Prod path signed 2026-06-18** (see Test B pass record); repeat in **demo** for checklist |
 | 6 | Manual sell | [Step 1.6](#step-16--manual-sell--flatten-test) | **Done 2026-06-10** — `sell`/`close` flatten; portfolio 0 positions |
 
 **Block 1 done when:** README [Production checklist](../README.md#production-checklist) items for pytest, SIGINT shutdown, and circuit breaker are checked.

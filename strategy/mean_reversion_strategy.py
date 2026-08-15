@@ -239,6 +239,20 @@ class MeanReversionStrategy(BaseStrategy):
         if ticker not in self._price_history:
             self._price_history[ticker] = deque(maxlen=self._lookback)
 
+    def remove_watch_ticker(self, ticker: str) -> bool:
+        """Drop a flat watch entry (SCANNING / CLOSED only)."""
+        pos = self._positions.get(ticker)
+        if pos is not None and pos.state not in (
+            PositionState.SCANNING,
+            PositionState.CLOSED,
+        ):
+            return False
+        self._watch_tickers.discard(ticker)
+        if ticker in self._positions:
+            del self._positions[ticker]
+        self._price_history.pop(ticker, None)
+        return True
+
     def get_position(self, ticker: str) -> MeanReversionPosition | None:
         return self._positions.get(ticker)
 

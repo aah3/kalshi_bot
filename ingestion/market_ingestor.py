@@ -295,6 +295,50 @@ class MarketIngestor:
     def get_all_snapshots(self) -> list[dict[str, Any]]:
         return [b.snapshot() for b in self._books.values()]
 
+    def add_tickers(self, tickers: list[str]) -> list[str]:
+        """
+        Add markets to the local book map and live subscription.
+
+        Returns the tickers that were newly added. If a WebSocket is connected,
+        sends an incremental subscribe; otherwise they are included on next connect.
+        """
+        added: list[str] = []
+        for ticker in tickers:
+            t = (ticker or "").strip()
+            if not t or t in self._books:
+                continue
+            self._books[t] = OrderBook(ticker=t)
+            self._tickers.append(t)
+            added.append(t)
+        if added and self._ws is not None:
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._subscribe_tickers(self._ws, added),
+                    name="ws_subscribe_add",
+                )
+            except RuntimeError:
+                pass
+        return added
+
+    def remove_tickers(self, tickers: list[str]) -> list[str]:
+        """
+        Remove flat markets from the local book map.
+
+        Does not send an unsubscribe command (Kalshi WS may not support it
+        reliably); books simply stop being updated after removal. A forced
+        reconnect will resubscribe only to the remaining ticker set.
+        """
+        removed: list[str] = []
+        for ticker in tickers:
+            t = (ticker or "").strip()
+            if not t or t not in self._books:
+                continue
+            del self._books[t]
+            if t in self._tickers:
+                self._tickers.remove(t)
+            removed.append(t)
+        return removed
+
     async def run(self) -> None:
         """Connect to the WebSocket and process messages until cancelled."""
         self._running = True
@@ -422,6 +466,11 @@ class MarketIngestor:
 
     async def _subscribe(self, ws) -> None:
         """Send subscription commands for all tickers."""
+        await self._subscribe_tickers(ws, self._tickers)
+
+    async def _subscribe_tickers(self, ws, tickers: list[str]) -> None:
+        if not tickers:
+            return
         channels = ["orderbook_delta", "trade"]
         if self._on_fill:
             if self._credentials:
@@ -436,10 +485,11 @@ class MarketIngestor:
             "cmd":    "subscribe",
             "params": {
                 "channels":       channels,
-                "market_tickers": self._tickers,
+                "market_tickers": list(tickers),
             },
         }
         await ws.send(json.dumps(sub_msg))
+        logger.info("WebSocket subscribe", tickers=list(tickers), channels=channels)
 
     async def _handle_message(self, raw: str) -> None:
         try:

@@ -4,8 +4,7 @@
 
 # ── Core runtime ──────────────────────────────────────────────────────────────
 
-# Load `.env` into os.environ (used at startup from config.py)
-python-dotenv>=1.0.0,<2.0.0
+PyYAML>=6.0.1,<7.0.0
 
 # Async HTTP client — order placement, token refresh, REST discovery
 aiohttp>=3.9.0,<4.0.0

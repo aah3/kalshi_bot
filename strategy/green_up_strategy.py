@@ -692,6 +692,31 @@ class GreenUpStrategy(BaseStrategy):
             self._positions[ticker] = GreenUpPosition(ticker=ticker)
             logger.info("GreenUp: watching ticker", ticker=ticker, strategy=self.name)
 
+    def remove_watch_ticker(self, ticker: str) -> bool:
+        """
+        Drop a flat watch entry (SCANNING / STOPPED / CLOSED only).
+
+        Returns True if removed. Refuses to drop in-flight or hedged states.
+        """
+        pos = self._positions.get(ticker)
+        if pos is None:
+            return False
+        if pos.state not in (
+            PositionState.SCANNING,
+            PositionState.STOPPED,
+            PositionState.CLOSED,
+        ):
+            logger.warning(
+                "GreenUp: refuse remove_watch_ticker — not flat",
+                ticker=ticker,
+                state=pos.state.value,
+                strategy=self.name,
+            )
+            return False
+        del self._positions[ticker]
+        logger.info("GreenUp: stopped watching ticker", ticker=ticker, strategy=self.name)
+        return True
+
     def get_position(self, ticker: str) -> GreenUpPosition | None:
         return self._positions.get(ticker)
 

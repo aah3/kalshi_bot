@@ -20,6 +20,13 @@ from credentials.credential_manager import CredentialManager
 from execution.rate_limiter import BucketType, RateLimiter
 from logging_.structured_logger import logger
 from strategy.base_strategy import Signal
+from trading.kalshi_order_v2 import (
+    CREATE_ORDER_V2_PATH,
+    build_create_order_v2_body,
+    normalize_time_in_force,
+    parse_create_order_v2_response,
+)
+from trading.kalshi_order_v2 import kalshi_order_count_fields
 
 
 class ExecutionError(Exception):
@@ -87,33 +94,29 @@ class ExecutionManager:
 
         Returns the exchange order dict on success, or None on failure.
         """
+        if self._session is None or self._session.closed:
+            logger.warning(
+                "Skipping order submit — HTTP session closed",
+                ticker=signal.ticker,
+            )
+            return None
+
         meta          = signal.meta or {}
         order_type    = meta.get("order_type", "limit")
         action        = meta.get("action", "buy")
-        time_in_force = meta.get("time_in_force", "good_till_canceled")
+        time_in_force = normalize_time_in_force(
+            meta.get("time_in_force", "good_till_canceled")
+        )
         if order_type == "market" and time_in_force == "good_till_canceled":
             time_in_force = "immediate_or_cancel"
-        # Legacy short aliases from older strategy meta
-        _tif_aliases = {
-            "gtc": "good_till_canceled",
-            "ioc": "immediate_or_cancel",
-            "fok": "fill_or_kill",
-        }
-        time_in_force = _tif_aliases.get(time_in_force, time_in_force)
 
         contracts = max(signal.size_cents // max(signal.limit_price or 1, 1), 1)
+        _, count_fp = kalshi_order_count_fields(float(contracts))
+        contracts = float(count_fp)
 
         client_order_id = str(uuid.uuid4())
-        body: dict[str, Any] = {
-            "ticker":           signal.ticker,
-            "client_order_id":  client_order_id,
-            "type":             order_type,
-            "action":           action,
-            "side":             signal.side.value,
-            "count":            contracts,
-            "count_fp":         f"{contracts:.2f}",
-            "time_in_force":    time_in_force,
-        }
+        yes_price: int | None = None
+        no_price: int | None = None
 
         if order_type == "limit":
             yes_price = meta.get("yes_price")
@@ -123,7 +126,6 @@ class ExecutionManager:
                     if signal.side.value == "yes"
                     else 100 - signal.limit_price
                 )
-            body["yes_price"] = yes_price
         elif order_type == "market":
             cap = meta.get("yes_price") if signal.side.value == "yes" else meta.get("no_price")
             if cap is None and signal.limit_price is not None:
@@ -135,12 +137,23 @@ class ExecutionManager:
             if cap is None:
                 cap = 99
             if signal.side.value == "yes":
-                body["yes_price"] = cap
+                yes_price = cap
             else:
-                body["no_price"] = cap
+                no_price = cap
 
+        body = build_create_order_v2_body(
+            ticker=signal.ticker,
+            client_order_id=client_order_id,
+            action=action,
+            side=signal.side.value,
+            contracts=contracts,
+            time_in_force=time_in_force,
+            yes_price=yes_price,
+            no_price=no_price,
+            post_only=order_type == "limit" and time_in_force == "good_till_canceled",
+        )
         body_str  = json.dumps(body, separators=(",", ":"))
-        path      = "/portfolio/orders"
+        path      = CREATE_ORDER_V2_PATH
         sign_path = f"/trade-api/v2{path}"
         headers   = self._creds.sign_request("POST", sign_path, body=body_str)
 
@@ -190,11 +203,12 @@ class ExecutionManager:
                         return None
 
                     self._limiter.reset_backoff(BucketType.WRITE)
-                    order = (await resp.json()).get("order", {})
+                    raw = await resp.json()
+                    order = parse_create_order_v2_response(raw)
                     self._open_orders[order.get("order_id", client_order_id)] = order
                     return order
 
-                except aiohttp.ClientError as exc:
+                except (aiohttp.ClientError, RuntimeError) as exc:
                     logger.error(
                         f"HTTP error placing order: {exc}",
                         ticker=signal.ticker,
@@ -207,8 +221,12 @@ class ExecutionManager:
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a single resting order by ID. Returns True on success."""
-        path    = f"/trade-api/v2/portfolio/orders/{order_id}"
-        headers = self._creds.sign_request("DELETE", path)
+        if self._session is None or self._session.closed:
+            return False
+
+        path      = f"/portfolio/orders/{order_id}"
+        sign_path = f"/trade-api/v2{path}"
+        headers   = self._creds.sign_request("DELETE", sign_path)
 
         async with self._limiter.throttle(BucketType.WRITE):
             try:
