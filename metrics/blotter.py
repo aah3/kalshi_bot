@@ -341,7 +341,9 @@ class Blotter:
         blotter.close_trade(trade_id)
     """
 
-    def __init__(self, db_path: str = config.DB_PATH) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
+        if db_path is None:
+            db_path = config.DB_PATH
         self._db_path   = db_path
         self._postgres  = config.USE_POSTGRES
         self._pg_url    = config.POSTGRES_URL

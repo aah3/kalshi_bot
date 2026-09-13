@@ -63,7 +63,7 @@ from strategy.base_strategy import BaseStrategy
 from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_probs, build_strategy
 from monitoring.session_table import SessionMonitor
 from ingestion.rest_book_fallback import make_market_client_from_session, run_rest_book_fallback_loop
-from trading.auth_check import verify_portfolio_credentials
+from trading.auth_check import calibrate_clock_offset, verify_portfolio_credentials
 from trading.fill_reconciler import run_fill_reconciliation_loop
 from trading.portfolio_monitor import PortfolioMonitor
 
@@ -299,6 +299,14 @@ async def on_tick(tick: dict[str, Any]) -> None:
 
     meta = signal_obj.meta or {}
     phase = meta.get("phase", "entry")
+
+    if (
+        _execution
+        and getattr(_execution, "jurisdiction_blocked", False)
+        and phase in ("entry", "leg_1")
+    ):
+        _rollback_pending_entry(signal_obj.ticker)
+        return
 
     if phase in ("entry", "leg_1") and _live_rules and _live_rules.enabled:
         from discovery.live_market import is_tick_live
@@ -939,6 +947,20 @@ def _collect_strategy_states(session_tickers: list[str]) -> dict[str, str]:
     return states
 
 
+async def _runtime_limit_loop(minutes: float) -> None:
+    """Trigger the same graceful shutdown as Ctrl+C after a wall-clock limit."""
+    if minutes <= 0:
+        return
+    try:
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=float(minutes) * 60.0)
+    except asyncio.TimeoutError:
+        logger.info(
+            "Max runtime reached — graceful shutdown",
+            max_runtime_minutes=minutes,
+        )
+        _shutdown_event.set()
+
+
 async def _session_exit_loop(
     session_tickers: list[str],
     *,
@@ -1492,6 +1514,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Auto-shutdown when session tickers are flat (no orders, no in-flight "
             "entry legs or strategy states) and the market/event window is over "
             "(does not wait for official settlement)"
+        ),
+    )
+    parser.add_argument(
+        "--max-runtime-minutes",
+        type=float,
+        default=None,
+        metavar="MIN",
+        help=(
+            "Graceful shutdown after N minutes (same path as Ctrl+C: cancel "
+            "resting orders, do not flatten). 0/omit = run until signal."
         ),
     )
 
@@ -2053,8 +2085,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
     # ── Instantiate all modules ───────────────────────────────────────────────
     credentials      = CredentialManager()
     rate_limiter     = RateLimiter()
-    _store           = MetricsStore()
-    _blotter         = Blotter()
+    _store           = MetricsStore(db_path=config.DB_PATH)
+    _blotter         = Blotter(db_path=config.DB_PATH)
     calculator       = MetricsCalculator(_store)
     _circuit_breaker = CircuitBreaker(kill_switch=kill_switch)
     _execution       = ExecutionManager(credentials, rate_limiter)
@@ -2103,6 +2135,12 @@ async def main(args: argparse.Namespace | None = None) -> None:
     monitor_task = None
     session_exit_task = None
     universe_task = None
+    runtime_limit_task = None
+
+    try:
+        await calibrate_clock_offset(credentials, shared_session)
+    except Exception as exc:
+        logger.warning(f"Clock calibration skipped: {exc}")
 
     auth_ok, auth_msg = await verify_portfolio_credentials(
         credentials, rate_limiter, shared_session
@@ -2249,6 +2287,13 @@ async def main(args: argparse.Namespace | None = None) -> None:
             name="universe_refresh",
         )
 
+    max_runtime = getattr(args, "max_runtime_minutes", None)
+    if max_runtime is not None and float(max_runtime) > 0:
+        runtime_limit_task = asyncio.create_task(
+            _runtime_limit_loop(float(max_runtime)),
+            name="runtime_limit",
+        )
+
     startup_kw: dict = dict(
         env=config.ENV,
         strategy=_strategy.name,
@@ -2264,6 +2309,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
         auto_take_profit_on_alert=_auto_take_profit,
         exit_on_settle=bool(args.exit_on_settle),
         exit_when_flat=bool(args.exit_when_flat),
+        max_runtime_minutes=getattr(args, "max_runtime_minutes", None),
         live_trading_only=_live_rules.enabled if _live_rules else False,
         live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
         live_max_minutes_to_close=_live_rules.max_minutes_to_close if _live_rules else None,
@@ -2349,6 +2395,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             fill_reconcile_task,
             session_exit_task,
             universe_task,
+            runtime_limit_task,
         ):
             if task:
                 task.cancel()
@@ -2359,6 +2406,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             fill_reconcile_task,
             session_exit_task,
             universe_task,
+            runtime_limit_task,
         ):
             if task:
                 try:

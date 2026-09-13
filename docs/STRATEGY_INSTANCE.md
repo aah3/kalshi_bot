@@ -44,6 +44,7 @@ Requires `PyYAML` (`pip install -r requirements.txt`).
 - **Lifecycle** `on_flat: keep_running` (default in examples) leaves the process
   up when flat so rediscovery can find new markets.
 - **Shutdown** still cancels resting orders only (`on_shutdown: cancel_resting`).
+- **`--max-runtime-minutes N`** (CLI or `runtime.max_runtime_minutes`) triggers that same graceful path after N minutes — use this on Windows instead of killing the process.
 
 ## Field map (quick)
 

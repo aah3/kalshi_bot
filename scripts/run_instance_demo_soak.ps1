@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   Sets KALSHI_ENV=demo and runs main.py with an instance YAML.
-  Use with Task Scheduler or a manual terminal.
+  Duration uses --max-runtime-minutes so shutdown is graceful (cancel resting).
 
 .PARAMETER Instance
   Path to StrategyInstance YAML (default: gu_sports_underdog demo).
@@ -14,7 +14,7 @@
   Preview tickers and exit (no trading).
 
 .PARAMETER DurationMinutes
-  If > 0, stop the bot after N minutes via job timeout wrapper.
+  If > 0, bot shuts down gracefully after N minutes.
   0 = run until Ctrl+C / Task Scheduler stop.
 
 .EXAMPLE
@@ -34,13 +34,20 @@ Set-Location $ProjectRoot
 
 $env:KALSHI_ENV = "demo"
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUNBUFFERED = "1"
+
+$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $Python)) {
+    $Python = "python"
+}
 
 Write-Host ""
 Write-Host "=== DEMO StrategyInstance soak ===" -ForegroundColor Cyan
 Write-Host "  instance: $Instance"
 Write-Host "  env:      $env:KALSHI_ENV"
+Write-Host "  python:   $Python"
 if ($DurationMinutes -gt 0) {
-    Write-Host "  duration: ${DurationMinutes}m (auto-stop)"
+    Write-Host "  duration: ${DurationMinutes}m (graceful --max-runtime-minutes)"
 } else {
     Write-Host "  duration: until Ctrl+C / scheduler stop"
 }
@@ -50,20 +57,9 @@ $pyArgs = @("main.py", "--instance", $Instance)
 if ($DiscoverOnly) {
     $pyArgs += "--discover-only"
 }
-
 if ($DurationMinutes -gt 0 -and -not $DiscoverOnly) {
-    $timeoutSec = $DurationMinutes * 60
-    $proc = Start-Process -FilePath "python" -ArgumentList $pyArgs `
-        -WorkingDirectory $ProjectRoot -PassThru -NoNewWindow
-    Write-Host "Started PID $($proc.Id); will stop after ${DurationMinutes}m"
-    if (-not $proc.WaitForExit($timeoutSec * 1000)) {
-        Write-Host "Duration reached — sending Ctrl+C-equivalent stop..." -ForegroundColor Yellow
-        Stop-Process -Id $proc.Id -Force
-        Write-Host "Process stopped."
-        exit 0
-    }
-    exit $proc.ExitCode
+    $pyArgs += @("--max-runtime-minutes", "$DurationMinutes")
 }
 
-& python @pyArgs
+& $Python @pyArgs
 exit $LASTEXITCODE

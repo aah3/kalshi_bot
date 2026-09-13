@@ -31,15 +31,22 @@ async def verify_portfolio_credentials(
     """
     path      = "/portfolio/balance"
     sign_path = f"/trade-api/v2{path}"
-    headers   = credentials.sign_request("GET", sign_path)
 
     async with rate_limiter.throttle(BucketType.READ):
+        headers = credentials.sign_request("GET", sign_path)
         resp = await session.get(f"{config.BASE_URL}{path}", headers=headers)
 
     if resp.status == 200:
         return True, "Portfolio credentials verified"
 
     text = await resp.text()
+    if resp.status == 401 and "header_timestamp_expired" in text:
+        async with rate_limiter.throttle(BucketType.READ):
+            headers = credentials.sign_request("GET", sign_path)
+            resp = await session.get(f"{config.BASE_URL}{path}", headers=headers)
+        if resp.status == 200:
+            return True, "Portfolio credentials verified (timestamp retry)"
+        text = await resp.text()
     if resp.status == 401:
         if "NOT_FOUND" in text:
             keys_url = DEMO_KEYS_URL if config.ENV != "production" else PROD_KEYS_URL
@@ -57,3 +64,31 @@ async def verify_portfolio_credentials(
     return False, (
         f"Portfolio auth failed: HTTP {resp.status} — {text[:300]}"
     )
+
+
+async def calibrate_clock_offset(
+    credentials: CredentialManager,
+    session: aiohttp.ClientSession,
+) -> int:
+    """
+    Align signed timestamps to Kalshi's Date header.
+
+    Windows clocks often sit 30s+ ahead of Kalshi, which yields
+    ``header_timestamp_expired`` on portfolio endpoints.
+    """
+    from credentials.clock_skew import offset_ms_from_http_date
+    from logging_.structured_logger import logger
+
+    resp = await session.get(f"{config.BASE_URL}/exchange/status")
+    date_hdr = resp.headers.get("Date")
+    if not date_hdr:
+        return 0
+    offset = offset_ms_from_http_date(date_hdr)
+    credentials.set_clock_offset_ms(offset)
+    if abs(offset) >= 2_000:
+        logger.warning(
+            "Applied Kalshi clock offset to request signatures",
+            offset_ms=offset,
+            http_date=date_hdr,
+        )
+    return offset

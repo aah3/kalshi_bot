@@ -201,6 +201,8 @@ def _merge_args_from_instance(
         args.quiet = True
     if not args.auto_take_profit and rt.auto_take_profit:
         args.auto_take_profit = True
+    if getattr(args, "max_runtime_minutes", None) in (None, 0) and rt.max_runtime_minutes:
+        args.max_runtime_minutes = rt.max_runtime_minutes
 
     life = instance.lifecycle
     if life.on_flat == "exit" and not args.exit_when_flat:
@@ -240,6 +242,18 @@ def _merge_args_from_instance(
             args.discover_no_tradeable_filter = True
         if not d.live_only:
             args.no_live_only = True
+        else:
+            # Keep runtime entry gates aligned with instance discovery windows.
+            # Kalshi Sports close_time is often settlement (days), not the event.
+            if d.max_minutes_to_close is not None:
+                config.LIVE_MAX_MINUTES_TO_CLOSE = float(d.max_minutes_to_close)
+                os.environ["KALSHI_LIVE_MAX_MINUTES_TO_CLOSE"] = str(
+                    d.max_minutes_to_close
+                )
+            if d.activity_hours is not None:
+                mins = float(d.activity_hours) * 60.0
+                config.LIVE_MAX_MINUTES_SINCE_UPDATE = mins
+                os.environ["KALSHI_LIVE_MAX_MINUTES_SINCE_UPDATE"] = str(mins)
 
     if uni.mode in ("static", "hybrid") and uni.static_tickers and not args.tickers:
         args.tickers = ",".join(uni.static_tickers)

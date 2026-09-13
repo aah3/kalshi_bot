@@ -83,3 +83,19 @@ def test_mark_signal_filled_uses_supported_sql(store):
         store.mark_signal_filled(ticker="T-C", order_id="oid-c")
     except sqlite3.OperationalError as exc:  # pragma: no cover - regression guard
         pytest.fail(f"mark_signal_filled raised on stock SQLite: {exc}")
+
+
+def test_default_db_path_resolved_at_init(tmp_path, monkeypatch):
+    """Instance adapter patches config.DB_PATH after import; defaults must not freeze it."""
+    import config
+    from metrics import blotter as blotter_mod
+    from metrics import metrics_store as store_mod
+    from metrics.blotter import Blotter
+    from metrics.metrics_store import MetricsStore
+
+    path = str(tmp_path / "instance.db")
+    for cfg in (config, store_mod.config, blotter_mod.config):
+        monkeypatch.setattr(cfg, "DB_PATH", path)
+        monkeypatch.setattr(cfg, "USE_POSTGRES", False)
+    assert MetricsStore()._db_path == path
+    assert Blotter()._db_path == path

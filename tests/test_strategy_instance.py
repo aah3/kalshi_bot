@@ -158,6 +158,32 @@ def test_example_demo_yaml_loads():
     assert inst.id == "gu_sports_underdog"
     assert inst.universe.refresh_seconds == 900
     assert inst.strategy_params["hedge_mode"] == "stake_back"
+    assert inst.strategy_params["gu_entry_mode"] == "cross_spread"
+    assert inst.universe.discover.live_only is False
+
+
+def test_example_prod_yaml_loads():
+    root = Path(__file__).resolve().parents[1]
+    path = root / "config" / "instances" / "gu_sports_underdog.prod.yaml"
+    if not path.exists():
+        return
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        return
+    inst = load_strategy_instance(path)
+    assert inst.id == "gu_sports_underdog_prod"
+    assert inst.risk.max_position_cents == 100
+    assert inst.risk.max_concurrent_positions == 1
+    assert inst.universe.discover.live_only is True
+    assert inst.strategy_params["gu_entry_mode"] == "cross_spread"
+
+
+def test_runtime_max_minutes_from_yaml():
+    data = _minimal_gu()
+    data["runtime"] = {"quiet": True, "max_runtime_minutes": 90}
+    inst = parse_strategy_instance(data)
+    assert inst.runtime.max_runtime_minutes == 90
 
 
 def test_ticker_is_protected_green_up():
@@ -224,6 +250,7 @@ def test_merge_args_sets_discover_flags():
         auto_take_profit=False,
         exit_when_flat=False,
         exit_on_settle=False,
+        max_runtime_minutes=None,
         max_concurrent_positions=None,
         discover=False,
         discover_category=None,
@@ -302,6 +329,68 @@ def test_merge_args_sets_discover_flags():
     assert args.quiet is True
 
 
+def test_instance_live_windows_rebind_entry_gates(monkeypatch):
+    import config
+    from orchestration.instance_adapter import _merge_args_from_instance
+
+    monkeypatch.setattr(config, "LIVE_MAX_MINUTES_TO_CLOSE", 180.0)
+    monkeypatch.setattr(config, "LIVE_MAX_MINUTES_SINCE_UPDATE", 60.0)
+    data = _minimal_gu()
+    data["universe"]["discover"]["live_only"] = True
+    data["universe"]["discover"]["max_minutes_to_close"] = 10080
+    data["universe"]["discover"]["activity_hours"] = 2
+    inst = parse_strategy_instance(data)
+    args = argparse.Namespace(
+        strategy="green_up",
+        monitor_interval=None,
+        quiet=False,
+        auto_take_profit=False,
+        exit_when_flat=False,
+        exit_on_settle=False,
+        max_runtime_minutes=None,
+        max_concurrent_positions=None,
+        discover=False,
+        discover_category=None,
+        discover_top=None,
+        discover_min_volume=None,
+        discover_min_yes_ask=None,
+        discover_max_yes_ask=None,
+        discover_max_spread=None,
+        discover_activity_hours=None,
+        discover_max_minutes_to_close=None,
+        discover_rank_by=None,
+        discover_min_fee_roi=None,
+        discover_tag=None,
+        discover_sport=None,
+        discover_competition=None,
+        discover_scope=None,
+        discover_series=None,
+        discover_preset=None,
+        discover_full_scan=False,
+        discover_no_tradeable_filter=False,
+        no_live_only=False,
+        tickers=None,
+        entry_max=None,
+        hedge_trigger=None,
+        hedge_offset=None,
+        hedge_mode=None,
+        stop_loss=None,
+        gu_no_entry_max=False,
+        gu_entry_mode=None,
+        gu_exit_mode=None,
+        gu_limit_offset=None,
+        gu_max_spread=None,
+        gu_hedge_style=None,
+        gu_max_cycles=None,
+        model_prob=None,
+        comp_pairs=None,
+    )
+    _merge_args_from_instance(inst, args)
+    assert args.no_live_only is False
+    assert config.LIVE_MAX_MINUTES_TO_CLOSE == 10080.0
+    assert config.LIVE_MAX_MINUTES_SINCE_UPDATE == 120.0
+
+
 if __name__ == "__main__":
     test_parse_green_up_instance()
     test_unknown_strategy_params_rejected()
@@ -310,6 +399,8 @@ if __name__ == "__main__":
     test_portfolio_select_by_id()
     test_build_strategy_kwargs_and_criteria()
     test_example_demo_yaml_loads()
+    test_example_prod_yaml_loads()
+    test_runtime_max_minutes_from_yaml()
     test_ticker_is_protected_green_up()
     test_remove_watch_ticker_refuses_entered()
     test_universe_diff_drop_if_flat_protects_open()

@@ -136,6 +136,7 @@ class RuntimeConfig:
     monitor_interval: float | None = None
     quiet: bool = False
     auto_take_profit: bool = False
+    max_runtime_minutes: float | None = None
 
 
 @dataclass(frozen=True)

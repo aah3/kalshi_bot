@@ -1,16 +1,17 @@
-# Demo all-day green_up sleeve (Phase 1 StrategyInstance).
+# Production $1 micro-pilot — green_up Sports sleeve (StrategyInstance).
+# Real money. Do not reuse the demo YAML against prod keys.
 # Usage:
-#   python main.py --instance config/instances/gu_sports_underdog.demo.yaml
-#   python main.py --instance config/instances/gu_sports_underdog.demo.yaml --discover-only
+#   .\scripts\run_instance_prod.ps1 -DiscoverOnly
+#   .\scripts\run_instance_prod.ps1 -DurationMinutes 90
 
-id: gu_sports_underdog
+id: gu_sports_underdog_prod
 enabled: true
 strategy: green_up
 
 universe:
   mode: discover
   refresh_seconds: 900
-  max_watchlist: 5
+  max_watchlist: 3
   static_tickers: []
   drop_policy:
     closed: drop
@@ -19,15 +20,15 @@ universe:
   discover:
     category: Sports
     preset: green_up
-    top_n: 5
+    top_n: 3
     max_yes_ask: 30
     min_volume_24h: 500
-    # Demo Sports tape is stale (updated_time often ~7d). Production-tight
-    # 2h / 360m live window yields api_pool=0 even though ~46k markets exist.
     full_scan: true
-    activity_hours: 336
+    activity_hours: 2
+    # Kalshi Sports close_time is settlement (often days out), not the live
+    # event. activity_hours + runtime live gates keep tape fresh.
     max_minutes_to_close: 10080
-    live_only: false
+    live_only: true
     rank_by: screener
 
 strategy_params:
@@ -35,22 +36,22 @@ strategy_params:
   hedge_trigger: 44
   hedge_mode: stake_back
   stop_loss: 10
-  # IOC so unfilled entries do not occupy concurrent slots (bid-2 GTC stalled soaks)
+  # Cross-spread IOC for first live fills; switch to limit_offset after a signed cycle
   gu_entry_mode: cross_spread
   gu_exit_mode: cross_spread
   gu_hedge_style: trigger
   gu_max_cycles: 0
 
 risk:
-  max_position_cents: 10000
-  max_concurrent_positions: 2
-  daily_loss_limit_cents: 20000
-  max_drawdown_pct: 0.10
+  max_position_cents: 100
+  max_concurrent_positions: 1
+  daily_loss_limit_cents: 500
+  max_drawdown_pct: 0.05
   max_sector_concentration: 1.0
 
 persistence:
-  db_path: kalshi_bot_demo_gu_sports.db
-  log_file: kalshi_bot_demo_gu_sports.jsonl
+  db_path: kalshi_bot_prod_gu_sports.db
+  log_file: kalshi_bot_prod_gu_sports.jsonl
 
 lifecycle:
   on_flat: keep_running

@@ -53,6 +53,7 @@ class ExecutionManager:
         self._session: aiohttp.ClientSession | None = None
         self._open_orders: dict[str, dict] = {}   # order_id -> order metadata
         self._token_task: asyncio.Task | None = None
+        self.jurisdiction_blocked = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -200,6 +201,12 @@ class ExecutionManager:
                             ticker=signal.ticker,
                             response=text[:300],
                         )
+                        if resp.status == 403 and "residents_are_not_currently_allowed" in text:
+                            self.jurisdiction_blocked = True
+                            logger.error(
+                                "Jurisdiction block — pausing new orders for this process",
+                                ticker=signal.ticker,
+                            )
                         return None
 
                     self._limiter.reset_backoff(BucketType.WRITE)
