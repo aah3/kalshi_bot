@@ -61,7 +61,8 @@ def cmd_performance(args, blotter: Blotter, perf: PerformanceAnalytics) -> None:
         # Export underlying trade data to CSV
         closed  = blotter.query_trades(status="closed",  days=args.days)
         settled = blotter.query_trades(status="settled", days=args.days)
-        blotter.export_csv(closed + settled, filepath=args.csv)
+        stopped = blotter.query_trades(status="stopped", days=args.days)
+        blotter.export_csv(closed + settled + stopped, filepath=args.csv)
         print(f"  Trade data exported → {args.csv}\n")
 
 
@@ -70,8 +71,9 @@ def cmd_session(args, blotter: Blotter, perf: PerformanceAnalytics) -> None:
     days = args.days or 1
     closed  = blotter.query_trades(status="closed",  days=days)
     settled = blotter.query_trades(status="settled", days=days)
+    stopped = blotter.query_trades(status="stopped", days=days)
     open_t  = blotter.query_trades(status="open")
-    all_closed = closed + settled
+    all_closed = closed + settled + stopped
 
     total_pnl     = sum(t.net_pnl_cents or 0 for t in all_closed)
     total_cost    = sum(t.total_cost_cents for t in all_closed)

@@ -1039,6 +1039,19 @@ async def kill_switch() -> None:
     Cancels all open orders then sets the shutdown event.
     """
     logger.risk_breach("kill switch activated — cancelling all orders and halting")
+
+    # Write an out-of-band sentinel file *before* anything else. The
+    # risk_breach line above goes through the buffered JSONL file handler
+    # and can be lost if the process exits before that handler flushes
+    # (see docs/ROADMAP.md); this alert is fsync'd immediately so an
+    # external watcher (scripts/watch_kill_switch.ps1) sees the trip even
+    # then. It only records — it never cancels orders or flattens.
+    try:
+        from risk.kill_switch_alert import alert_kill_switch
+        alert_kill_switch("kill switch activated — cancelling all orders and halting")
+    except Exception as exc:  # pragma: no cover - alerting must never block the trip
+        logger.error(f"kill_switch_alert failed: {exc}")
+
     if _execution:
         await _execution.cancel_all_orders()
     _shutdown_event.set()
@@ -2091,6 +2104,14 @@ async def main(args: argparse.Namespace | None = None) -> None:
     _circuit_breaker = CircuitBreaker(kill_switch=kill_switch)
     _execution       = ExecutionManager(credentials, rate_limiter)
 
+    # Clear any kill-switch alert left over from a previous session so a
+    # fresh start never looks like it's already tripped.
+    try:
+        from risk.kill_switch_alert import clear_kill_switch_alert
+        clear_kill_switch_alert()
+    except Exception as exc:
+        logger.error(f"kill_switch_alert cleanup failed: {exc}")
+
     _settlement_watcher = SettlementWatcher(
         blotter=_blotter,
         credentials=credentials,
@@ -2437,7 +2458,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
         # Session summary from blotter
         closed  = _blotter.query_trades(status="closed",  days=1)
         settled = _blotter.query_trades(status="settled", days=1)
-        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled)
+        stopped = _blotter.query_trades(status="stopped", days=1)
+        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled + stopped)
 
         final_metrics = calculator.all_metrics()
         logger.info("Final session metrics", **final_metrics)
@@ -2445,6 +2467,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             "Session complete",
             trades_closed=len(closed),
             trades_settled=len(settled),
+            trades_stopped=len(stopped),
             session_net_pnl_usd=round(session_pnl / 100, 2),
         )
         logger.info("Shutdown complete")

@@ -105,3 +105,68 @@ def test_mark_trade_hedged_keeps_parent_open_for_settlement(blotter):
 
     legs = blotter.query_legs(parent_trade_id=tid, status="open")
     assert len(legs) == 2
+
+
+def test_close_leg_stop_loss_marks_leg_and_parent_stopped(blotter):
+    """A stop-loss close must roll up to a ``stopped`` parent, not ``closed`` —
+    that is what lets the blotter distinguish a stop-capped loss from a normal
+    exit (POSITION STOP alerts firing with no ``stopped`` parent recorded)."""
+    tid = blotter.open_trade(ticker="T-STOP", strategy="green_up_full_green_market")
+    leg_id = blotter.record_fill(
+        parent_trade_id=tid,
+        order_id="e1",
+        side="yes",
+        entry_price=61,
+        contracts=1,
+        trade_type="entry",
+    )
+
+    pnl = blotter.close_leg(leg_id, exit_price=43, close_type="stop_loss")
+    assert pnl < 0
+
+    leg = blotter.get_leg(leg_id)
+    assert leg.status == "stopped"
+    assert leg.exit_price == 43
+
+    blotter.close_trade(tid, notes="stopped")
+
+    parent = blotter.get_trade(tid)
+    assert parent.status == "stopped"
+    assert parent.net_pnl_cents == pnl
+
+    # Stopped trades must be discoverable via the stopped-status filter and
+    # must roll into the strategy/category P&L aggregates like any other
+    # closed position.
+    assert [p.trade_id for p in blotter.query_trades(status="stopped")] == [tid]
+    strategy_pnl = {row["group"]: row for row in blotter.pnl_by_strategy(days=1)}
+    assert "green_up_full_green_market" in strategy_pnl
+    assert strategy_pnl["green_up_full_green_market"]["trade_count"] == 1
+
+
+def test_close_leg_settlement_still_takes_priority_over_stopped(blotter):
+    """If a stopped leg's market later settles, settlement status must win."""
+    tid = blotter.open_trade(ticker="T-STOP-SETTLE", strategy="green_up_full_green_market")
+    leg_id = blotter.record_fill(
+        parent_trade_id=tid,
+        order_id="e1",
+        side="yes",
+        entry_price=61,
+        contracts=1,
+        trade_type="entry",
+    )
+    blotter.close_leg(leg_id, exit_price=43, close_type="stop_loss")
+
+    hedge_leg_id = blotter.record_fill(
+        parent_trade_id=tid,
+        order_id="h1",
+        side="no",
+        entry_price=39,
+        contracts=1,
+        trade_type="hedge",
+    )
+    blotter.close_leg(hedge_leg_id, exit_price=100, close_type="settlement", resolution="no")
+
+    blotter.close_trade(tid)
+
+    parent = blotter.get_trade(tid)
+    assert parent.status == "settled"

@@ -5,6 +5,11 @@ __pycache__/
 
 # Versioned snapshots (*_v0*, *_v1*, *_v10*, ...)
 *_v[0-9]*
+# Real module names that happen to match the versioned-snapshot pattern above
+# (Kalshi's own "v2" order API) — whitelist explicitly so they aren't silently
+# dropped from commits. This is why trading/kalshi_order_v2.py was missing
+# from origin/main despite execution_manager.py / order_entry.py importing it.
+!trading/kalshi_order_v2.py
 
 # Local databases and logs
 *.db

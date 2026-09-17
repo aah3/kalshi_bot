@@ -106,7 +106,8 @@ class PerformanceAnalytics:
         """
         closed = self._blotter.query_trades(status="closed",  days=days)
         settled = self._blotter.query_trades(status="settled", days=days)
-        all_closed = closed + settled
+        stopped = self._blotter.query_trades(status="stopped", days=days)
+        all_closed = closed + settled + stopped
 
         return {
             "window_days":        days,
@@ -132,7 +133,8 @@ class PerformanceAnalytics:
     def win_rate(self, days: int = 30) -> WinRateStats:
         closed  = self._blotter.query_trades(status="closed",  days=days)
         settled = self._blotter.query_trades(status="settled", days=days)
-        return self._win_rate_stats(closed + settled)
+        stopped = self._blotter.query_trades(status="stopped", days=days)
+        return self._win_rate_stats(closed + settled + stopped)
 
     def _win_rate_stats(self, trades: list[ParentRecord]) -> dict[str, Any]:
         if not trades:
@@ -179,7 +181,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         gross_profit = sum(t.net_pnl_cents for t in trades if (t.net_pnl_cents or 0) > 0)
         gross_loss   = abs(sum(t.net_pnl_cents for t in trades if (t.net_pnl_cents or 0) < 0))
@@ -202,7 +205,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         if not trades:
             return None
@@ -235,7 +239,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         daily = self._to_daily_pnl(trades)
         if len(daily) < 2:
@@ -267,7 +272,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         if not trades:
             return {"overall_minutes": None, "by_strategy": {}}
@@ -302,7 +308,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         if not trades:
             return {
@@ -361,7 +368,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         daily = self._to_daily_pnl(trades)
         if not daily:
@@ -383,7 +391,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         daily  = self._to_daily_pnl(trades)
         result = []
@@ -414,7 +423,8 @@ class PerformanceAnalytics:
         if trades is None:
             closed  = self._blotter.query_trades(status="closed",  days=days)
             settled = self._blotter.query_trades(status="settled", days=days)
-            trades  = closed + settled
+            stopped = self._blotter.query_trades(status="stopped", days=days)
+            trades  = closed + settled + stopped
 
         # Group by strategy
         by_strategy: dict[str, list[ParentRecord]] = defaultdict(list)
