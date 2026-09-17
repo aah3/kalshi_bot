@@ -55,6 +55,33 @@ See chat/plan notes for full CLI 1:1 maps. Core blocks:
 - `risk` / `persistence` → config + DB/log isolation
 - `lifecycle` / `runtime` → exit flags, monitor, quiet
 
+## Kill-switch alerting & unattended autostart
+
+| Piece | Path |
+|--------|------|
+| Out-of-band kill-switch sentinel (written by `main.kill_switch()`) | `risk/kill_switch_alert.py` |
+| Operator watcher (sentinel + log tail; never `Stop-Process`, never flattens) | `scripts/watch_kill_switch.ps1` |
+| Register unattended overnight autostart (Task Scheduler, at-logon) | `scripts/register_autostart.ps1` |
+| Remove the autostart task | `scripts/unregister_autostart.ps1` |
+
+- `risk/kill_switch_alert.py` writes a small, fsync'd JSON sentinel
+  (`<db_stem>.kill_switch_alert.json`, next to the instance DB) the instant
+  the circuit breaker's kill switch fires — independent of the buffered
+  JSONL log handler, which can lose the `risk_breach` line if the process
+  exits immediately after tripping.
+- `scripts/watch_kill_switch.ps1` polls that sentinel (plus a log-tail
+  fallback) and alerts the operator (console banner + beep). It is
+  read-only with respect to the trading process: cancellation already
+  happened inside `ExecutionManager.cancel_all_orders()` before the
+  watcher ever sees the alert, and it never calls `Stop-Process` or
+  flattens positions.
+- **Only register autostart when the operator explicitly asks** for an
+  unattended overnight soak, and only after an attended session has passed
+  on the current code. `register_autostart.ps1` refuses to run without
+  `-Confirm` for exactly this reason. Unregister with
+  `unregister_autostart.ps1` when the soak is done or before shipping
+  further changes.
+
 ## Phase 2 (not built)
 
 - Portfolio supervisor launching N workers
