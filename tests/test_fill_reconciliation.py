@@ -294,19 +294,20 @@ def test_stop_fill_closes_entry_leg_with_realised_pnl():
         assert strat.get_position(ticker).state == PositionState.STOPPED
         assert ticker not in main._active_trades
 
-        # Still exactly ONE leg — the entry leg, now CLOSED with realised P&L.
+        # Still exactly ONE leg — the entry leg, now STOPPED with realised P&L.
         legs = blotter.query_legs(parent_trade_id=trade_id)
         assert len(legs) == 1
         entry_leg = legs[0]
-        assert entry_leg.status == "closed"
+        assert entry_leg.status == "stopped"
         assert entry_leg.exit_price == 43
         expected_fee = int(config.FEE_PER_CONTRACT_CENTS * 1)
         assert entry_leg.realised_pnl_cents == (43 - 61) * 1 - expected_fee
 
-        # Parent trade closed and net P&L reflects the realised loss.
-        parent = blotter.query_trades()
+        # Parent trade rolls up to "stopped" (not a plain "closed") so the
+        # blotter can distinguish a stop-capped loss from a normal exit.
+        parent = blotter.query_trades(status="stopped")
         parent = [p for p in parent if p.trade_id == trade_id][0]
-        assert parent.status == "closed"
+        assert parent.status == "stopped"
         assert parent.net_pnl_cents == (43 - 61) * 1 - expected_fee
         assert parent.total_contracts == 1   # no phantom second contract
     finally:

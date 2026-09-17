@@ -2458,7 +2458,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
         # Session summary from blotter
         closed  = _blotter.query_trades(status="closed",  days=1)
         settled = _blotter.query_trades(status="settled", days=1)
-        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled)
+        stopped = _blotter.query_trades(status="stopped", days=1)
+        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled + stopped)
 
         final_metrics = calculator.all_metrics()
         logger.info("Final session metrics", **final_metrics)
@@ -2466,6 +2467,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             "Session complete",
             trades_closed=len(closed),
             trades_settled=len(settled),
+            trades_stopped=len(stopped),
             session_net_pnl_usd=round(session_pnl / 100, 2),
         )
         logger.info("Shutdown complete")
