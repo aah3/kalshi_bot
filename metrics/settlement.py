@@ -159,6 +159,15 @@ class SettlementWatcher:
 
     # ── One-shot check ────────────────────────────────────────────────────────
 
+    async def fetch_market_statuses(
+        self,
+        tickers: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch ``{ticker: {status, result}}`` for the given tickers."""
+        if not tickers:
+            return {}
+        return await self._fetch_market_statuses(tickers)
+
     async def check_now(self) -> list[SettlementResult]:
         """
         Immediately scan all open positions for resolved markets.

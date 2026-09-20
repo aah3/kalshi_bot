@@ -63,7 +63,7 @@ from strategy.base_strategy import BaseStrategy
 from strategy.factory import VALID_STRATEGIES, _parse_comp_pairs, _parse_model_probs, build_strategy
 from monitoring.session_table import SessionMonitor
 from ingestion.rest_book_fallback import make_market_client_from_session, run_rest_book_fallback_loop
-from trading.auth_check import verify_portfolio_credentials
+from trading.auth_check import calibrate_clock_offset, verify_portfolio_credentials
 from trading.fill_reconciler import run_fill_reconciliation_loop
 from trading.portfolio_monitor import PortfolioMonitor
 
@@ -99,12 +99,16 @@ _strategy:           BaseStrategy      | None = None
 _store:              MetricsStore      | None = None
 _shutdown_event = asyncio.Event()
 _auto_take_profit: bool = False
+_instance_id: str | None = None
+_universe_manager = None  # orchestration.universe_manager.UniverseManager | None
+_session_tickers: list[str] = []  # mutable watchlist for session exit / monitor
 
 # Active trade tracking: ticker -> parent_trade_id
 # Maps each market to its currently open logical trade so every fill
 # is linked to the correct blotter parent row.
 _active_trades: dict[str, str] = {}
 _pending_orders: dict[str, dict[str, Any]] = {}  # order_id -> submit context for blotter
+_inflight_submits: dict[str, dict[str, Any]] = {}  # ticker -> submit ctx (pre-order_id race)
 # Fill ids already applied, so the WebSocket and REST-reconciliation paths never
 # double-count the same fill.
 _processed_fill_ids: set[str] = set()
@@ -286,12 +290,23 @@ async def on_tick(tick: dict[str, Any]) -> None:
     if _circuit_breaker and _circuit_breaker.is_tripped:
         return
 
+    if _shutdown_event.is_set():
+        return
+
     signal_obj = _strategy.evaluate(tick)
     if signal_obj is None:
         return
 
     meta = signal_obj.meta or {}
     phase = meta.get("phase", "entry")
+
+    if (
+        _execution
+        and getattr(_execution, "jurisdiction_blocked", False)
+        and phase in ("entry", "leg_1")
+    ):
+        _rollback_pending_entry(signal_obj.ticker)
+        return
 
     if phase in ("entry", "leg_1") and _live_rules and _live_rules.enabled:
         from discovery.live_market import is_tick_live
@@ -361,7 +376,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
             config.STOP_LOSS_CLOSE_WINDOW_MINUTES,
         )
         if not _sl_ok:
-            logger.info(
+            logger.warning(
                 "Suppressing stop-loss — time remaining",
                 ticker=signal_obj.ticker,
                 reason=_sl_reason,
@@ -440,8 +455,18 @@ async def on_tick(tick: dict[str, Any]) -> None:
             return
 
     # Submit order to exchange (blotter records on confirmed WS fill only)
+    submit_ctx = _build_pending_context(
+        ticker=ticker,
+        trade_type=trade_type,
+        meta=meta,
+        strategy=signal_obj.strategy,
+        side=signal_obj.side.value,
+    )
+    _inflight_submits[ticker] = submit_ctx
+
     order = await _execution.submit_order(signal_obj)
     if not order:
+        _inflight_submits.pop(ticker, None)
         if phase in ("entry", "leg_1"):
             _rollback_pending_entry(ticker)
         elif phase == "hedge":
@@ -457,14 +482,7 @@ async def on_tick(tick: dict[str, Any]) -> None:
         return
 
     order_id = order.get("order_id", "")
-    _pending_orders[order_id] = {
-        "ticker":     ticker,
-        "trade_type": trade_type,
-        "meta":       meta,
-        "strategy":   signal_obj.strategy,
-        "category":   meta.get("category", "Unknown"),
-        "side":       signal_obj.side.value,
-    }
+    _pending_orders[order_id] = _inflight_submits.pop(ticker, submit_ctx)
 
     if phase == "stop_loss":
         from strategy.green_up_strategy import GreenUpStrategy
@@ -520,6 +538,165 @@ def _known_order_ids() -> set[str]:
     if _execution:
         ids |= set(_execution.open_orders.keys())
     return ids
+
+
+def _restore_active_trades_from_blotter() -> None:
+    """Map open blotter parent trades back to in-memory ticker → trade_id."""
+    if not _blotter:
+        return
+    for row in _blotter.open_positions_summary():
+        ticker = row.get("ticker")
+        trade_id = row.get("trade_id")
+        if ticker and trade_id:
+            _active_trades[ticker] = trade_id
+
+
+def _build_pending_context(
+    *,
+    ticker: str,
+    trade_type: str,
+    meta: dict[str, Any],
+    strategy: str,
+    side: str,
+) -> dict[str, Any]:
+    enriched = dict(meta) if meta else {}
+    if _instance_id and "instance_id" not in enriched:
+        enriched["instance_id"] = _instance_id
+    return {
+        "ticker":     ticker,
+        "trade_type": trade_type,
+        "meta":       enriched,
+        "strategy":   strategy,
+        "category":   enriched.get("category", "Unknown"),
+        "side":       side,
+    }
+
+
+def _infer_pending_context(
+    fill: dict[str, Any],
+    order_id: str,
+) -> dict[str, Any] | None:
+    """
+    Reconstruct submit context when a fill arrives before _pending_orders
+    is keyed (async race) or when reconciliation delivers a fill we own.
+    """
+    ticker = fill.get("ticker", "")
+    if not ticker or not _strategy:
+        return None
+
+    from strategy.green_up_strategy import GreenUpStrategy, PositionState as GUState
+
+    if isinstance(_strategy, GreenUpStrategy):
+        pos = _strategy.get_position(ticker)
+        if pos is None:
+            return None
+        side = fill.get("side", "")
+        if pos.state == GUState.WATCHING and side == "yes":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state == GUState.STOPPING:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="stop_loss",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state in (GUState.HEDGING, GUState.ENTERED) and side == "no":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="hedge",
+                meta={},
+                strategy=_strategy.name,
+                side="no",
+            )
+        if pos.stop_order_id and order_id == pos.stop_order_id:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="stop_loss",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.hedge_order_id and order_id == pos.hedge_order_id:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="hedge",
+                meta={},
+                strategy=_strategy.name,
+                side="no",
+            )
+        if pos.entry_order_id and order_id == pos.entry_order_id:
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+
+    from strategy.high_prob_strategy import HighProbStrategy, PositionState as HPState
+    from strategy.mean_reversion_strategy import (
+        MeanReversionStrategy,
+        PositionState as MRState,
+    )
+
+    if isinstance(_strategy, (HighProbStrategy, MeanReversionStrategy)):
+        pos = _strategy.get_position(ticker)
+        if pos is None:
+            return None
+        exit_pending = HPState.EXIT_PENDING if isinstance(_strategy, HighProbStrategy) else MRState.EXIT_PENDING
+        entered = HPState.ENTERED if isinstance(_strategy, HighProbStrategy) else MRState.ENTERED
+        watching = HPState.WATCHING if isinstance(_strategy, HighProbStrategy) else MRState.WATCHING
+        side = fill.get("side", "")
+        if pos.state == watching and side == "yes":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state == exit_pending:
+            phase = "stop_loss" if getattr(pos, "stop_order_sent", False) else "exit"
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type=phase,
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+        if pos.state == entered and side == "yes":
+            return _build_pending_context(
+                ticker=ticker,
+                trade_type="entry",
+                meta={},
+                strategy=_strategy.name,
+                side="yes",
+            )
+
+    return None
+
+
+def _resolve_pending_context(
+    fill: dict[str, Any],
+    order_id: str,
+) -> dict[str, Any] | None:
+    """Look up submit context for a fill from order id, inflight, or strategy."""
+    ticker = fill.get("ticker", "")
+    pending = _pending_orders.get(order_id) if order_id else None
+    if pending:
+        return pending
+    if ticker:
+        pending = _inflight_submits.get(ticker)
+        if pending:
+            return pending
+    return _infer_pending_context(fill, order_id)
 
 
 def _close_entry_leg_on_exit(
@@ -601,7 +778,7 @@ def on_fill_received(fill: dict[str, Any]) -> None:
 
     order_id = fill.get("order_id", "")
     ticker   = fill.get("ticker", "")
-    pending  = _pending_orders.get(order_id)
+    pending  = _resolve_pending_context(fill, order_id)
     exit_entry_closed = False
 
     if _strategy:
@@ -712,6 +889,8 @@ def on_fill_received(fill: dict[str, Any]) -> None:
         _execution.record_fill(fill)
         if order_id not in _execution.open_orders:
             _pending_orders.pop(order_id, None)
+        if ticker:
+            _inflight_submits.pop(ticker, None)
 
     if _circuit_breaker:
         _circuit_breaker.record_fill(fill)
@@ -756,12 +935,123 @@ async def _portfolio_risk_sync_loop(interval_seconds: float) -> None:
             pass
 
 
+def _collect_strategy_states(session_tickers: list[str]) -> dict[str, str]:
+    """Return ``{ticker: state_value}`` for session tickers with strategy positions."""
+    if not _strategy:
+        return {}
+    states: dict[str, str] = {}
+    for ticker in session_tickers:
+        pos = _strategy.get_position(ticker)
+        if pos is not None:
+            states[ticker] = pos.state.value
+    return states
+
+
+async def _runtime_limit_loop(minutes: float) -> None:
+    """Trigger the same graceful shutdown as Ctrl+C after a wall-clock limit."""
+    if minutes <= 0:
+        return
+    try:
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=float(minutes) * 60.0)
+    except asyncio.TimeoutError:
+        logger.info(
+            "Max runtime reached — graceful shutdown",
+            max_runtime_minutes=minutes,
+        )
+        _shutdown_event.set()
+
+
+async def _session_exit_loop(
+    session_tickers: list[str],
+    *,
+    exit_on_settle: bool,
+    exit_when_flat: bool,
+    interval_seconds: float,
+) -> None:
+    """Poll session completion conditions and trigger graceful shutdown."""
+    from discovery.market_registry import get_market
+    from trading.session_exit import should_exit_on_settle, should_exit_when_flat
+
+    while not _shutdown_event.is_set():
+        try:
+            if _settlement_watcher and exit_on_settle:
+                await _settlement_watcher.check_now()
+
+            market_statuses: dict[str, dict] = {}
+            if _settlement_watcher and (exit_on_settle or exit_when_flat):
+                market_statuses = await _settlement_watcher.fetch_market_statuses(
+                    session_tickers
+                )
+
+            open_blotter = _blotter.open_positions_summary() if _blotter else []
+            open_orders = _execution.open_orders if _execution else {}
+            strategy_states = _collect_strategy_states(session_tickers)
+            markets = {ticker: get_market(ticker) for ticker in session_tickers}
+
+            if exit_on_settle:
+                reason = should_exit_on_settle(
+                    session_tickers,
+                    market_statuses,
+                    open_blotter,
+                )
+                if reason:
+                    logger.info(
+                        "Session auto-exit (--exit-on-settle)",
+                        reason=reason,
+                    )
+                    logger.shutdown(reason=f"session auto-exit: {reason}")
+                    _shutdown_event.set()
+                    break
+
+            if exit_when_flat:
+                reason = should_exit_when_flat(
+                    session_tickers,
+                    market_statuses,
+                    markets,
+                    open_blotter,
+                    open_orders,
+                    strategy_states,
+                )
+                if reason:
+                    logger.info(
+                        "Session auto-exit (--exit-when-flat)",
+                        reason=reason,
+                    )
+                    logger.shutdown(reason=f"session auto-exit: {reason}")
+                    _shutdown_event.set()
+                    break
+        except Exception as exc:
+            logger.warning(f"Session exit check failed: {exc}")
+
+        try:
+            await asyncio.wait_for(
+                _shutdown_event.wait(),
+                timeout=interval_seconds,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+
 async def kill_switch() -> None:
     """
     Hard stop — called by CircuitBreaker when any risk limit is breached.
     Cancels all open orders then sets the shutdown event.
     """
     logger.risk_breach("kill switch activated — cancelling all orders and halting")
+
+    # Write an out-of-band sentinel file *before* anything else. The
+    # risk_breach line above goes through the buffered JSONL file handler
+    # and can be lost if the process exits before that handler flushes
+    # (see docs/ROADMAP.md); this alert is fsync'd immediately so an
+    # external watcher (scripts/watch_kill_switch.ps1) sees the trip even
+    # then. It only records — it never cancels orders or flattens.
+    try:
+        from risk.kill_switch_alert import alert_kill_switch
+        alert_kill_switch("kill switch activated — cancelling all orders and halting")
+    except Exception as exc:  # pragma: no cover - alerting must never block the trip
+        logger.error(f"kill_switch_alert failed: {exc}")
+
     if _execution:
         await _execution.cancel_all_orders()
     _shutdown_event.set()
@@ -786,6 +1076,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"Strategy engine (default: {config.DEFAULT_STRATEGY}, "
             "or KALSHI_STRATEGY env)"
         ),
+    )
+    parser.add_argument(
+        "--instance",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load a StrategyInstance YAML/JSON (sets strategy, universe, risk, "
+            "persistence). Optional --instance-id when PATH is a portfolio file."
+        ),
+    )
+    parser.add_argument(
+        "--instance-id",
+        default=None,
+        metavar="ID",
+        help="Select instance id from a portfolio file used with --instance",
     )
     parser.add_argument(
         "--tickers",
@@ -1207,6 +1512,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "contracts (env KALSHI_AUTO_TAKE_PROFIT)"
         ),
     )
+    parser.add_argument(
+        "--exit-on-settle",
+        action="store_true",
+        help=(
+            "Auto-shutdown when every session ticker is settled/finalized on Kalshi "
+            "and no open blotter trades remain on those tickers"
+        ),
+    )
+    parser.add_argument(
+        "--exit-when-flat",
+        action="store_true",
+        help=(
+            "Auto-shutdown when session tickers are flat (no orders, no in-flight "
+            "entry legs or strategy states) and the market/event window is over "
+            "(does not wait for official settlement)"
+        ),
+    )
+    parser.add_argument(
+        "--max-runtime-minutes",
+        type=float,
+        default=None,
+        metavar="MIN",
+        help=(
+            "Graceful shutdown after N minutes (same path as Ctrl+C: cancel "
+            "resting orders, do not flatten). 0/omit = run until signal."
+        ),
+    )
 
     # Auto-discovery: top N tickers in a category matching filters
     parser.add_argument(
@@ -1625,10 +1957,40 @@ async def main(args: argparse.Namespace | None = None) -> None:
     global _store, _blotter, _settlement_watcher
     global _portfolio_monitor, _alert_manager, _session_monitor
     global _max_concurrent_positions, _live_rules, _portfolio_snapshot
-    global _auto_take_profit
+    global _auto_take_profit, _instance_id, _universe_manager, _session_tickers
 
     if args is None:
         args = parse_args()
+
+    instance = None
+    if getattr(args, "instance", None):
+        from orchestration.strategy_instance import (
+            StrategyInstanceError,
+            load_strategy_instance,
+        )
+        from orchestration.instance_adapter import apply_instance_runtime
+
+        try:
+            instance = load_strategy_instance(
+                args.instance,
+                instance_id=getattr(args, "instance_id", None),
+            )
+        except StrategyInstanceError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+        if not instance.enabled:
+            logger.error("StrategyInstance is disabled", instance_id=instance.id)
+            sys.exit(1)
+        apply_instance_runtime(instance, args)
+        _instance_id = instance.id
+        logger.info(
+            "StrategyInstance loaded",
+            instance_id=instance.id,
+            strategy=instance.strategy,
+            refresh_seconds=instance.universe.refresh_seconds,
+            db_path=config.DB_PATH,
+            log_file=config.LOG_FILE,
+        )
 
     if args.quiet or not config.LOG_CONSOLE:
         logger.set_console_level(logging.WARNING)
@@ -1657,9 +2019,12 @@ async def main(args: argparse.Namespace | None = None) -> None:
     if not tickers:
         logger.error(
             "No tickers configured — set KALSHI_TICKERS, pass --tickers, "
-            f"or use --discover (defaults to {DEFAULT_DISCOVER_CATEGORY})"
+            f"use --discover (defaults to {DEFAULT_DISCOVER_CATEGORY}), "
+            "or pass --instance with a discover/static universe"
         )
         sys.exit(1)
+
+    _session_tickers = list(tickers)
 
     model_probs = _parse_model_probs(
         ",".join(args.model_prob) if args.model_prob else os.getenv("KALSHI_MODEL_PROB")
@@ -1733,11 +2098,19 @@ async def main(args: argparse.Namespace | None = None) -> None:
     # ── Instantiate all modules ───────────────────────────────────────────────
     credentials      = CredentialManager()
     rate_limiter     = RateLimiter()
-    _store           = MetricsStore()
-    _blotter         = Blotter()
+    _store           = MetricsStore(db_path=config.DB_PATH)
+    _blotter         = Blotter(db_path=config.DB_PATH)
     calculator       = MetricsCalculator(_store)
     _circuit_breaker = CircuitBreaker(kill_switch=kill_switch)
     _execution       = ExecutionManager(credentials, rate_limiter)
+
+    # Clear any kill-switch alert left over from a previous session so a
+    # fresh start never looks like it's already tripped.
+    try:
+        from risk.kill_switch_alert import clear_kill_switch_alert
+        clear_kill_switch_alert()
+    except Exception as exc:
+        logger.error(f"kill_switch_alert cleanup failed: {exc}")
 
     _settlement_watcher = SettlementWatcher(
         blotter=_blotter,
@@ -1781,6 +2154,14 @@ async def main(args: argparse.Namespace | None = None) -> None:
     book_fallback_task = None
     fill_reconcile_task = None
     monitor_task = None
+    session_exit_task = None
+    universe_task = None
+    runtime_limit_task = None
+
+    try:
+        await calibrate_clock_offset(credentials, shared_session)
+    except Exception as exc:
+        logger.warning(f"Clock calibration skipped: {exc}")
 
     auth_ok, auth_msg = await verify_portfolio_credentials(
         credentials, rate_limiter, shared_session
@@ -1861,7 +2242,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
     )
     if monitor_interval > 0:
         _session_monitor = SessionMonitor(
-            tickers=tickers,
+            tickers=_session_tickers,
             strategy=_strategy,
             ingestor=_ingestor,
             execution=_execution,
@@ -1874,6 +2255,64 @@ async def main(args: argparse.Namespace | None = None) -> None:
         )
         monitor_task = asyncio.create_task(
             _session_monitor.run(), name="session_monitor"
+        )
+
+    if args.exit_on_settle or args.exit_when_flat:
+        session_exit_task = asyncio.create_task(
+            _session_exit_loop(
+                _session_tickers,
+                exit_on_settle=bool(args.exit_on_settle),
+                exit_when_flat=bool(args.exit_when_flat),
+                interval_seconds=config.PORTFOLIO_RISK_SYNC_SECONDS,
+            ),
+            name="session_exit",
+        )
+
+    if (
+        instance is not None
+        and instance.universe.refresh_seconds
+        and instance.universe.refresh_seconds > 0
+        and instance.universe.mode in ("discover", "hybrid")
+    ):
+        from orchestration.instance_adapter import criteria_from_instance
+        from orchestration.universe_manager import UniverseManager
+
+        criteria = criteria_from_instance(instance)
+
+        async def _discover_fn(crit):
+            return await discover_with_details(credentials, rate_limiter, crit)
+
+        async def _register_fn(new_tickers: list[str]) -> None:
+            await _register_markets_for_tickers(
+                new_tickers, credentials, rate_limiter
+            )
+
+        def _on_watchlist_changed(new_list: list[str]) -> None:
+            _session_tickers[:] = list(new_list)
+
+        _universe_manager = UniverseManager(
+            instance=instance,
+            criteria=criteria,
+            strategy=_strategy,
+            ingestor=_ingestor,
+            watching=list(_session_tickers),
+            discover_fn=_discover_fn,
+            register_fn=_register_fn,
+            blotter=_blotter,
+            execution=_execution,
+            session_monitor=_session_monitor,
+            on_watchlist_changed=_on_watchlist_changed,
+        )
+        universe_task = asyncio.create_task(
+            _universe_manager.run_loop(_shutdown_event),
+            name="universe_refresh",
+        )
+
+    max_runtime = getattr(args, "max_runtime_minutes", None)
+    if max_runtime is not None and float(max_runtime) > 0:
+        runtime_limit_task = asyncio.create_task(
+            _runtime_limit_loop(float(max_runtime)),
+            name="runtime_limit",
         )
 
     startup_kw: dict = dict(
@@ -1889,10 +2328,17 @@ async def main(args: argparse.Namespace | None = None) -> None:
         ws_book_rest_fallback_poll_seconds=config.WS_BOOK_REST_FALLBACK_POLL_SECONDS,
         max_concurrent_positions=_max_concurrent_positions,
         auto_take_profit_on_alert=_auto_take_profit,
+        exit_on_settle=bool(args.exit_on_settle),
+        exit_when_flat=bool(args.exit_when_flat),
+        max_runtime_minutes=getattr(args, "max_runtime_minutes", None),
         live_trading_only=_live_rules.enabled if _live_rules else False,
         live_max_minutes_since_update=_live_rules.max_minutes_since_update if _live_rules else None,
         live_max_minutes_to_close=_live_rules.max_minutes_to_close if _live_rules else None,
     )
+    if _instance_id:
+        startup_kw["instance_id"] = _instance_id
+        if instance is not None:
+            startup_kw["universe_refresh_seconds"] = instance.universe.refresh_seconds
     if args.strategy == "green_up":
         from strategy.green_up_strategy import GreenUpStrategy
 
@@ -1920,9 +2366,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
     # Resume open positions from previous session
     open_pos = _blotter.open_positions_summary()
     if open_pos:
+        _restore_active_trades_from_blotter()
         logger.info(
             f"Resuming with {len(open_pos)} open positions from previous session",
             open_positions=[p["trade_id"] for p in open_pos],
+            active_trade_map=dict(_active_trades),
         )
 
     # ── Run until shutdown event ──────────────────────────────────────────────
@@ -1935,6 +2383,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             open_blotter_trade_ids=[p["trade_id"] for p in open_blotter],
             open_exchange_orders=list(_execution.open_orders.keys()),
             active_alerts=_alert_manager.active_alert_summary(),
+            instance_id=_instance_id,
         )
 
         # Stop ingestor first (no new ticks)
@@ -1965,6 +2414,9 @@ async def main(args: argparse.Namespace | None = None) -> None:
             risk_sync_task,
             book_fallback_task,
             fill_reconcile_task,
+            session_exit_task,
+            universe_task,
+            runtime_limit_task,
         ):
             if task:
                 task.cancel()
@@ -1973,6 +2425,9 @@ async def main(args: argparse.Namespace | None = None) -> None:
             risk_sync_task,
             book_fallback_task,
             fill_reconcile_task,
+            session_exit_task,
+            universe_task,
+            runtime_limit_task,
         ):
             if task:
                 try:
@@ -2003,7 +2458,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
         # Session summary from blotter
         closed  = _blotter.query_trades(status="closed",  days=1)
         settled = _blotter.query_trades(status="settled", days=1)
-        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled)
+        stopped = _blotter.query_trades(status="stopped", days=1)
+        session_pnl = sum((t.net_pnl_cents or 0) for t in closed + settled + stopped)
 
         final_metrics = calculator.all_metrics()
         logger.info("Final session metrics", **final_metrics)
@@ -2011,6 +2467,7 @@ async def main(args: argparse.Namespace | None = None) -> None:
             "Session complete",
             trades_closed=len(closed),
             trades_settled=len(settled),
+            trades_stopped=len(stopped),
             session_net_pnl_usd=round(session_pnl / 100, 2),
         )
         logger.info("Shutdown complete")

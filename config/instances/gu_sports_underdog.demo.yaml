@@ -1,0 +1,65 @@
+# Demo all-day green_up sleeve (Phase 1 StrategyInstance).
+# Usage:
+#   python main.py --instance config/instances/gu_sports_underdog.demo.yaml
+#   python main.py --instance config/instances/gu_sports_underdog.demo.yaml --discover-only
+
+id: gu_sports_underdog
+enabled: true
+strategy: green_up
+
+universe:
+  mode: discover
+  refresh_seconds: 900
+  max_watchlist: 5
+  static_tickers: []
+  drop_policy:
+    closed: drop
+    fail_filters: drop_if_flat
+    not_in_top_n: drop_if_flat
+  discover:
+    category: Sports
+    preset: green_up
+    top_n: 5
+    max_yes_ask: 30
+    min_volume_24h: 500
+    # Demo Sports tape is stale (updated_time often ~7d). Production-tight
+    # 2h / 360m live window yields api_pool=0 even though ~46k markets exist.
+    full_scan: true
+    activity_hours: 336
+    max_minutes_to_close: 10080
+    live_only: false
+    rank_by: screener
+
+strategy_params:
+  entry_max: 30
+  hedge_trigger: 44
+  hedge_mode: stake_back
+  stop_loss: 10
+  # IOC so unfilled entries do not occupy concurrent slots (bid-2 GTC stalled soaks)
+  gu_entry_mode: cross_spread
+  gu_exit_mode: cross_spread
+  gu_hedge_style: trigger
+  gu_max_cycles: 0
+
+risk:
+  max_position_cents: 10000
+  max_concurrent_positions: 2
+  daily_loss_limit_cents: 20000
+  max_drawdown_pct: 0.10
+  max_sector_concentration: 1.0
+
+persistence:
+  db_path: kalshi_bot_demo_gu_sports.db
+  log_file: kalshi_bot_demo_gu_sports.jsonl
+
+lifecycle:
+  on_flat: keep_running
+  on_all_settled: keep_running
+  on_shutdown: cancel_resting
+
+runtime:
+  monitor_interval: 30
+  quiet: true
+  auto_take_profit: false
+
+schedule: null

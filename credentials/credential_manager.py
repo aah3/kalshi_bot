@@ -35,6 +35,7 @@ class CredentialManager:
         self._credential_source = source
         self._api_key_id = api_key_id
         self._private_key = self._load_private_key(key_b64)
+        self._clock_offset_ms = 0
 
     # ── Public interface ────────────────────────────────────────────────────
 
@@ -51,6 +52,10 @@ class CredentialManager:
         """Which env vars supplied the active key (for logs)."""
         return self._credential_source
 
+    def set_clock_offset_ms(self, offset_ms: int) -> None:
+        """Shift signed timestamps toward Kalshi's clock (ms added to local epoch)."""
+        self._clock_offset_ms = int(offset_ms)
+
     def sign_request(
         self,
         method: str,
@@ -65,12 +70,16 @@ class CredentialManager:
             method:       HTTP verb (GET, POST, DELETE …), uppercase.
             path:         URL path including query string, e.g. '/trade-api/v2/markets'.
             body:         Raw request body string (empty string for GET).
-            timestamp_ms: Unix epoch milliseconds; defaults to now.
+            timestamp_ms: Unix epoch milliseconds; defaults to now plus clock offset.
 
         Returns:
             Dict of headers to merge into the outgoing request.
         """
-        ts = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
+        ts = (
+            timestamp_ms
+            if timestamp_ms is not None
+            else int(time.time() * 1000) + self._clock_offset_ms
+        )
         message = self._build_message(method, path, ts)
         signature = self._sign(message)
 

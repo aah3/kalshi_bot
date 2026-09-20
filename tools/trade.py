@@ -77,9 +77,21 @@ from execution.rate_limiter import RateLimiter
 from trading.auth_check import verify_portfolio_credentials
 from trading.order_entry import OrderEntry, OrderRequest, OrderSide, OrderType, TimeInForce
 from trading.portfolio_monitor import PortfolioMonitor
+from trading.position_parse import format_contract_qty
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_count(value: str) -> float:
+    """Parse a whole or fractional contract count (e.g. 1, 0.69, 27.31)."""
+    try:
+        count = round(float(value), 2)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid contract count: {value!r}") from exc
+    if count <= 0:
+        raise argparse.ArgumentTypeError("count must be > 0")
+    return count
+
 
 def _make_deps():
     creds   = CredentialManager()
@@ -99,7 +111,7 @@ def _print_preview(preview: dict) -> None:
     print(f"  ORDER PREVIEW  ({action} {preview['order_type'].upper()} {preview['side'].upper()})")
     print(f"{'─' * 65}")
     print(f"  {'Ticker:':<28} {preview['ticker']}")
-    print(f"  {'Contracts:':<28} {preview['count']}")
+    print(f"  {'Contracts:':<28} {format_contract_qty(preview['count'])}")
     lp = preview.get("limit_price")
     yp = preview.get("yes_price")
     print(f"  {'Limit price:':<28} {f'{lp}c' if lp is not None else 'MARKET'}")
@@ -143,6 +155,7 @@ async def cmd_preview(args):
         count=args.count,
         limit_price=None if args.market else args.price,
         time_in_force=TimeInForce.from_cli(args.tif),
+        action="sell" if getattr(args, "sell", False) else "buy",
         note=args.note or "",
     )
     async with OrderEntry(creds, limiter) as oe, \
@@ -167,11 +180,11 @@ async def cmd_close(args):
         print(f"\n  No open position on {args.ticker}.\n")
         return
 
-    count = args.count if getattr(args, "count", None) else pos.contracts
+    count = float(args.count) if getattr(args, "count", None) is not None else pos.contracts
     count = min(count, pos.contracts)
     side = pos.side.lower()
     print(
-        f"\n  Closing {count} {side.upper()} contract(s) on {args.ticker} "
+        f"\n  Closing {format_contract_qty(count)} {side.upper()} contract(s) on {args.ticker} "
         f"(entry ~{pos.avg_entry_price}c, mark ~{pos.mark_price or '?'}c)\n"
     )
 
@@ -369,7 +382,12 @@ async def cmd_balance(args):
 def _add_order_args(p):
     p.add_argument("--ticker",  required=True,       help="Market ticker e.g. PRES-2024-DEM")
     p.add_argument("--side",    required=True, choices=["yes", "no"])
-    p.add_argument("--count",   required=True, type=int, help="Number of contracts")
+    p.add_argument(
+        "--count",
+        required=True,
+        type=_parse_count,
+        help="Contracts to trade (whole or fractional, e.g. 10 or 0.69)",
+    )
     p.add_argument("--price",   type=int,      help="Limit price in cents (1-99)")
     p.add_argument("--market",  action="store_true", help="Market order (IOC at book cap)")
     p.add_argument("--max-price", type=int, metavar="CENTS",
@@ -388,6 +406,7 @@ sub = parser.add_subparsers(dest="cmd", required=True)
 # preview
 p_prev = sub.add_parser("preview", help="Preview an order (no submission)")
 _add_order_args(p_prev)
+p_prev.add_argument("--sell", action="store_true", help="Preview a sell (default: buy)")
 
 # buy
 p_buy = sub.add_parser("buy", help="Place a market or limit order (buy)")
@@ -400,11 +419,19 @@ _add_order_args(p_sell)
 p_sell.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
 # close
-p_close = sub.add_parser("close", help="Market-sell your full position on a ticker")
+p_close = sub.add_parser(
+    "close",
+    help="Market-sell your full position on a ticker",
+    allow_abbrev=False,
+)
 p_close.add_argument("--ticker", required=True)
-p_close.add_argument("--count", type=int, help="Contracts to sell (default: entire position)")
+p_close.add_argument(
+    "--count",
+    type=_parse_count,
+    help="Contracts to sell (default: exact open size, including fractions)",
+)
 p_close.add_argument("--max-price", type=int, metavar="CENTS", help="Min YES/NO price for market sell")
-p_close.add_argument("--note", default="")
+p_close.add_argument("--note", default="", metavar="NOTE", help="Optional label for this trade")
 p_close.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
 # status

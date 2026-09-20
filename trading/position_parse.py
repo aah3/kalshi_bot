@@ -30,6 +30,14 @@ def _fp_contracts(val: Any) -> float:
         return float(int(val or 0))
 
 
+def format_contract_qty(contracts_fp: float) -> str:
+    """Human-readable contract quantity (whole or fractional)."""
+    rounded = round(contracts_fp, 2)
+    if abs(rounded - round(rounded)) < 1e-9:
+        return str(int(round(rounded)))
+    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+
 def parse_market_position(raw: dict[str, Any]) -> dict[str, Any] | None:
     """
     Parse one ``market_positions`` element into fields for ``Position``.
@@ -69,11 +77,7 @@ def parse_market_position(raw: dict[str, Any]) -> dict[str, Any] | None:
             side = raw.get("side", "yes").lower()
             contracts_fp = float(legacy_int)
 
-    contracts = max(int(round(contracts_fp)), 0)
-    if contracts == 0 and contracts_fp > 0:
-        contracts = 1
-
-    if contracts <= 0:
+    if contracts_fp <= 0:
         return None
 
     exposure_cents = _dollars_to_cents(raw.get("market_exposure_dollars"))
@@ -84,12 +88,12 @@ def parse_market_position(raw: dict[str, Any]) -> dict[str, Any] | None:
     if exposure_cents == 0:
         exposure_cents = _dollars_to_cents(raw.get("total_traded_dollars"))
 
-    avg_entry = exposure_cents // contracts if contracts > 0 else 0
+    avg_entry = round(exposure_cents / contracts_fp) if contracts_fp > 0 else 0
 
     return {
         "ticker": ticker,
         "side": side,
-        "contracts": contracts,
+        "contracts": contracts_fp,
         "contracts_fp": contracts_fp,
         "avg_entry_price": avg_entry,
         "cost_basis_cents": exposure_cents,

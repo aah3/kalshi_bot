@@ -122,6 +122,10 @@ DEFAULT_PARTIAL_HEDGE_FRACTION: float = 0.50  # PARTIAL mode: hedge 50% of full-
 # Consecutive cancel/replace failures against a resting stop before we treat the
 # order as gone (already filled or cancelled on the venue) and stop spinning.
 MAX_STOP_CANCEL_FAILURES: int          = 3
+# Throttle repeated time-gate suppression logs (one line per ticker per interval).
+STOP_GATE_LOG_INTERVAL_S: float       = 60.0
+# Escalate protective stop to IOC market when bid is at or below this (cents).
+MIN_BID_FLOOR_ESCALATE: int            = 1
 
 
 def resolve_entry_max_price(
@@ -255,6 +259,7 @@ class GreenUpPosition:
     # Timestamps
     entered_at: float = field(default_factory=time.monotonic)
     hedged_at:  float = 0.0
+    stop_armed_at: float = 0.0   # monotonic; set when bid first breaches stop level
 
     # ── Derived helpers ───────────────────────────────────────────────────────
 
@@ -436,6 +441,7 @@ class GreenUpStrategy(BaseStrategy):
 
         # ticker -> GreenUpPosition
         self._positions: dict[str, GreenUpPosition] = {}
+        self._stop_gate_log_at: dict[str, float] = {}
 
     @property
     def uses_relative_hedge(self) -> bool:
@@ -496,6 +502,20 @@ class GreenUpStrategy(BaseStrategy):
             return None
 
         if pos and pos.state == PositionState.STOPPING:
+            if not pos.stop_order_id:
+                best_bid = work_tick.get("best_bid")
+                if (
+                    best_bid is not None
+                    and pos.stop_loss_trigger_price
+                    and best_bid > pos.stop_loss_trigger_price
+                ):
+                    pos.state = PositionState.ENTERED
+                    pos.stop_armed_at = 0.0
+                    return None
+                stop_sig = self._check_stop_loss(pos, work_tick)
+                if stop_sig:
+                    return stop_sig
+                return None
             return self._manage_resting_stop(pos, work_tick)
 
         if pos and pos.state == PositionState.ENTERED:
@@ -615,6 +635,7 @@ class GreenUpStrategy(BaseStrategy):
             pos.stop_order_id     = ""
             pos.stop_limit_price  = 0
             pos.stop_cancel_failures = 0
+            pos.stop_armed_at     = 0.0
 
             net_loss_cents = pos.entry_stake_cents - size_c
 
@@ -671,8 +692,76 @@ class GreenUpStrategy(BaseStrategy):
             self._positions[ticker] = GreenUpPosition(ticker=ticker)
             logger.info("GreenUp: watching ticker", ticker=ticker, strategy=self.name)
 
+    def remove_watch_ticker(self, ticker: str) -> bool:
+        """
+        Drop a flat watch entry (SCANNING / STOPPED / CLOSED only).
+
+        Returns True if removed. Refuses to drop in-flight or hedged states.
+        """
+        pos = self._positions.get(ticker)
+        if pos is None:
+            return False
+        if pos.state not in (
+            PositionState.SCANNING,
+            PositionState.STOPPED,
+            PositionState.CLOSED,
+        ):
+            logger.warning(
+                "GreenUp: refuse remove_watch_ticker — not flat",
+                ticker=ticker,
+                state=pos.state.value,
+                strategy=self.name,
+            )
+            return False
+        del self._positions[ticker]
+        logger.info("GreenUp: stopped watching ticker", ticker=ticker, strategy=self.name)
+        return True
+
     def get_position(self, ticker: str) -> GreenUpPosition | None:
         return self._positions.get(ticker)
+
+    def _stop_loss_time_allowed(self, ticker: str) -> tuple[bool, str]:
+        """Return whether the stop-loss time gate permits submitting an exit."""
+        from discovery.market_registry import get_market
+        from risk.entry_gates import check_stop_loss_allowed
+
+        return check_stop_loss_allowed(
+            get_market(ticker),
+            config.STOP_LOSS_CLOSE_WINDOW_MINUTES,
+        )
+
+    def _log_stop_gate_suppressed(self, ticker: str, reason: str) -> None:
+        """Log time-gate suppression at WARNING so --quiet sessions see it."""
+        now = time.monotonic()
+        last = self._stop_gate_log_at.get(ticker, 0.0)
+        if now - last < STOP_GATE_LOG_INTERVAL_S:
+            return
+        self._stop_gate_log_at[ticker] = now
+        logger.warning(
+            "GreenUp: stop-loss suppressed — time remaining",
+            ticker=ticker,
+            reason=reason,
+            threshold_minutes=config.STOP_LOSS_CLOSE_WINDOW_MINUTES,
+            strategy=self.name,
+        )
+
+    def _should_escalate_stop(self, pos: GreenUpPosition, best_bid: int | None) -> bool:
+        """Escalate to IOC market when bid is at the floor or stop is stale."""
+        if best_bid is not None and best_bid <= MIN_BID_FLOOR_ESCALATE:
+            return True
+        if pos.stop_armed_at <= 0:
+            return False
+        escalate_after = config.STOP_LOSS_ESCALATE_SECONDS
+        if escalate_after <= 0:
+            return True
+        return (time.monotonic() - pos.stop_armed_at) >= escalate_after
+
+    def _resolve_stop_exit_mode(
+        self, pos: GreenUpPosition, best_bid: int | None
+    ) -> EntryPriceMode:
+        if self._should_escalate_stop(pos, best_bid):
+            return EntryPriceMode.MARKET
+        return self._stop_sell_mode()
 
     def register_stop_order(
         self, ticker: str, order_id: str, limit_price: int
@@ -719,6 +808,7 @@ class GreenUpStrategy(BaseStrategy):
         pos.state                = PositionState.ENTERED
         pos.stop_limit_price     = 0
         pos.stop_cancel_failures = 0
+        pos.stop_armed_at        = 0.0
 
     def register_hedge_order(
         self, ticker: str, order_id: str, limit_price: int
@@ -1175,7 +1265,7 @@ class GreenUpStrategy(BaseStrategy):
             return None
 
         sell_price, order_type, tif = resolve_yes_sell_exit(
-            self._stop_sell_mode(),
+            self._resolve_stop_exit_mode(pos, best_bid),
             best_bid,
             best_ask,
             self._limit_offset,
@@ -1183,7 +1273,11 @@ class GreenUpStrategy(BaseStrategy):
         if sell_price <= 0 or sell_price >= 100:
             return None
 
-        if pos.stop_order_id and pos.stop_limit_price == sell_price:
+        if (
+            pos.stop_order_id
+            and pos.stop_limit_price == sell_price
+            and order_type != "market"
+        ):
             return None
 
         cancel_id = pos.stop_order_id or None
@@ -1210,14 +1304,24 @@ class GreenUpStrategy(BaseStrategy):
         """
         best_bid = tick.get("best_bid")
         if best_bid is None or best_bid > pos.stop_loss_trigger_price:
+            if pos.stop_armed_at > 0:
+                pos.stop_armed_at = 0.0
             return None
 
         best_ask = tick.get("best_ask")
         if best_ask is None:
             return None
 
+        if pos.stop_armed_at <= 0:
+            pos.stop_armed_at = time.monotonic()
+
+        allowed, gate_reason = self._stop_loss_time_allowed(pos.ticker)
+        if not allowed:
+            self._log_stop_gate_suppressed(pos.ticker, gate_reason)
+            return None
+
         sell_price, order_type, tif = resolve_yes_sell_exit(
-            self._stop_sell_mode(),
+            self._resolve_stop_exit_mode(pos, best_bid),
             best_bid,
             best_ask,
             self._limit_offset,
@@ -1271,6 +1375,7 @@ class GreenUpStrategy(BaseStrategy):
                 strategy=self.name,
             )
         else:
+            escalate = self._should_escalate_stop(pos, best_bid)
             logger.warning(
                 "GreenUp: stop-loss triggered",
                 ticker=pos.ticker,
@@ -1285,6 +1390,7 @@ class GreenUpStrategy(BaseStrategy):
                 est_net_loss_usd=round(net_loss_cents / 100, 2),
                 cancel_order_id=cancel_order_id,
                 time_in_trade_s=round(pos.time_in_trade_s, 1),
+                escalated_to_market=escalate,
                 strategy=self.name,
             )
 

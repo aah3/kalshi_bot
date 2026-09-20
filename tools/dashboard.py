@@ -176,7 +176,8 @@ def _render_performance(perf: PerformanceAnalytics, days: int) -> None:
     try:
         closed  = perf._blotter.query_trades(status="closed",  days=days)
         settled = perf._blotter.query_trades(status="settled", days=days)
-        all_done = closed + settled
+        stopped = perf._blotter.query_trades(status="stopped", days=days)
+        all_done = closed + settled + stopped
 
         if not all_done:
             print("  No closed trades in window.")

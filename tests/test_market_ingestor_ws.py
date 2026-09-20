@@ -45,3 +45,20 @@ def test_ws_legacy_batch_delta():
         "deltas": [{"side": "yes_bid", "price": 10, "delta": -5}],
     })
     assert 10 not in book.yes_bids
+
+
+def test_add_remove_tickers():
+    from ingestion.market_ingestor import MarketIngestor
+
+    async def _noop(_tick):
+        return None
+
+    ing = MarketIngestor(tickers=["A"], on_tick=_noop)
+    assert ing.tickers == ["A"]
+    added = ing.add_tickers(["B", "A", "C"])
+    assert added == ["B", "C"]
+    assert set(ing.tickers) == {"A", "B", "C"}
+    removed = ing.remove_tickers(["B"])
+    assert removed == ["B"]
+    assert "B" not in ing.tickers
+    assert ing.get_book("B") is None

@@ -22,7 +22,7 @@ Order lifecycle
 
 Kalshi REST endpoints used
 ──────────────────────────
-    POST   /portfolio/orders            create order
+    POST   /portfolio/events/orders     create order (V2)
     GET    /portfolio/orders/{id}       poll order status
     DELETE /portfolio/orders/{id}       cancel resting order
     GET    /portfolio/orders            list open orders
@@ -41,13 +41,26 @@ import aiohttp
 
 import config
 from credentials.credential_manager import CredentialManager
+from trading.position_parse import format_contract_qty
 from discovery.market_client import MarketClient, OrderBookSnapshot
 from discovery.orderbook_parse import market_order_yes_price, worst_market_fill_price
 from execution.rate_limiter import BucketType, RateLimiter
 from logging_.structured_logger import logger
+from trading.kalshi_order_v2 import (
+    CREATE_ORDER_V2_PATH,
+    build_create_order_v2_body,
+    parse_create_order_v2_response,
+)
 
 
 # ── Order types ───────────────────────────────────────────────────────────────
+
+def kalshi_order_count_fields(contracts: float) -> tuple[int, str]:
+    """Re-export for callers that import from ``order_entry``."""
+    from trading.kalshi_order_v2 import kalshi_order_count_fields as _fmt
+
+    return _fmt(contracts)
+
 
 class OrderType(str, Enum):
     MARKET = "market"
@@ -121,7 +134,7 @@ class OrderRequest:
     ticker:       str
     side:         OrderSide
     order_type:   OrderType
-    count:        int              # number of contracts (integer, not cents)
+    count:        float            # number of contracts (fractional via count_fp)
     limit_price:  int | None       # cents (1-99) for limit; None for market
     market_max_price: int | None = None  # optional cap for market (else from book)
     time_in_force: TimeInForce    = TimeInForce.GTC
@@ -141,12 +154,12 @@ class OrderRequest:
         if self.limit_price is None:
             return None
         price = self.limit_price if self.side == OrderSide.YES else 100 - self.limit_price
-        return price * self.count
+        return int(round(price * self.count))
 
     @property
     def max_payout_cents(self) -> int:
         """Maximum payout if position wins: always $1 per contract."""
-        return self.count * 100
+        return int(round(self.count * 100))
 
     def validate(self) -> list[str]:
         """Return a list of validation errors (empty = valid)."""
@@ -179,7 +192,7 @@ class OrderReceipt:
     ticker:           str
     side:             OrderSide
     order_type:       OrderType
-    count:            int
+    count:            float
     limit_price:      int | None
     yes_price:        int | None
     status:           OrderStatus
@@ -193,7 +206,7 @@ class OrderReceipt:
         return (
             f"ORDER {self.order_id[:8]}  "
             f"{self.order_type.value.upper()} {self.side.value.upper()} "
-            f"{self.count} × {self.ticker}  "
+            f"{format_contract_qty(self.count)} × {self.ticker}  "
             f"@ {self.limit_price or 'MKT'}c  "
             f"cost≈{cost_str}  "
             f"max_payout=${self.max_payout_cents/100:.2f}  "
@@ -372,6 +385,12 @@ class OrderEntry:
                     request.action,
                     request.count,
                 )
+            if market_cap is not None and request.action == "sell":
+                if request.side == OrderSide.YES:
+                    est_yes_price = market_cap
+                else:
+                    est_yes_price = 100 - market_cap
+                est_cost_cents = int(round(market_cap * request.count))
 
         implied_roi = None
         if est_cost_cents and est_cost_cents > 0:
@@ -421,27 +440,18 @@ class OrderEntry:
         if request.order_type == OrderType.MARKET and tif == TimeInForce.GTC.value:
             tif = TimeInForce.IOC.value
 
-        body: dict[str, Any] = {
-            "ticker":          request.ticker,
-            "client_order_id": client_order_id,
-            "type":            request.order_type.value,
-            "action":          request.action,
-            "side":            request.side.value,
-            "count":           request.count,
-            "count_fp":        f"{request.count:.2f}",
-            "time_in_force":   tif,
-        }
-
         submit_yes_price: int | None = None
         submit_no_price: int | None = None
+        yes_price: int | None = None
+        no_price: int | None = None
 
         if request.order_type == OrderType.LIMIT and request.yes_price is not None:
             if request.side == OrderSide.YES:
-                body["yes_price"] = request.yes_price
+                yes_price = request.yes_price
                 submit_yes_price = request.yes_price
             else:
-                body["no_price"] = 100 - request.yes_price
-                submit_no_price = body["no_price"]
+                no_price = 100 - request.yes_price
+                submit_no_price = no_price
         elif request.order_type == OrderType.MARKET:
             cap = request.market_max_price
             if cap is None:
@@ -457,14 +467,29 @@ class OrderEntry:
                     request.count,
                 )
             if request.side == OrderSide.YES:
-                body["yes_price"] = cap
+                yes_price = cap
                 submit_yes_price = cap
             else:
-                body["no_price"] = cap
+                no_price = cap
                 submit_no_price = cap
 
+        body = build_create_order_v2_body(
+            ticker=request.ticker,
+            client_order_id=client_order_id,
+            action=request.action,
+            side=request.side.value,
+            contracts=request.count,
+            time_in_force=tif,
+            yes_price=yes_price,
+            no_price=no_price,
+            post_only=(
+                request.order_type == OrderType.LIMIT
+                and tif == TimeInForce.GTC.value
+            ),
+        )
+
         body_str = json.dumps(body, separators=(",", ":"))
-        path     = "/portfolio/orders"
+        path     = CREATE_ORDER_V2_PATH
         sign_path = f"/trade-api/v2{path}"
         headers  = self._creds.sign_request("POST", sign_path, body=body_str)
 
@@ -505,7 +530,7 @@ class OrderEntry:
 
                 self._limiter.reset_backoff(BucketType.WRITE)
                 raw   = await resp.json()
-                order = raw.get("order", raw)
+                order = parse_create_order_v2_response(raw)
 
                 receipt = OrderReceipt(
                     order_id=order.get("order_id", client_order_id),

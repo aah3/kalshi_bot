@@ -18,6 +18,8 @@ cfg.HP_STAKE_CENTS = 5000
 cfg.HP_USE_FEE_ADJUSTED_ROI = True
 cfg.HP_ASSUME_ROUND_TRIP_FEES = False
 cfg.HP_MAX_SPREAD_CENTS = 8
+cfg.STOP_LOSS_CLOSE_WINDOW_MINUTES = 0.0
+cfg.STOP_LOSS_ESCALATE_SECONDS = 120.0
 sys.modules["config"] = cfg
 
 log_mod = types.ModuleType("logging_.structured_logger")
@@ -859,3 +861,91 @@ def test_evaluate_hedges_when_ask_missing_on_entered_position():
     assert sig.side.value == "no"
     assert sig.meta.get("phase") == "hedge"
 
+
+def test_stop_loss_suppressed_by_time_gate_stays_entered():
+    """Time gate blocks before STOPPING — no trigger spam / state flip."""
+    from datetime import datetime, timedelta, timezone
+
+    from discovery.market_client import MarketSummary
+    from discovery.market_registry import register_markets
+
+    cfg.STOP_LOSS_CLOSE_WINDOW_MINUTES = 5.0
+
+    now = datetime.now(timezone.utc)
+    register_markets([
+        MarketSummary(
+            ticker="T-GATE",
+            event_ticker="EVT",
+            title="Gate test",
+            category="Sports",
+            series_ticker="KXTEST",
+            yes_bid=10,
+            yes_ask=12,
+            no_bid=88,
+            no_ask=90,
+            last_price=11,
+            volume=100,
+            volume_24h=100,
+            open_interest=10,
+            liquidity=1000,
+            status="open",
+            close_time=now + timedelta(hours=3),
+            updated_at=now,
+            result=None,
+        )
+    ])
+
+    strat = GreenUpStrategy(
+        stop_loss_cents=10,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T-GATE")
+    pos = strat.get_position("T-GATE")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 20
+    pos.entry_stake_cents = 20
+    pos.entry_contracts = 1
+    pos.stop_loss_trigger_price = stop_loss_trigger_price(20, 10)
+
+    assert strat.evaluate(_tick(5, 6, "T-GATE")) is None
+    assert pos.state == PositionState.ENTERED
+    assert pos.stop_armed_at > 0
+
+
+def test_stopping_without_order_id_retries_stop():
+    strat = GreenUpStrategy(
+        stop_loss_cents=10,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T-RETRY")
+    pos = strat.get_position("T-RETRY")
+    pos.state = PositionState.STOPPING
+    pos.entry_price_cents = 20
+    pos.entry_stake_cents = 20
+    pos.entry_contracts = 1
+    pos.stop_loss_trigger_price = stop_loss_trigger_price(20, 10)
+    pos.stop_order_id = ""
+
+    sig = strat.evaluate(_tick(5, 6, "T-RETRY"))
+    assert sig is not None
+    assert sig.meta.get("phase") == "stop_loss"
+    assert pos.state == PositionState.STOPPING
+
+
+def test_stop_escalates_to_market_on_floor_bid():
+    strat = GreenUpStrategy(
+        stop_loss_cents=10,
+        exit_price_mode=EntryPriceMode.CROSS_SPREAD,
+    )
+    strat.add_watch_ticker("T-FLOOR")
+    pos = strat.get_position("T-FLOOR")
+    pos.state = PositionState.ENTERED
+    pos.entry_price_cents = 20
+    pos.entry_stake_cents = 20
+    pos.entry_contracts = 1
+    pos.stop_loss_trigger_price = stop_loss_trigger_price(20, 10)
+
+    sig = strat.evaluate(_tick(1, 99, "T-FLOOR"))
+    assert sig is not None
+    assert sig.meta.get("order_type") == "market"
+    assert sig.meta.get("time_in_force") == "ioc"

@@ -341,7 +341,9 @@ class Blotter:
         blotter.close_trade(trade_id)
     """
 
-    def __init__(self, db_path: str = config.DB_PATH) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
+        if db_path is None:
+            db_path = config.DB_PATH
         self._db_path   = db_path
         self._postgres  = config.USE_POSTGRES
         self._pg_url    = config.POSTGRES_URL
@@ -555,6 +557,13 @@ class Blotter:
 
             hold_min = _hold_minutes(entry_time_str, now)
 
+            if close_type == "settlement":
+                leg_status = "settled"
+            elif close_type == "stop_loss":
+                leg_status = "stopped"
+            else:
+                leg_status = "closed"
+
             conn.execute(
                 """
                 UPDATE trades SET
@@ -572,7 +581,7 @@ class Blotter:
                     exit_price,
                     realised_pnl,
                     settlement_pnl,
-                    "settled" if close_type == "settlement" else "closed",
+                    leg_status,
                     now,
                     hold_min,
                     resolution,
@@ -653,7 +662,7 @@ class Blotter:
             legs = conn.execute(
                 """
                 SELECT realised_pnl_cents, settlement_pnl_cents, fees_cents,
-                       entry_time, exit_time, contracts, entry_price
+                       entry_time, exit_time, contracts, entry_price, status
                 FROM trades WHERE parent_trade_id = ?
                 """,
                 (trade_id,),
@@ -673,7 +682,17 @@ class Blotter:
             last_exit   = max(exit_times)  if exit_times  else now
             hold_min    = _hold_minutes(first_entry, last_exit)
 
-            status = "settled" if any(r[1] is not None for r in legs) else "closed"
+            # Settlement outranks everything (market resolved). Otherwise, if
+            # any leg was closed by a stop-loss fill, surface the parent as
+            # "stopped" rather than a plain "closed" — this is what lets the
+            # blotter distinguish a stop-capped loss from a normal exit.
+            leg_statuses = {r[7] for r in legs}
+            if any(r[1] is not None for r in legs):
+                status = "settled"
+            elif "stopped" in leg_statuses:
+                status = "stopped"
+            else:
+                status = "closed"
 
             conn.execute(
                 """
@@ -860,7 +879,7 @@ class Blotter:
                     SUM(total_fees_cents)             AS total_fees_cents,
                     AVG(hold_minutes)                 AS avg_hold_minutes
                 FROM parent_trades
-                WHERE status IN ('closed','settled')
+                WHERE status IN ('closed','settled','stopped')
                   AND entry_time >= ?
                 GROUP BY strategy
                 ORDER BY total_pnl_cents DESC
@@ -885,7 +904,7 @@ class Blotter:
                     SUM(total_fees_cents)             AS total_fees_cents,
                     AVG(hold_minutes)                 AS avg_hold_minutes
                 FROM parent_trades
-                WHERE status IN ('closed','settled')
+                WHERE status IN ('closed','settled','stopped')
                   AND entry_time >= ?
                 GROUP BY category
                 ORDER BY total_pnl_cents DESC
@@ -901,7 +920,7 @@ class Blotter:
                 """
                 SELECT trade_id, ticker, market_title, category, strategy,
                        total_contracts, total_cost_cents, total_fees_cents,
-                       num_legs, entry_time
+                       num_legs, entry_time, status
                 FROM parent_trades
                 WHERE status IN ('open', 'hedged', 'partially_hedged')
                 ORDER BY entry_time DESC
@@ -910,7 +929,7 @@ class Blotter:
         return [dict(zip(
             ["trade_id","ticker","market_title","category","strategy",
              "total_contracts","total_cost_cents","total_fees_cents",
-             "num_legs","entry_time"], r
+             "num_legs","entry_time","status"], r
         )) for r in rows]
 
     def best_trades(self, n: int = 10, days: int = 30) -> list[ParentRecord]:
@@ -919,7 +938,7 @@ class Blotter:
             rows = conn.execute(
                 """
                 SELECT * FROM parent_trades
-                WHERE status IN ('closed','settled') AND entry_time >= ?
+                WHERE status IN ('closed','settled','stopped') AND entry_time >= ?
                 ORDER BY net_pnl_cents DESC LIMIT ?
                 """,
                 (cutoff, n),
@@ -932,7 +951,7 @@ class Blotter:
             rows = conn.execute(
                 """
                 SELECT * FROM parent_trades
-                WHERE status IN ('closed','settled') AND entry_time >= ?
+                WHERE status IN ('closed','settled','stopped') AND entry_time >= ?
                 ORDER BY net_pnl_cents ASC LIMIT ?
                 """,
                 (cutoff, n),

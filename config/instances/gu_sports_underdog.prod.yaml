@@ -1,0 +1,66 @@
+# Production $1 micro-pilot — green_up Sports sleeve (StrategyInstance).
+# Real money. Do not reuse the demo YAML against prod keys.
+# Usage:
+#   .\scripts\run_instance_prod.ps1 -DiscoverOnly
+#   .\scripts\run_instance_prod.ps1 -DurationMinutes 90
+
+id: gu_sports_underdog_prod
+enabled: true
+strategy: green_up
+
+universe:
+  mode: discover
+  refresh_seconds: 900
+  max_watchlist: 3
+  static_tickers: []
+  drop_policy:
+    closed: drop
+    fail_filters: drop_if_flat
+    not_in_top_n: drop_if_flat
+  discover:
+    category: Sports
+    preset: green_up
+    top_n: 3
+    max_yes_ask: 30
+    min_volume_24h: 500
+    full_scan: true
+    activity_hours: 2
+    # Kalshi Sports close_time is settlement (often days out), not the live
+    # event. activity_hours + runtime live gates keep tape fresh.
+    max_minutes_to_close: 10080
+    live_only: true
+    rank_by: screener
+
+strategy_params:
+  entry_max: 30
+  hedge_trigger: 44
+  hedge_mode: stake_back
+  stop_loss: 10
+  # Cross-spread IOC for first live fills; switch to limit_offset after a signed cycle
+  gu_entry_mode: cross_spread
+  gu_exit_mode: cross_spread
+  gu_hedge_style: trigger
+  gu_max_cycles: 0
+
+risk:
+  max_position_cents: 100
+  max_concurrent_positions: 1
+  daily_loss_limit_cents: 500
+  max_drawdown_pct: 0.05
+  max_sector_concentration: 1.0
+
+persistence:
+  db_path: kalshi_bot_prod_gu_sports.db
+  log_file: kalshi_bot_prod_gu_sports.jsonl
+
+lifecycle:
+  on_flat: keep_running
+  on_all_settled: keep_running
+  on_shutdown: cancel_resting
+
+runtime:
+  monitor_interval: 30
+  quiet: true
+  auto_take_profit: false
+
+schedule: null

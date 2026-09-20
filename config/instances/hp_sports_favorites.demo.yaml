@@ -1,0 +1,49 @@
+# Demo high_prob sleeve (StrategyInstance). Startup-only discover unless refresh_seconds set.
+# Usage:
+#   python main.py --instance config/instances/hp_sports_favorites.demo.yaml
+
+id: hp_sports_favorites
+enabled: true
+strategy: high_prob
+
+universe:
+  mode: discover
+  refresh_seconds: 1800
+  max_watchlist: 3
+  drop_policy:
+    closed: drop
+    fail_filters: drop_if_flat
+    not_in_top_n: drop_if_flat
+  discover:
+    category: Sports
+    preset: high_prob
+    top_n: 3
+    min_yes_ask: 70
+    rank_by: fee_adjusted_roi
+
+strategy_params:
+  hp_min_yes_ask: 70
+  hp_entry_mode: limit_offset
+  hp_exit_mode: cross_spread
+  hp_post_fill: tp_and_stop
+  hp_stake_cents: 10000
+  hp_take_profit_pct: 0.25
+  hp_stop_loss: 0.10
+  hp_max_cycles: 0
+
+risk:
+  max_position_cents: 10000
+  max_concurrent_positions: 1
+
+persistence:
+  db_path: kalshi_bot_demo_hp_sports.db
+  log_file: kalshi_bot_demo_hp_sports.jsonl
+
+lifecycle:
+  on_flat: keep_running
+  on_all_settled: keep_running
+  on_shutdown: cancel_resting
+
+runtime:
+  monitor_interval: 30
+  quiet: true

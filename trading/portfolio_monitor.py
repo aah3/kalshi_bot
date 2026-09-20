@@ -39,7 +39,7 @@ from discovery.market_client import MarketClient, OrderBookSnapshot
 from execution.rate_limiter import BucketType, RateLimiter
 from ingestion.market_ingestor import normalize_fill_message
 from logging_.structured_logger import logger
-from trading.position_parse import parse_market_position
+from trading.position_parse import format_contract_qty, parse_market_position
 
 
 # ── Realised P&L from fills ───────────────────────────────────────────────────
@@ -126,7 +126,7 @@ class Position:
     # From Kalshi API
     ticker:          str
     side:            str              # "yes" | "no"
-    contracts:       int              # number of contracts held
+    contracts:       float            # number of contracts held (may be fractional)
     avg_entry_price: int              # cents paid per contract
     market_title:    str = ""
 
@@ -141,8 +141,8 @@ class Position:
     minutes_to_close: float | None = None
 
     def __post_init__(self) -> None:
-        self.cost_basis  = self.avg_entry_price * self.contracts
-        self.max_payout  = 100 * self.contracts
+        self.cost_basis  = int(round(self.avg_entry_price * self.contracts))
+        self.max_payout  = int(round(100 * self.contracts))
 
     def apply_mark(self, book: OrderBookSnapshot | None) -> None:
         """Update unrealised P&L from a live order book snapshot."""
@@ -159,7 +159,7 @@ class Position:
             self.mark_price    = 100 - yes_mid
             self.implied_prob  = (100 - yes_mid) / 100.0
 
-        self.current_value  = self.mark_price * self.contracts
+        self.current_value  = int(round(self.mark_price * self.contracts))
         self.unrealised_pnl = self.current_value - self.cost_basis
 
     @property
@@ -178,7 +178,8 @@ class Position:
             "ticker":           self.ticker,
             "title":            self.market_title,
             "side":             self.side,
-            "contracts":        self.contracts,
+            "contracts":        format_contract_qty(self.contracts),
+            "contracts_fp":     self.contracts,
             "avg_entry_price":  self.avg_entry_price,
             "cost_basis_usd":   round(self.cost_basis / 100, 2),
             "mark_price":       self.mark_price,
@@ -263,7 +264,7 @@ class PortfolioSnapshot:
             pnl_sign = "+" if pos.unrealised_pnl >= 0 else ""
             exp_str  = f"{pos.minutes_to_close:.0f}m" if pos.minutes_to_close is not None else "open"
             print(
-                f"  {pos.ticker:<30} {pos.side:<5} {pos.contracts:>5} "
+                f"  {pos.ticker:<30} {pos.side:<5} {format_contract_qty(pos.contracts):>5} "
                 f"{pos.avg_entry_price:>5}c {(pos.mark_price or 0):>5}c "
                 f"${pos.cost_basis/100:>7.2f} ${pos.current_value/100:>7.2f} "
                 f"{pnl_sign}${pos.unrealised_pnl/100:>9.2f} "
@@ -492,11 +493,11 @@ class PortfolioMonitor:
     @staticmethod
     def _parse_position(parsed: dict[str, Any]) -> Position:
         """Build Position from ``parse_market_position`` output."""
-        contracts = int(parsed["contracts"])
+        contracts = float(parsed["contracts"])
         cost_basis = int(parsed.get("cost_basis_cents", 0))
         avg_price = int(parsed.get("avg_entry_price", 0))
         if avg_price == 0 and cost_basis > 0 and contracts > 0:
-            avg_price = cost_basis // contracts
+            avg_price = round(cost_basis / contracts)
 
         pos = Position(
             ticker=parsed["ticker"],

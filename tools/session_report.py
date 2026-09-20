@@ -70,8 +70,9 @@ def build_report(blotter: Blotter, perf: PerformanceAnalytics, days: int, date: 
     # ── Trade data ────────────────────────────────────────────────────────────
     closed  = blotter.query_trades(status="closed",  days=days, from_date=from_date, to_date=to_date)
     settled = blotter.query_trades(status="settled", days=days, from_date=from_date, to_date=to_date)
+    stopped = blotter.query_trades(status="stopped", days=days, from_date=from_date, to_date=to_date)
     open_t  = blotter.open_positions_summary()
-    all_done = closed + settled
+    all_done = closed + settled + stopped
 
     # ── P&L aggregates ────────────────────────────────────────────────────────
     total_net_pnl   = sum(t.net_pnl_cents or 0 for t in all_done)
